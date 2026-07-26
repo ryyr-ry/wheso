@@ -5,9 +5,6 @@
     "sender": "packages/server/src/sender.ts",
     "receiver": "packages/server/src/receiver.ts",
     "shard": "packages/server/src/shard.ts",
-    "fanout": "packages/server/src/fanout.ts",
-    "coordinator": "packages/server/src/coordinator.ts",
-    "aggregator": "packages/server/src/aggregator.ts",
     "meta": "packages/server/src/meta.ts",
     "control": "packages/server/src/control.ts"
   },
