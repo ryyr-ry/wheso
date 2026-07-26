@@ -62,5 +62,14 @@ jobs:
       - name: fuzz:check
         run: npm run fuzz:check
 
+      - name: trace:check
+        run: npm run trace:check
+
+      - name: trace:receiver:check
+        run: npm run trace:receiver:check
+
+      - name: fuzz:check
+        run: npm run fuzz:check
+
       - name: tests
         run: npm test
