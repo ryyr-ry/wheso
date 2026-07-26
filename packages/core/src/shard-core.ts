@@ -9,8 +9,39 @@ import {
   SHEDDING_HYSTERESIS_MS,
   NODE_MAX_OUT_BYTES_PER_SEC,
   NODE_MAX_OUT_MESSAGES_PER_SEC,
+  SHARD_UTIL_WINDOW_MS,
+  SHARD_UTIL_ENTER_T2_NUM,
+  SHARD_UTIL_ENTER_T2_DEN,
+  SHARD_UTIL_ENTER_T1_NUM,
+  SHARD_UTIL_ENTER_T1_DEN,
+  SHARD_UTIL_ENTER_SPATIAL_NUM,
+  SHARD_UTIL_ENTER_SPATIAL_DEN,
+  SHARD_UTIL_ENTER_KEY_ONLY_NUM,
+  SHARD_UTIL_ENTER_KEY_ONLY_DEN,
+  SHARD_UTIL_EXIT_T2_NUM,
+  SHARD_UTIL_EXIT_T2_DEN,
+  SHARD_UTIL_EXIT_T1_NUM,
+  SHARD_UTIL_EXIT_T1_DEN,
+  SHARD_UTIL_EXIT_SPATIAL_NUM,
+  SHARD_UTIL_EXIT_SPATIAL_DEN,
+  SHARD_UTIL_EXIT_KEY_ONLY_NUM,
+  SHARD_UTIL_EXIT_KEY_ONLY_DEN,
+  SHARD_TREND_ENTER_T2_NUM,
+  SHARD_TREND_ENTER_T2_DEN,
+  SHARD_TREND_ENTER_T1_NUM,
+  SHARD_TREND_ENTER_T1_DEN,
+  SHARD_TREND_ENTER_SPATIAL_NUM,
+  SHARD_TREND_ENTER_SPATIAL_DEN,
+  SHARD_TREND_ENTER_KEY_ONLY_NUM,
+  SHARD_TREND_ENTER_KEY_ONLY_DEN,
+  SHARD_TREND_EXIT_NUM,
+  SHARD_TREND_EXIT_DEN,
+  SHARD_TREND_EXIT_KEY_ONLY_NUM,
+  SHARD_TREND_EXIT_KEY_ONLY_DEN,
 } from "./generated/constants.ts";
 
+import { ERROR_DEFINITIONS } from "./generated/errors.ts";
+import { delaySlope, type Slope } from "./fixed.ts";
 import { dropPriority } from "./wire.ts";
 
 // --- Result 型 ---
@@ -85,6 +116,17 @@ export interface BudgetEvent {
   readonly bytesPerSec: number;
 }
 
+/**
+ * 受信者からの測定報告（conformance.md 4.2）。
+ * state-machines.md 3 節の遷移条件 maxTrend の入力である。
+ */
+export interface ReportEvent {
+  readonly kind: "report";
+  readonly from: number;
+  /** 片道遅延の標本列（マイクロ秒の整数）。勾配の算出に用いる */
+  readonly delayUs: readonly number[];
+}
+
 export type ShardEvent =
   | MediaEvent
   | SubscribeEvent
@@ -92,7 +134,8 @@ export type ShardEvent =
   | LeaveEvent
   | LinkEvent
   | TimerEvent
-  | BudgetEvent;
+  | BudgetEvent
+  | ReportEvent;
 
 // --- 出力コマンド (conformance.md 4.3) ---
 
@@ -138,6 +181,15 @@ export interface CloseCommand {
   readonly code: number;
 }
 
+/**
+ * 制御系へのエラー通知（conformance.md 4.3）。
+ * 接続は閉じない。KEY_ONLY への遷移でシャードの再分割を要求するために使う。
+ */
+export interface NotifyCommand {
+  readonly kind: "notify";
+  readonly code: number;
+}
+
 export type ShardCommand =
   | ForwardCommand
   | DropCommand
@@ -146,7 +198,8 @@ export type ShardCommand =
   | ConnectCommand
   | DisconnectCommand
   | ScheduleCommand
-  | CloseCommand;
+  | CloseCommand
+  | NotifyCommand;
 
 // --- 購読情報 ---
 
@@ -177,6 +230,31 @@ export interface ShardState {
   readonly windowStartMs: number;
   /** 無視されたイベントの記録（W_UNEXPECTED_EVENT） */
   readonly unexpectedEvents: readonly string[];
+  /**
+   * 受信者ごとの遅延勾配。report イベントで更新する。
+   * subscriberId の昇順で保持する（決定性のため）。
+   */
+  readonly trends: readonly ReceiverTrend[];
+  /**
+   * (senderId, channel) ごとに観測した spatialId の最大値。
+   * SHEDDING_SPATIAL で「最上位 spatialId のみ」を破棄するために必要である。
+   * senderId, channel の昇順で保持する。
+   */
+  readonly maxSpatial: readonly MaxSpatial[];
+}
+
+/** 受信者 1 人の遅延勾配。分子と分母の整数対で持つ（ADR-0017）。 */
+export interface ReceiverTrend {
+  readonly subscriberId: number;
+  readonly numerator: number;
+  readonly denominator: number;
+}
+
+/** 送信者とチャネルごとの最大 spatialId。 */
+export interface MaxSpatial {
+  readonly from: number;
+  readonly ch: number;
+  readonly sid: number;
 }
 
 // --- 初期状態 ---
@@ -192,6 +270,8 @@ export function initialState(t: number): ShardState {
     sentMessagesInWindow: 0,
     windowStartMs: t,
     unexpectedEvents: [],
+    trends: [],
+    maxSpatial: [],
   };
 }
 
@@ -222,6 +302,8 @@ export function step(state: ShardState, event: ShardEvent, t: number): StepResul
       return handleTimer(state, t);
     case "budget":
       return handleBudget(state, event, t);
+    case "report":
+      return handleReport(state, event, t);
   }
 }
 
@@ -230,14 +312,15 @@ export function step(state: ShardState, event: ShardEvent, t: number): StepResul
 function handleMedia(state: ShardState, event: MediaEvent, t: number): StepResult {
   const commands: ShardCommand[] = [];
 
-  // 窓のリセット（1 秒経過したら）
-  const newState = maybeResetWindow(state, t);
+  // 窓のリセット（観測窓が満了したら）
+  // 観測した spatialId の最大値も更新する。SHEDDING_SPATIAL の判定に使う。
+  const newState = updateMaxSpatial(maybeResetWindow(state, t), event);
 
   // 破棄優先順位を計算（wire.ts の dropPriority を再利用する）
   const priority = dropPriority(event.ch, event.flags);
 
   // 輻輳状態に応じた破棄判定
-  const shouldDrop = shouldDropInCongestion(newState.congestion, event, priority);
+  const shouldDrop = shouldDropInCongestion(newState, event, priority);
 
   if (shouldDrop) {
     // 破棄する場合
@@ -287,7 +370,10 @@ function handleMedia(state: ShardState, event: MediaEvent, t: number): StepResul
     sentMessagesInWindow: newState.sentMessagesInWindow + msgCost,
   };
 
-  return { state: stateAfterForward, commands };
+  // 転送により利用率が上がるため、輻輳状態を再評価する。
+  // 評価しないと util が閾値を超えても遷移が起きない（state-machines.md 3 節）。
+  const evaluated = evaluateCongestionTransition(stateAfterForward, t);
+  return { state: evaluated.state, commands: [...commands, ...evaluated.commands] };
 }
 
 // --- 内部: 購読イベント処理 ---
@@ -364,11 +450,11 @@ function handleLink(state: ShardState, _event: LinkEvent, _t: number): StepResul
 // --- 内部: タイマーイベント処理 ---
 
 function handleTimer(state: ShardState, t: number): StepResult {
-  // タイマーは輻輳遷移の再評価に使う可能性があるが、
-  // state-machines.md 3 節の表にはタイマーによる遷移が定義されていない。
-  // 窓のリセットのみ行う。
+  // タイマーは窓のリセットと輻輳状態の再評価に使う。
+  // 送信が止まった場合、util は時間の経過だけで下がる。タイマーで再評価しないと
+  // 回復方向の遷移（表の 3 行目・5 行目・7 行目・8 行目）が起きない。
   const newState = maybeResetWindow(state, t);
-  return { state: newState, commands: [] };
+  return evaluateCongestionTransition(newState, t);
 }
 
 // --- 内部: 予算イベント処理 ---
@@ -388,149 +474,206 @@ function handleBudget(state: ShardState, event: BudgetEvent, t: number): StepRes
   return { state: result.state, commands };
 }
 
+// --- 内部: 測定報告の処理 ---
+
+function handleReport(state: ShardState, event: ReportEvent, t: number): StepResult {
+  // 遅延勾配は fixed.ts の整数演算で求める。浮動小数点を使わない（ADR-0017）。
+  const slope: Slope = delaySlope(event.delayUs);
+  const rest = state.trends.filter((entry) => entry.subscriberId !== event.from);
+  const updated: ReceiverTrend = {
+    subscriberId: event.from,
+    numerator: slope.numerator,
+    denominator: slope.denominator,
+  };
+  // subscriberId の昇順で保持する。反復順序が結果に影響するため決定的にする必要がある。
+  const trends = [...rest, updated].sort((a, b) => a.subscriberId - b.subscriberId);
+  return evaluateCongestionTransition({ ...state, trends }, t);
+}
+
 // --- 内部: 輻輳状態の遷移評価 ---
-// state-machines.md 3 節の表に従う。
-// util = 要求レート ÷ 予算。整数演算で交差乗算する。
+// state-machines.md 3 節の表に一行ずつ対応する。
+// 遷移の入力は util（要求レート ÷ 予算）と maxTrend（受信者の遅延勾配の最大値）である。
+// 劣化側は「または」、回復側は「かつ」で結合する。
+// 比較は全て整数の交差乗算で行う（ADR-0017）。浮動小数点を使わない。
+
+/** util > num/den を判定する。util = 送信メッセージ数 ÷ (窓の秒数 × 予算レート)。 */
+function utilGreater(state: ShardState, t: number, num: number, den: number): boolean {
+  const windowMs = t - state.windowStartMs;
+  if (windowMs <= 0) {
+    return false;
+  }
+  // util = sent × 1000 / (windowMs × maxMps)
+  // util > num/den ⇔ sent × 1000 × den > num × windowMs × maxMps
+  // 分母（windowMs × maxMps × den）は正であるため不等号の向きは変わらない。
+  return state.sentMessagesInWindow * 1000 * den > num * windowMs * NODE_MAX_OUT_MESSAGES_PER_SEC;
+}
+
+/** util < num/den を判定する。 */
+function utilLess(state: ShardState, t: number, num: number, den: number): boolean {
+  const windowMs = t - state.windowStartMs;
+  if (windowMs <= 0) {
+    // 窓が開いた直後は送信量が 0 であり、利用率は 0 とみなす。
+    return num > 0;
+  }
+  return state.sentMessagesInWindow * 1000 * den < num * windowMs * NODE_MAX_OUT_MESSAGES_PER_SEC;
+}
+
+/** maxTrend > num/den を判定する。報告が無い場合は false（勾配が不明なら劣化と判定しない）。 */
+function trendGreater(state: ShardState, num: number, den: number): boolean {
+  for (const trend of state.trends) {
+    // trend > num/den ⇔ trend.numerator × den > num × trend.denominator
+    // denominator は delaySlope の定義により常に正である（conformance.md 3.3）。
+    if (trend.numerator * den > num * trend.denominator) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** maxTrend < num/den を判定する。報告が 1 つも無い場合は回復条件を満たすとみなす。 */
+function trendLess(state: ShardState, num: number, den: number): boolean {
+  for (const trend of state.trends) {
+    if (!(trend.numerator * den < num * trend.denominator)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function evaluateCongestionTransition(state: ShardState, t: number): StepResult {
-  // ヒステリシス: 現状態に入ってから SHEDDING_HYSTERESIS_MS 以内は遷移しない
-  const elapsed = t - state.congestionEnteredAt;
-  if (elapsed < SHEDDING_HYSTERESIS_MS) {
+  // ヒステリシス: 現状態に入ってから SHEDDING_HYSTERESIS_MS 以内は遷移しない。
+  // 振動を防ぐためである（state-machines.md 3 節）。
+  if (t - state.congestionEnteredAt < SHEDDING_HYSTERESIS_MS) {
     return { state, commands: [] };
   }
 
-  // util の計算: sentMessagesInWindow / 窓の経過秒 / NODE_MAX_OUT_MESSAGES_PER_SEC
-  // 交差乗算で比較する。
-  // util > threshold  ⇔  sentMessages * 1000 > threshold_num * windowDuration * NODE_MAX / threshold_den
-  // ここでは簡易的に: util = sentMessages * 1000 / (windowDuration * NODE_MAX)
-  // 比較は全て交差乗算で行う。
-
-  const windowDuration = t - state.windowStartMs;
-  if (windowDuration <= 0) {
-    return { state, commands: [] };
-  }
-
-  // 整数でのレート比較: util > X を判定する
-  // util = sentMessages / (windowDuration_sec * MAX_MPS)
-  //      = sentMessages * 1000 / (windowDuration * MAX_MPS)
-  // util > X/10  ⇔  sentMessages * 1000 * 10 > X * windowDuration * MAX_MPS
-  const sentMsgScaled = state.sentMessagesInWindow * 10000; // * 1000 * 10
-  const maxMps = NODE_MAX_OUT_MESSAGES_PER_SEC;
-
-  // util のスケールされた値: sentMessages * 10000
-  // 閾値のスケールされた値: threshold * windowDuration * maxMps / 1（thresholdは10倍済み）
-  // util > 0.9  ⇔ sentMsgScaled > 9 * windowDuration * maxMps
-  // util > 1.0  ⇔ sentMsgScaled > 10 * windowDuration * maxMps
-  // util > 1.1  ⇔ sentMsgScaled > 11 * windowDuration * maxMps
-  // util > 1.2  ⇔ sentMsgScaled > 12 * windowDuration * maxMps
-  // util < 0.8  ⇔ sentMsgScaled < 8 * windowDuration * maxMps
-  // util < 0.85 ⇔ sentMsgScaled * 100 < 85 * windowDuration * maxMps * 100
-  //             ... より正確に: sentMessages * 10000 * 20 < 17 * windowDuration * maxMps * 20
-  //             簡略化: sentMessages * 200000 < 17 * windowDuration * maxMps * 20 は不要
-  //             util < 0.85 ⇔ sentMsgScaled * 2 < 17 * windowDuration * maxMps
-
-  const base = windowDuration * maxMps;
-
-  const utilGt09 = sentMsgScaled > 9 * base;
-  const utilGt10 = sentMsgScaled > 10 * base;
-  const utilGt11 = sentMsgScaled > 11 * base;
-  const utilGt12 = sentMsgScaled > 12 * base;
-  const utilLt08 = sentMsgScaled < 8 * base;
-  // util < 0.85: sentMsgScaled / base < 8.5 ⇔ sentMsgScaled * 2 < 17 * base
-  const utilLt085 = sentMsgScaled * 2 < 17 * base;
-  // util < 0.9: sentMsgScaled < 9 * base
-  const utilLt09 = sentMsgScaled < 9 * base;
-  // util < 1.0: sentMsgScaled < 10 * base
-  const utilLt10 = sentMsgScaled < 10 * base;
-
-  // maxTrend の入力は report イベントで来るが、shard の状態機械では
-  // budget イベントと util のみで遷移を判定する（report は receiver の責務）。
-  // state-machines.md 3 節の条件には maxTrend があるが、shard は util のみで判定する。
-  // maxTrend 条件は「または」で結合されているため、util 条件のみで遷移可能。
-
-  let newCongestion = state.congestion;
-  const commands: ShardCommand[] = [];
-
+  let next = state.congestion;
   switch (state.congestion) {
     case "NORMAL":
-      if (utilGt09) {
-        newCongestion = "SHEDDING_T2";
+      if (
+        utilGreater(state, t, SHARD_UTIL_ENTER_T2_NUM, SHARD_UTIL_ENTER_T2_DEN) ||
+        trendGreater(state, SHARD_TREND_ENTER_T2_NUM, SHARD_TREND_ENTER_T2_DEN)
+      ) {
+        next = "SHEDDING_T2";
       }
       break;
     case "SHEDDING_T2":
-      if (utilGt10) {
-        newCongestion = "SHEDDING_T1";
-      } else if (utilLt08) {
-        newCongestion = "NORMAL";
+      if (
+        utilGreater(state, t, SHARD_UTIL_ENTER_T1_NUM, SHARD_UTIL_ENTER_T1_DEN) ||
+        trendGreater(state, SHARD_TREND_ENTER_T1_NUM, SHARD_TREND_ENTER_T1_DEN)
+      ) {
+        next = "SHEDDING_T1";
+      } else if (
+        utilLess(state, t, SHARD_UTIL_EXIT_T2_NUM, SHARD_UTIL_EXIT_T2_DEN) &&
+        trendLess(state, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
+      ) {
+        next = "NORMAL";
       }
       break;
     case "SHEDDING_T1":
-      if (utilGt11) {
-        newCongestion = "SHEDDING_SPATIAL";
-      } else if (utilLt085) {
-        newCongestion = "SHEDDING_T2";
+      if (
+        utilGreater(state, t, SHARD_UTIL_ENTER_SPATIAL_NUM, SHARD_UTIL_ENTER_SPATIAL_DEN) ||
+        trendGreater(state, SHARD_TREND_ENTER_SPATIAL_NUM, SHARD_TREND_ENTER_SPATIAL_DEN)
+      ) {
+        next = "SHEDDING_SPATIAL";
+      } else if (
+        utilLess(state, t, SHARD_UTIL_EXIT_T1_NUM, SHARD_UTIL_EXIT_T1_DEN) &&
+        trendLess(state, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
+      ) {
+        next = "SHEDDING_T2";
       }
       break;
     case "SHEDDING_SPATIAL":
-      if (utilGt12) {
-        newCongestion = "KEY_ONLY";
-      } else if (utilLt09) {
-        newCongestion = "SHEDDING_T1";
+      if (
+        utilGreater(state, t, SHARD_UTIL_ENTER_KEY_ONLY_NUM, SHARD_UTIL_ENTER_KEY_ONLY_DEN) ||
+        trendGreater(state, SHARD_TREND_ENTER_KEY_ONLY_NUM, SHARD_TREND_ENTER_KEY_ONLY_DEN)
+      ) {
+        next = "KEY_ONLY";
+      } else if (
+        utilLess(state, t, SHARD_UTIL_EXIT_SPATIAL_NUM, SHARD_UTIL_EXIT_SPATIAL_DEN) &&
+        trendLess(state, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
+      ) {
+        next = "SHEDDING_T1";
       }
       break;
     case "KEY_ONLY":
-      if (utilLt10) {
-        newCongestion = "SHEDDING_SPATIAL";
+      if (
+        utilLess(state, t, SHARD_UTIL_EXIT_KEY_ONLY_NUM, SHARD_UTIL_EXIT_KEY_ONLY_DEN) &&
+        trendLess(state, SHARD_TREND_EXIT_KEY_ONLY_NUM, SHARD_TREND_EXIT_KEY_ONLY_DEN)
+      ) {
+        next = "SHEDDING_SPATIAL";
       }
       break;
   }
 
-  if (newCongestion !== state.congestion) {
-    const newState: ShardState = {
-      ...state,
-      congestion: newCongestion,
-      congestionEnteredAt: t,
-    };
-    return { state: newState, commands };
+  if (next === state.congestion) {
+    return { state, commands: [] };
   }
 
-  return { state, commands };
+  const commands: ShardCommand[] = [];
+  if (next === "KEY_ONLY") {
+    // シャードの再分割が必要な水準である。制御系へ通知する（state-machines.md 3 節）。
+    commands.push({ kind: "notify", code: ERROR_DEFINITIONS.E_NODE_OVERLOADED.closeCode });
+  }
+  return {
+    state: { ...state, congestion: next, congestionEnteredAt: t },
+    commands,
+  };
 }
 
 // --- 内部: 輻輳状態に応じた破棄判定 ---
 
 function shouldDropInCongestion(
-  congestion: CongestionState,
+  state: ShardState,
   event: MediaEvent,
   priority: number | null,
 ): boolean {
-  // 破棄禁止のユニット（KEY / 音声）は常に転送する
+  // 破棄禁止のユニット（KEY / 音声）は常に転送する（wire-format.md 1.4）
   if (priority === null) {
     return false;
   }
 
-  switch (congestion) {
+  switch (state.congestion) {
     case "NORMAL":
       return false;
     case "SHEDDING_T2":
-      // temporalId が最大の層を破棄する → DISCARDABLE が立っているもの = priority 1,2,3
+      // temporalId が最大の層を破棄する。最大層は送信側が DISCARDABLE を立てているため、
+      // 破棄可否の判断は flags 由来の優先順位（1〜3）で行う。
       return priority <= 3;
     case "SHEDDING_T1":
-      // temporalId >= 1 を破棄する → priority 1,2,3 に加え priority 4,5 のうち temporal > 0
-      // しかし priority 4,5 は DISCARDABLE=0 であり temporal 層の判定は flags だけでは不可能。
-      // state-machines.md の記述: 「temporalId >= 1 を破棄する」
-      // event.tid で判定する。
+      // temporalId >= 1 を破棄する。
       return event.tid >= 1;
     case "SHEDDING_SPATIAL":
-      // 最上位 spatialId を破棄する（+ SHEDDING_T1 の条件も維持）
-      // event.sid が最大層であるかの判定が必要だが、最大層の情報は状態に無い。
-      // priority に基づいて判定: priority 1-5 は全て破棄対象
-      // ただし KEY は priority null なので既にフィルタされている。
-      return true;
+      // 最上位 spatialId のみを破棄する。全層を破棄するとサムネイルまで消えるため、
+      // (senderId, channel) ごとに観測した最大 spatialId と一致する場合に限る。
+      // 加えて SHEDDING_T1 の条件（temporalId >= 1）も維持する。
+      return event.sid >= maxSpatialFor(state, event.from, event.ch) || event.tid >= 1;
     case "KEY_ONLY":
-      // KEY 以外を全て破棄する。priority !== null は既に KEY でない。
+      // KEY 以外を全て破棄する。priority !== null は KEY でないことを意味する。
       return true;
   }
+}
+
+/** (senderId, channel) について観測した最大 spatialId。未観測なら 0 を返す。 */
+function maxSpatialFor(state: ShardState, from: number, ch: number): number {
+  for (const entry of state.maxSpatial) {
+    if (entry.from === from && entry.ch === ch) {
+      return entry.sid;
+    }
+  }
+  return 0;
+}
+
+/** 観測した spatialId の最大値を更新する。順序は決定的（from, ch の昇順）に保つ。 */
+function updateMaxSpatial(state: ShardState, event: MediaEvent): ShardState {
+  const current = state.maxSpatial.find((e) => e.from === event.from && e.ch === event.ch);
+  if (current !== undefined && current.sid >= event.sid) {
+    return state;
+  }
+  const rest = state.maxSpatial.filter((e) => !(e.from === event.from && e.ch === event.ch));
+  const updated: MaxSpatial = { from: event.from, ch: event.ch, sid: event.sid };
+  const merged = [...rest, updated].sort((a, b) => (a.from !== b.from ? a.from - b.from : a.ch - b.ch));
+  return { ...state, maxSpatial: merged };
 }
 
 // --- 内部: 予算超過判定 ---
@@ -559,7 +702,7 @@ function isOverBudget(
 function maybeResetWindow(state: ShardState, t: number): ShardState {
   // 1 秒経過したら窓をリセットする
   const elapsed = t - state.windowStartMs;
-  if (elapsed >= 1000) {
+  if (elapsed >= SHARD_UTIL_WINDOW_MS) {
     return {
       ...state,
       sentBytesInWindow: 0,

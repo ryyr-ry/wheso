@@ -74,7 +74,8 @@ function isShardEvent(value: unknown): value is ShardEvent {
     kind === "leave" ||
     kind === "link" ||
     kind === "timer" ||
-    kind === "budget"
+    kind === "budget" ||
+    kind === "report"
   );
 }
 

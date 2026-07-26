@@ -233,3 +233,63 @@ export const LINE_BUDGET_MOBILE = 10;
 /** 同上（Rust / C++）。ADR-0015 */
 export const LINE_BUDGET_NATIVE = 10;
 
+/* shardCongestion */
+/** 容量利用率を測る観測窓。1 秒あたりのレート予算と直接比較できる長さにする。ADR-0017 */
+export const SHARD_UTIL_WINDOW_MS = 1000;
+/** NORMAL → SHEDDING_T2 の util 閾値 0.9 の分子。ADR-0017 */
+export const SHARD_UTIL_ENTER_T2_NUM = 9;
+/** NORMAL → SHEDDING_T2 の util 閾値 0.9 の分母。ADR-0017 */
+export const SHARD_UTIL_ENTER_T2_DEN = 10;
+/** SHEDDING_T2 → SHEDDING_T1 の util 閾値 1.0 の分子。ADR-0017 */
+export const SHARD_UTIL_ENTER_T1_NUM = 1;
+/** SHEDDING_T2 → SHEDDING_T1 の util 閾値 1.0 の分母。ADR-0017 */
+export const SHARD_UTIL_ENTER_T1_DEN = 1;
+/** SHEDDING_T1 → SHEDDING_SPATIAL の util 閾値 1.1 の分子。ADR-0017 */
+export const SHARD_UTIL_ENTER_SPATIAL_NUM = 11;
+/** SHEDDING_T1 → SHEDDING_SPATIAL の util 閾値 1.1 の分母。ADR-0017 */
+export const SHARD_UTIL_ENTER_SPATIAL_DEN = 10;
+/** SHEDDING_SPATIAL → KEY_ONLY の util 閾値 1.2 の分子。ADR-0017 */
+export const SHARD_UTIL_ENTER_KEY_ONLY_NUM = 6;
+/** SHEDDING_SPATIAL → KEY_ONLY の util 閾値 1.2 の分母。ADR-0017 */
+export const SHARD_UTIL_ENTER_KEY_ONLY_DEN = 5;
+/** SHEDDING_T2 → NORMAL の util 閾値 0.8 の分子。ADR-0017 */
+export const SHARD_UTIL_EXIT_T2_NUM = 4;
+/** SHEDDING_T2 → NORMAL の util 閾値 0.8 の分母。ADR-0017 */
+export const SHARD_UTIL_EXIT_T2_DEN = 5;
+/** SHEDDING_T1 → SHEDDING_T2 の util 閾値 0.85 の分子。ADR-0017 */
+export const SHARD_UTIL_EXIT_T1_NUM = 17;
+/** SHEDDING_T1 → SHEDDING_T2 の util 閾値 0.85 の分母。ADR-0017 */
+export const SHARD_UTIL_EXIT_T1_DEN = 20;
+/** SHEDDING_SPATIAL → SHEDDING_T1 の util 閾値 0.9 の分子。ADR-0017 */
+export const SHARD_UTIL_EXIT_SPATIAL_NUM = 9;
+/** SHEDDING_SPATIAL → SHEDDING_T1 の util 閾値 0.9 の分母。ADR-0017 */
+export const SHARD_UTIL_EXIT_SPATIAL_DEN = 10;
+/** KEY_ONLY → SHEDDING_SPATIAL の util 閾値 1.0 の分子。ADR-0017 */
+export const SHARD_UTIL_EXIT_KEY_ONLY_NUM = 1;
+/** KEY_ONLY → SHEDDING_SPATIAL の util 閾値 1.0 の分母。ADR-0017 */
+export const SHARD_UTIL_EXIT_KEY_ONLY_DEN = 1;
+/** NORMAL → SHEDDING_T2 の maxTrend 閾値 0.01 の分子。ADR-0017 */
+export const SHARD_TREND_ENTER_T2_NUM = 1;
+/** NORMAL → SHEDDING_T2 の maxTrend 閾値 0.01 の分母。ADR-0017 */
+export const SHARD_TREND_ENTER_T2_DEN = 100;
+/** SHEDDING_T2 → SHEDDING_T1 の maxTrend 閾値 0.03 の分子。ADR-0017 */
+export const SHARD_TREND_ENTER_T1_NUM = 3;
+/** SHEDDING_T2 → SHEDDING_T1 の maxTrend 閾値 0.03 の分母。ADR-0017 */
+export const SHARD_TREND_ENTER_T1_DEN = 100;
+/** SHEDDING_T1 → SHEDDING_SPATIAL の maxTrend 閾値 0.06 の分子。ADR-0017 */
+export const SHARD_TREND_ENTER_SPATIAL_NUM = 3;
+/** SHEDDING_T1 → SHEDDING_SPATIAL の maxTrend 閾値 0.06 の分母。ADR-0017 */
+export const SHARD_TREND_ENTER_SPATIAL_DEN = 50;
+/** SHEDDING_SPATIAL → KEY_ONLY の maxTrend 閾値 0.1 の分子。ADR-0017 */
+export const SHARD_TREND_ENTER_KEY_ONLY_NUM = 1;
+/** SHEDDING_SPATIAL → KEY_ONLY の maxTrend 閾値 0.1 の分母。ADR-0017 */
+export const SHARD_TREND_ENTER_KEY_ONLY_DEN = 10;
+/** 回復側の maxTrend 閾値 -0.005 の分子。ADR-0017 */
+export const SHARD_TREND_EXIT_NUM = -1;
+/** 回復側の maxTrend 閾値 -0.005 の分母。ADR-0017 */
+export const SHARD_TREND_EXIT_DEN = 200;
+/** KEY_ONLY → SHEDDING_SPATIAL の maxTrend 閾値 0 の分子。ADR-0017 */
+export const SHARD_TREND_EXIT_KEY_ONLY_NUM = 0;
+/** KEY_ONLY → SHEDDING_SPATIAL の maxTrend 閾値 0 の分母。ADR-0017 */
+export const SHARD_TREND_EXIT_KEY_ONLY_DEN = 1;
+

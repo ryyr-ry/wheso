@@ -159,6 +159,72 @@ export function generateShardEvents(seed: bigint, steps: number): Result<readonl
   events.push({ t, event: { kind: "budget", bytesPerSec: NODE_MAX_OUT_BYTES_PER_SEC } });
   t += 100;
 
+  // --- フェーズ 3.6: 輻輳の昇格と回復 ---
+  // なぜ report を使うか: state-machines.md 3 節の遷移条件は util と maxTrend の
+  // 「または」である。util を閾値まで上げるには 1 秒窓で 18,000 メッセージが必要であり、
+  // トレースの規模が現実的でない。maxTrend は report イベントで直接与えられるため、
+  // 5 状態すべてと回復方向の遷移を短い列で網羅できる。
+  //
+  // 勾配の作り方: 遅延標本を等間隔で増やすと勾配は正、減らすと負になる。
+  // 標本番号 i に対して y = base + step × i とすれば勾配は概ね step である。
+  // 昇格に必要な閾値は 0.01 → 0.03 → 0.06 → 0.1 であり、
+  // 1 標本あたり 1000 マイクロ秒ずつ増やせば勾配は約 1000 となり全閾値を超える。
+  const reporter = participants[0];
+  if (reporter !== undefined) {
+    const rising: number[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      rising.push(10000 + i * 1000);
+    }
+    // 各段の遷移はヒステリシス（500 ms）を跨ぐ必要がある。
+    // 4 回報告して NORMAL → SHEDDING_T2 → SHEDDING_T1 → SHEDDING_SPATIAL → KEY_ONLY へ昇格する。
+    for (let stage = 0; stage < 4; stage += 1) {
+      events.push({ t, event: { kind: "report", from: reporter, delayUs: rising } });
+      t += 600;
+      // 各段で 1 個ずつメディアを流し、状態ごとの破棄の違いを記録する。
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: participants[1] ?? reporter,
+          ch: CHANNEL_VIDEO,
+          sid: 3,
+          tid: 2,
+          key: false,
+          bytes: 40000,
+          flags: FLAG_END_OF_FRAME | FLAG_DISCARDABLE,
+        },
+      });
+      t += 10;
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: participants[1] ?? reporter,
+          ch: CHANNEL_VIDEO,
+          sid: 0,
+          tid: 0,
+          key: false,
+          bytes: 4000,
+          flags: FLAG_END_OF_FRAME,
+        },
+      });
+      t += 10;
+    }
+
+    // 回復: 勾配を負にし、送信を止めて util を下げる。
+    // timer で窓をリセットし、report で回復条件（maxTrend < -0.005、KEY_ONLY は < 0）を満たす。
+    const falling: number[] = [];
+    for (let i = 0; i < 20; i += 1) {
+      falling.push(30000 - i * 1000);
+    }
+    for (let stage = 0; stage < 5; stage += 1) {
+      events.push({ t, event: { kind: "timer" } });
+      t += 100;
+      events.push({ t, event: { kind: "report", from: reporter, delayUs: falling } });
+      t += 600;
+    }
+  }
+
   // --- フェーズ 4: 混合イベント列 ---
   // 少なくとも steps 個（最低 200）のイベントを生成する
   const actualSteps = steps < 200 ? 200 : steps;

@@ -421,5 +421,152 @@
       "derivation": "同上（Rust / C++）",
       "adr": "ADR-0015"
     }
+  },
+  "shardCongestion": {
+    "SHARD_UTIL_WINDOW_MS": {
+      "value": 1000,
+      "derivation": "容量利用率を測る観測窓。1 秒あたりのレート予算と直接比較できる長さにする",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_ENTER_T2_NUM": {
+      "value": 9,
+      "derivation": "NORMAL → SHEDDING_T2 の util 閾値 0.9 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_ENTER_T2_DEN": {
+      "value": 10,
+      "derivation": "NORMAL → SHEDDING_T2 の util 閾値 0.9 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_ENTER_T1_NUM": {
+      "value": 1,
+      "derivation": "SHEDDING_T2 → SHEDDING_T1 の util 閾値 1.0 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_ENTER_T1_DEN": {
+      "value": 1,
+      "derivation": "SHEDDING_T2 → SHEDDING_T1 の util 閾値 1.0 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_ENTER_SPATIAL_NUM": {
+      "value": 11,
+      "derivation": "SHEDDING_T1 → SHEDDING_SPATIAL の util 閾値 1.1 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_ENTER_SPATIAL_DEN": {
+      "value": 10,
+      "derivation": "SHEDDING_T1 → SHEDDING_SPATIAL の util 閾値 1.1 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_ENTER_KEY_ONLY_NUM": {
+      "value": 6,
+      "derivation": "SHEDDING_SPATIAL → KEY_ONLY の util 閾値 1.2 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_ENTER_KEY_ONLY_DEN": {
+      "value": 5,
+      "derivation": "SHEDDING_SPATIAL → KEY_ONLY の util 閾値 1.2 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_EXIT_T2_NUM": {
+      "value": 4,
+      "derivation": "SHEDDING_T2 → NORMAL の util 閾値 0.8 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_EXIT_T2_DEN": {
+      "value": 5,
+      "derivation": "SHEDDING_T2 → NORMAL の util 閾値 0.8 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_EXIT_T1_NUM": {
+      "value": 17,
+      "derivation": "SHEDDING_T1 → SHEDDING_T2 の util 閾値 0.85 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_EXIT_T1_DEN": {
+      "value": 20,
+      "derivation": "SHEDDING_T1 → SHEDDING_T2 の util 閾値 0.85 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_EXIT_SPATIAL_NUM": {
+      "value": 9,
+      "derivation": "SHEDDING_SPATIAL → SHEDDING_T1 の util 閾値 0.9 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_EXIT_SPATIAL_DEN": {
+      "value": 10,
+      "derivation": "SHEDDING_SPATIAL → SHEDDING_T1 の util 閾値 0.9 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_EXIT_KEY_ONLY_NUM": {
+      "value": 1,
+      "derivation": "KEY_ONLY → SHEDDING_SPATIAL の util 閾値 1.0 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_UTIL_EXIT_KEY_ONLY_DEN": {
+      "value": 1,
+      "derivation": "KEY_ONLY → SHEDDING_SPATIAL の util 閾値 1.0 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_ENTER_T2_NUM": {
+      "value": 1,
+      "derivation": "NORMAL → SHEDDING_T2 の maxTrend 閾値 0.01 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_ENTER_T2_DEN": {
+      "value": 100,
+      "derivation": "NORMAL → SHEDDING_T2 の maxTrend 閾値 0.01 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_ENTER_T1_NUM": {
+      "value": 3,
+      "derivation": "SHEDDING_T2 → SHEDDING_T1 の maxTrend 閾値 0.03 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_ENTER_T1_DEN": {
+      "value": 100,
+      "derivation": "SHEDDING_T2 → SHEDDING_T1 の maxTrend 閾値 0.03 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_ENTER_SPATIAL_NUM": {
+      "value": 3,
+      "derivation": "SHEDDING_T1 → SHEDDING_SPATIAL の maxTrend 閾値 0.06 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_ENTER_SPATIAL_DEN": {
+      "value": 50,
+      "derivation": "SHEDDING_T1 → SHEDDING_SPATIAL の maxTrend 閾値 0.06 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_ENTER_KEY_ONLY_NUM": {
+      "value": 1,
+      "derivation": "SHEDDING_SPATIAL → KEY_ONLY の maxTrend 閾値 0.1 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_ENTER_KEY_ONLY_DEN": {
+      "value": 10,
+      "derivation": "SHEDDING_SPATIAL → KEY_ONLY の maxTrend 閾値 0.1 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_EXIT_NUM": {
+      "value": -1,
+      "derivation": "回復側の maxTrend 閾値 -0.005 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_EXIT_DEN": {
+      "value": 200,
+      "derivation": "回復側の maxTrend 閾値 -0.005 の分母",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_EXIT_KEY_ONLY_NUM": {
+      "value": 0,
+      "derivation": "KEY_ONLY → SHEDDING_SPATIAL の maxTrend 閾値 0 の分子",
+      "adr": "ADR-0017"
+    },
+    "SHARD_TREND_EXIT_KEY_ONLY_DEN": {
+      "value": 1,
+      "derivation": "KEY_ONLY → SHEDDING_SPATIAL の maxTrend 閾値 0 の分母",
+      "adr": "ADR-0017"
+    }
   }
 }
