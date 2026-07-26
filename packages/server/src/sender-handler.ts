@@ -1,0 +1,256 @@
+/**
+ * 送信ノード（sender）の伝送層アダプタ。
+ *
+ * 判断は持たない（判断は sender-core.ts）。責務は 3 つに限る。
+ *   1. クライアントのメディアと制御メッセージを入力イベントへ翻訳する
+ *   2. 判断コアへ渡す
+ *   3. 出力コマンドを、割当先シャードへの送信と接続操作へ写す
+ */
+
+import {
+  initialSenderState,
+  senderStep,
+  SHARD_PEER_CURRENT,
+  SHARD_PEER_NEXT,
+  type SenderCommand,
+  type SenderEvent,
+  type SenderState,
+} from "@wheso/core/src/sender-core.ts";
+import { decodeMediaMessage, wireErrorCloseCode } from "@wheso/core/src/wire.ts";
+
+/** 送信の口。実装は Durable Object 側が与える。 */
+export interface SenderTransport {
+  /** 割当先シャードへメディアを送る。peer は現行（1）か次期（2）である。 */
+  sendToShard(peer: number, bytes: Uint8Array): void;
+  /** 割当先シャードへ制御メッセージを送る。 */
+  sendTextToShard(peer: number, text: string): void;
+  /** シャードへの接続を開く。 */
+  connectShard(peer: number): void;
+  /** シャードへの接続を閉じる。 */
+  disconnectShard(peer: number): void;
+  /** クライアント接続を閉じる。 */
+  closeClient(code: number, reason: string): void;
+  /** 制御系へ報告する。 */
+  notifyControl(code: string): void;
+  /** 指定時刻に timer イベントを起こすよう要求する。 */
+  scheduleAt(atMs: number): void;
+}
+
+export interface SenderHandlerState {
+  readonly core: SenderState;
+}
+
+export function createSenderHandlerState(epoch: number): SenderHandlerState {
+  return { core: initialSenderState(epoch) };
+}
+
+/**
+ * クライアントから届いたメディアを処理する。
+ *
+ * 形式違反はクライアント接続を閉じる（wire-format.md 0 節）。
+ * 転送はメッセージ単位で行う。
+ */
+export function handleClientMedia(
+  state: SenderHandlerState,
+  bytes: Uint8Array,
+  nowMs: number,
+  transport: SenderTransport,
+): SenderHandlerState {
+  const decoded = decodeMediaMessage(bytes);
+  if (!decoded.ok) {
+    transport.closeClient(wireErrorCloseCode(decoded.error.code), decoded.error.code);
+    return state;
+  }
+
+  let core = state.core;
+  let sent = false;
+  for (const unit of decoded.value.units) {
+    const event: SenderEvent = {
+      kind: "media",
+      ch: decoded.value.channel,
+      sid: unit.spatialId,
+      tid: unit.temporalId,
+      seq: unit.sequenceNumber,
+      bytes: unit.payload.length,
+      flags: unit.flags,
+    };
+    const result = senderStep(core, event, nowMs);
+    core = result.state;
+    for (const command of result.commands) {
+      if (command.kind === "forward") {
+        if (!sent) {
+          sent = true;
+          for (const peer of command.to) {
+            transport.sendToShard(peer, bytes);
+          }
+        }
+        continue;
+      }
+      applyCommand(command, transport);
+    }
+  }
+  return { core };
+}
+
+/** クライアントの制御メッセージを処理する。未知の `t` は無視する。 */
+export function handleClientText(
+  state: SenderHandlerState,
+  text: string,
+  nowMs: number,
+  transport: SenderTransport,
+): SenderHandlerState {
+  const message = parseObject(text);
+  if (message === null) {
+    return state;
+  }
+  let core = state.core;
+  for (const event of toSenderEvents(message)) {
+    const result = senderStep(core, event, nowMs);
+    core = result.state;
+    for (const command of result.commands) {
+      applyCommand(command, transport);
+    }
+  }
+  return { core };
+}
+
+/** 上流（シャードや制御系）からのメッセージを処理する。ack と epochChange を受ける。 */
+export function handleUpstreamText(
+  state: SenderHandlerState,
+  text: string,
+  nowMs: number,
+  transport: SenderTransport,
+): SenderHandlerState {
+  return handleClientText(state, text, nowMs, transport);
+}
+
+/** 新 epoch のシャードから最初のフレームが届いたことを伝える。 */
+export function handleNewEpochFrame(
+  state: SenderHandlerState,
+  nowMs: number,
+  transport: SenderTransport,
+): SenderHandlerState {
+  const result = senderStep(state.core, { kind: "newEpochFrame" }, nowMs);
+  for (const command of result.commands) {
+    applyCommand(command, transport);
+  }
+  return { core: result.state };
+}
+
+/** 旧接続の残量を伝える。0 になったら旧接続を閉じる判断が下る。 */
+export function handleStaleBacklog(
+  state: SenderHandlerState,
+  bytes: number,
+  nowMs: number,
+  transport: SenderTransport,
+): SenderHandlerState {
+  const result = senderStep(state.core, { kind: "staleBacklog", bytes }, nowMs);
+  for (const command of result.commands) {
+    applyCommand(command, transport);
+  }
+  return { core: result.state };
+}
+
+/** タイマー満了。二重購読の時限を判定する。 */
+export function handleTimer(
+  state: SenderHandlerState,
+  nowMs: number,
+  transport: SenderTransport,
+): SenderHandlerState {
+  const result = senderStep(state.core, { kind: "timer" }, nowMs);
+  for (const command of result.commands) {
+    applyCommand(command, transport);
+  }
+  return { core: result.state };
+}
+
+function applyCommand(command: SenderCommand, transport: SenderTransport): void {
+  switch (command.kind) {
+    case "forward":
+      // forward は呼び出し側が扱う。
+      return;
+    case "drop":
+      // 渡さないことで表現される。
+      return;
+    case "connect":
+      transport.connectShard(command.peer);
+      return;
+    case "disconnect":
+      transport.disconnectShard(command.peer);
+      return;
+    case "unsubscribeStale":
+      // 旧接続の購読を解除する。宛先は現行の接続である。
+      transport.sendTextToShard(SHARD_PEER_CURRENT, JSON.stringify({ t: "subscribe", entries: [] }));
+      return;
+    case "notify":
+      transport.notifyControl(command.code);
+      return;
+    case "schedule":
+      transport.scheduleAt(command.at);
+      return;
+  }
+}
+
+function parseObject(text: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return null;
+    }
+    return { ...value };
+  } catch {
+    return null;
+  }
+}
+
+/** 制御メッセージを入力イベント列へ翻訳する。 */
+function toSenderEvents(message: Record<string, unknown>): readonly SenderEvent[] {
+  const t = message["t"];
+  if (t === "ack") {
+    const ch = message["channel"];
+    const sid = message["spatialId"];
+    const highestSeq = message["highestSeq"];
+    if (!isInteger(ch) || !isInteger(sid) || !isInteger(highestSeq)) {
+      return [];
+    }
+    return [{ kind: "ack", ch, sid, highestSeq }];
+  }
+  if (t === "streamAnnounce") {
+    const streams = message["streams"];
+    if (!Array.isArray(streams)) {
+      return [];
+    }
+    const events: SenderEvent[] = [];
+    for (const stream of streams) {
+      if (typeof stream !== "object" || stream === null) {
+        continue;
+      }
+      const record: Record<string, unknown> = { ...stream };
+      const ch = record["channel"];
+      const framerate = record["framerate"];
+      // spatialId は宣言に含まれない場合があるため、既定は最上位でなく 0 とする。
+      const sid = record["spatialId"];
+      if (!isInteger(ch) || !isInteger(framerate)) {
+        continue;
+      }
+      events.push({ kind: "streamAnnounce", ch, sid: isInteger(sid) ? sid : 0, framerate });
+    }
+    return events;
+  }
+  if (t === "epochChange") {
+    const epoch = message["epoch"];
+    const assignmentChanged = message["assignmentChanged"];
+    if (!isInteger(epoch) || typeof assignmentChanged !== "boolean") {
+      return [];
+    }
+    return [{ kind: "epochChange", epoch, assignmentChanged }];
+  }
+  return [];
+}
+
+function isInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value);
+}
+
+/** 次期 epoch の接続を表す識別子。入口が接続の対応付けに使う。 */
+export const SENDER_PEERS = { current: SHARD_PEER_CURRENT, next: SHARD_PEER_NEXT } as const;
