@@ -236,9 +236,11 @@ test("凍結トレースを再生すると輻輳 5 状態すべてと回復方�
     const record: Record<string, unknown> = { ...parsed };
     const t = typeof record["t"] === "number" ? record["t"] : 0;
     const event = record["in"];
-    // トレースの入力は shard-core の ShardEvent と同じ形である。
+    if (!isShardEvent(event)) {
+      continue;
+    }
     const before = state.congestion;
-    const result = step(state, event as never, t);
+    const result = step(state, event, t);
     state = result.state;
     visited.add(state.congestion);
     if (rank(state.congestion) < rank(before)) {
@@ -266,4 +268,23 @@ function rank(state: CongestionState): number {
     case "KEY_ONLY":
       return 4;
   }
+}
+
+/** トレースの入力行が ShardEvent であることを実行時に検査する。型アサーションを使わない。 */
+function isShardEvent(value: unknown): value is Parameters<typeof step>[1] {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const record: Record<string, unknown> = { ...value };
+  const kind = record["kind"];
+  return (
+    kind === "media" ||
+    kind === "subscribe" ||
+    kind === "join" ||
+    kind === "leave" ||
+    kind === "link" ||
+    kind === "timer" ||
+    kind === "budget" ||
+    kind === "report"
+  );
 }

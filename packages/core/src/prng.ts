@@ -11,25 +11,31 @@
 import { PRNG_MULTIPLIER_SHIFTS } from "./generated/constants.ts";
 import { type Result, ok, err } from "./result.ts";
 
-/** 移動量を定数文字列から解析する。数値をコードに直接書かない。 */
-function parseShifts(raw: string): { readonly a: bigint; readonly b: bigint; readonly c: bigint } {
+/** 移動量の 3 個組。 */
+interface Shifts {
+  readonly a: bigint;
+  readonly b: bigint;
+  readonly c: bigint;
+}
+
+/**
+ * 移動量を定数文字列から解析する。数値をコードに直接書かない。
+ *
+ * なぜ例外を投げないか: 失敗は Result で返す（コーディング規約）。
+ * 例外は他言語で panic に相当し、9 言語で同一の挙動にならない。
+ */
+function parseShifts(raw: string): Result<Shifts, PrngError> {
   const parts = raw.split(",");
   const first = parts[0];
   const second = parts[1];
   const third = parts[2];
   if (first === undefined || second === undefined || third === undefined) {
-    // 生成物の形式が壊れている場合にここに到達する。
-    // 実行時に検出できるよう、固定の値ではなく解析を行う。
-    throw new Error("PRNG_MULTIPLIER_SHIFTS の形式が不正");
+    return err({ code: "E_PRNG_SHIFTS", detail: "PRNG_MULTIPLIER_SHIFTS の形式が不正" });
   }
-  return {
-    a: BigInt(first),
-    b: BigInt(second),
-    c: BigInt(third),
-  };
+  return ok({ a: BigInt(first), b: BigInt(second), c: BigInt(third) });
 }
 
-const SHIFTS = parseShifts(PRNG_MULTIPLIER_SHIFTS);
+const SHIFTS_RESULT = parseShifts(PRNG_MULTIPLIER_SHIFTS);
 
 /** 64bit の範囲に切り詰める。BigInt は任意精度であるため巻き戻りを明示する。 */
 const MASK_64 = 0xFFFFFFFFFFFFFFFFn;
@@ -39,7 +45,7 @@ export interface PrngState {
   readonly value: bigint;
 }
 
-export type PrngErrorCode = "E_PRNG_ZERO_SEED";
+export type PrngErrorCode = "E_PRNG_ZERO_SEED" | "E_PRNG_SHIFTS";
 
 export interface PrngError {
   readonly code: PrngErrorCode;
@@ -53,6 +59,10 @@ export interface PrngError {
  * 規範（conformance.md 3.2）:「初期状態は 0 以外の値とする。種に 0 を与えてはならない。」
  */
 export function createPrng(seed: bigint): Result<PrngState, PrngError> {
+  // 生成物の形式が壊れている場合はここで検出する。読み込み時に例外を投げない。
+  if (!SHIFTS_RESULT.ok) {
+    return err(SHIFTS_RESULT.error);
+  }
   if (seed === 0n) {
     return err({ code: "E_PRNG_ZERO_SEED", detail: "種 0 は xorshift の不動点であり禁止" });
   }
@@ -70,9 +80,15 @@ export function createPrng(seed: bigint): Result<PrngState, PrngError> {
  *   出力 ← state
  */
 export function next(state: PrngState): { readonly state: PrngState; readonly output: bigint } {
+  // 移動量が解析できない場合は状態を変えずに返す。createPrng が先に失敗を返すため、
+  // 正常な経路ではここに到達しない。例外を投げないための分岐である。
+  if (!SHIFTS_RESULT.ok) {
+    return { state, output: state.value };
+  }
+  const shifts = SHIFTS_RESULT.value;
   let s = state.value;
-  s = (s ^ ((s << SHIFTS.a) & MASK_64)) & MASK_64;
-  s = (s ^ (s >> SHIFTS.b)) & MASK_64;
-  s = (s ^ ((s << SHIFTS.c) & MASK_64)) & MASK_64;
+  s = (s ^ ((s << shifts.a) & MASK_64)) & MASK_64;
+  s = (s ^ (s >> shifts.b)) & MASK_64;
+  s = (s ^ ((s << shifts.c) & MASK_64)) & MASK_64;
   return { state: { value: s }, output: s };
 }

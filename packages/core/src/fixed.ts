@@ -13,6 +13,7 @@ import {
   DELAY_TREND_RECOVER_DEN,
   DELAY_TREND_RECOVER_NUM,
 } from "./generated/constants.ts";
+import { type Result, ok, err } from "./result.ts";
 
 /* ------------------------------------------------------------------------- */
 /* 閾値                                                                      */
@@ -29,6 +30,14 @@ import {
  */
 const DEGRADE_RATIONAL = { num: DELAY_TREND_DEGRADE_NUM, den: DELAY_TREND_DEGRADE_DEN } as const;
 const RECOVER_RATIONAL = { num: DELAY_TREND_RECOVER_NUM, den: DELAY_TREND_RECOVER_DEN } as const;
+
+/** 整数演算の失敗。例外を投げず Result で返す（コーディング規約）。 */
+export type FixedErrorCode = "E_FIXED_DIVIDE_BY_ZERO" | "E_FIXED_RANGE";
+
+export interface FixedError {
+  readonly code: FixedErrorCode;
+  readonly detail: string;
+}
 
 /* ------------------------------------------------------------------------- */
 /* 勾配                                                                      */
@@ -171,9 +180,18 @@ export function wrap32(value: number): number {
  * 返すヘルパであり、中間の浮動小数点値を判断に使わない。
  * conformance.md 3.3:「除算が避けられない箇所は整数除算と切り捨てを明記する」
  */
-export function truncDiv(dividend: number, divisor: number): number {
-  // divisor === 0 の場合は Infinity が返る。呼び出し側で防ぐ前提。
-  return Math.trunc(dividend / divisor);
+export function truncDiv(dividend: number, divisor: number): Result<number, FixedError> {
+  if (divisor === 0) {
+    return err({ code: "E_FIXED_DIVIDE_BY_ZERO", detail: "0 で除算できない" });
+  }
+  // なぜ安全整数域を検査するか: JavaScript の `/` は浮動小数点除算であり、
+  // 安全整数域（2^53）を超えると商が丸められ、Rust や Swift の整数除算と
+  // 結果が一致しない（例: 9007199254740993 / 3）。9 言語で同一の結果を
+  // 要求するため（ADR-0017）、域外は失敗として返す。
+  if (!Number.isSafeInteger(dividend) || !Number.isSafeInteger(divisor)) {
+    return err({ code: "E_FIXED_RANGE", detail: "安全整数域を超える値は扱わない" });
+  }
+  return ok(Math.trunc(dividend / divisor));
 }
 
 /** 観測窓の大きさ。generated の定数から公開する。 */

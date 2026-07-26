@@ -30,7 +30,7 @@ describe("traces", () => {
     for (const line of frozenLines) {
       const parsed: unknown = JSON.parse(line);
       if (typeof parsed === "object" && parsed !== null) {
-        const obj = parsed as Record<string, unknown>;
+        const obj: Record<string, unknown> = { ...parsed };
         if ("out" in obj) {
           expectedOuts.push(line);
         }

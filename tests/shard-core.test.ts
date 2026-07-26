@@ -181,7 +181,7 @@ interface DropOrderVector {
 
 function isDropOrderVector(v: unknown): v is DropOrderVector {
   if (typeof v !== "object" || v === null) return false;
-  const obj = v as Record<string, unknown>;
+  const obj: Record<string, unknown> = { ...v };
   return (
     typeof obj["name"] === "string" &&
     typeof obj["channel"] === "number" &&

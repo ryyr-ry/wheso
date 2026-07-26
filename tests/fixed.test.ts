@@ -169,20 +169,37 @@ test("wrap32: naming.ts の Math.imul と >>> 0 と一致する", () => {
 /* truncDiv                                                                  */
 /* ------------------------------------------------------------------------- */
 
+/** Result から値を取り出す。失敗なら試験を落とす。 */
+function unwrapDiv(result: ReturnType<typeof truncDiv>): number {
+  assert.equal(result.ok, true, "除算が失敗した");
+  return result.ok ? result.value : 0;
+}
+
 test("truncDiv: 正の割り算", () => {
-  assert.equal(truncDiv(10, 3), 3);
-  assert.equal(truncDiv(9, 3), 3);
-  assert.equal(truncDiv(7, 2), 3);
+  assert.equal(unwrapDiv(truncDiv(10, 3)), 3);
+  assert.equal(unwrapDiv(truncDiv(9, 3)), 3);
+  assert.equal(unwrapDiv(truncDiv(7, 2)), 3);
 });
 
 test("truncDiv: 負をゼロ方向に丸める", () => {
-  assert.equal(truncDiv(-10, 3), -3);
-  assert.equal(truncDiv(-7, 2), -3);
-  assert.equal(truncDiv(10, -3), -3);
+  assert.equal(unwrapDiv(truncDiv(-10, 3)), -3);
+  assert.equal(unwrapDiv(truncDiv(-7, 2)), -3);
+  assert.equal(unwrapDiv(truncDiv(10, -3)), -3);
 });
 
-test("truncDiv: ゼロ除算は Infinity を返す（呼び出し側で防ぐ前提）", () => {
-  // 仕様上は呼び出し側が防ぐが、関数は Infinity を返す
+test("truncDiv: ゼロ除算は失敗を返す（例外を投げない）", () => {
   const result = truncDiv(10, 0);
-  assert.equal(result, Infinity);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.code, "E_FIXED_DIVIDE_BY_ZERO");
+  }
+});
+
+test("truncDiv: 安全整数域を超える入力は失敗を返す", () => {
+  // なぜ失敗にするか: 浮動小数点除算の丸めにより他言語の整数除算と結果が一致しない。
+  const result = truncDiv(Number.MAX_SAFE_INTEGER + 2, 3);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.error.code, "E_FIXED_RANGE");
+  }
 });
