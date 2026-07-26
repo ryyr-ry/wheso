@@ -176,6 +176,8 @@ export const HEARTBEAT_TIMEOUT_MS = 9000;
 /** epoch 移行で新シャードからフレームが来ない場合の打ち切り */
 export const DUAL_SUBSCRIBE_TIMEOUT_MS = 2000;
 export const STANDBY_SWAP_TIMEOUT_MS = 3000;
+/** 二重購読で新 epoch からフレームを待つ上限。state-machines.md 5 節の表 4 行目 */
+export const EPOCH_DUAL_SUBSCRIBE_TIMEOUT_MS = 2000;
 
 /* auth */
 /** 部屋名が決定論的であるため短命にする。ADR-0006 */

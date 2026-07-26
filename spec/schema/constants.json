@@ -296,6 +296,10 @@
     },
     "STANDBY_SWAP_TIMEOUT_MS": {
       "value": 3000
+    },
+    "EPOCH_DUAL_SUBSCRIBE_TIMEOUT_MS": {
+      "value": 2000,
+      "derivation": "二重購読で新 epoch からフレームを待つ上限。state-machines.md 5 節の表 4 行目"
     }
   },
   "auth": {
