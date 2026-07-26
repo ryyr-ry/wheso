@@ -26,9 +26,26 @@ import {
   WIRE_MAGIC,
 } from "../../packages/core/src/generated/wire-layout.ts";
 
-const PORT = 8788;
-const BASE = `http://127.0.0.1:${PORT}`;
-const WS_BASE = `ws://127.0.0.1:${PORT}`;
+/**
+ * 空きポートを 1 個確保する。
+ * 固定ポートにすると、前の実行が残っていた場合に衝突して失敗する。
+ */
+async function findFreePort(): Promise<number> {
+  const { createServer } = await import("node:net");
+  return await new Promise<number>((resolve, reject) => {
+    const probe = createServer();
+    probe.on("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+let PORT = 0;
+let BASE = "";
+let WS_BASE = "";
 const ROOM = "vsh-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0";
 
 let server: ChildProcess | null = null;
@@ -53,6 +70,9 @@ async function waitForReady(timeoutMs: number): Promise<boolean> {
 }
 
 before(async () => {
+  PORT = await findFreePort();
+  BASE = `http://127.0.0.1:${PORT}`;
+  WS_BASE = `ws://127.0.0.1:${PORT}`;
   // detached で起動し、終了時にプロセス群ごと落とす。
   // partykit dev は子プロセス（実行環境）を起動するため、親だけ落とすと残る。
   server = spawn("npx", ["partykit", "dev", "--port", String(PORT)], {
