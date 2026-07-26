@@ -1,0 +1,66 @@
+{
+  "$comment": "ワイヤフォーマットの機械可読定義。規範はワイヤフォーマット規範（wire-format）。本ファイルはコード生成の入力である。",
+  "protocolVersion": 1,
+  "magic": 161,
+  "byteOrder": "big-endian",
+  "messageHeader": {
+    "bytes": 8,
+    "fields": [
+      { "name": "magic", "offset": 0, "size": 1, "type": "u8", "constant": 161 },
+      { "name": "version", "offset": 1, "size": 1, "type": "u8", "constant": 1 },
+      { "name": "channel", "offset": 2, "size": 1, "type": "u8", "enum": "Channel" },
+      { "name": "unitCount", "offset": 3, "size": 1, "type": "u8", "min": 1, "max": 255 },
+      { "name": "senderId", "offset": 4, "size": 4, "type": "u32", "min": 1 }
+    ]
+  },
+  "unitHeader": {
+    "bytes": 20,
+    "fields": [
+      { "name": "sequenceNumber", "offset": 0, "size": 4, "type": "u32" },
+      { "name": "captureTimestampHighUs", "offset": 4, "size": 4, "type": "u32" },
+      { "name": "captureTimestampLowUs", "offset": 8, "size": 4, "type": "u32" },
+      { "name": "flags", "offset": 12, "size": 1, "type": "u8", "bitset": "UnitFlag" },
+      { "name": "spatialId", "offset": 13, "size": 1, "type": "u8", "min": 0, "max": 3 },
+      { "name": "temporalId", "offset": 14, "size": 1, "type": "u8", "min": 0, "max": 7 },
+      { "name": "reserved", "offset": 15, "size": 1, "type": "u8", "constant": 0 },
+      { "name": "payloadLength", "offset": 16, "size": 4, "type": "u32", "min": 1 }
+    ]
+  },
+  "enums": {
+    "Channel": [
+      { "name": "VIDEO", "value": 1, "description": "カメラ映像" },
+      { "name": "AUDIO", "value": 2, "description": "音声" },
+      { "name": "SCREEN_VIDEO", "value": 3, "description": "画面共有映像" },
+      { "name": "SCREEN_AUDIO", "value": 4, "description": "画面共有音声" }
+    ]
+  },
+  "bitsets": {
+    "UnitFlag": [
+      { "name": "KEY", "bit": 0, "description": "他フレームに依存せず復号できる" },
+      { "name": "DISCARDABLE", "bit": 1, "description": "破棄しても後続の復号に影響しない" },
+      { "name": "DTX", "bit": 2, "description": "音声の不連続送信（無音）" },
+      { "name": "END_OF_FRAME", "bit": 3, "description": "このユニットでフレームが完結する" },
+      { "name": "SCREEN_CONTENT", "bit": 4, "description": "文字や図が主体" },
+      { "name": "ACTIVE_SPEAKER", "bit": 5, "description": "送信者が発話中" }
+    ]
+  },
+  "limits": {
+    "maxUnitsPerMessage": 255,
+    "maxMessageBytes": 16000000,
+    "documentedReceiveLimitBytes": 33554432,
+    "$comment": "documentedReceiveLimitBytes は Cloudflare 公式ドキュメントの値（F-001）。maxMessageBytes は実測で成功した上限。"
+  },
+  "videoChannelRequiresSingleUnit": true,
+  "dropPriority": {
+    "$comment": "数値が小さいものから破棄する。null は破棄禁止。wire-format 1.4",
+    "rules": [
+      { "priority": null, "when": "channel は AUDIO または SCREEN_AUDIO" },
+      { "priority": null, "when": "KEY が立っている" },
+      { "priority": 1, "when": "DISCARDABLE かつ ACTIVE_SPEAKER でなく SCREEN_CONTENT でない" },
+      { "priority": 2, "when": "DISCARDABLE かつ ACTIVE_SPEAKER" },
+      { "priority": 3, "when": "DISCARDABLE かつ SCREEN_CONTENT" },
+      { "priority": 4, "when": "DISCARDABLE でなく ACTIVE_SPEAKER でない" },
+      { "priority": 5, "when": "DISCARDABLE でなく ACTIVE_SPEAKER" }
+    ]
+  }
+}

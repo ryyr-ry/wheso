@@ -1,0 +1,425 @@
+{
+  "$comment": "定数の機械可読定義。規範は定数規範（constants）。derivation は根拠、fact は事実台帳の ID、question は決定値台帳の ID。",
+  "nodeCapacity": {
+    "NODE_MAX_OUT_MESSAGES_PER_SEC": {
+      "value": 20000,
+      "unit": "msg/s",
+      "derivation": "実測上限 25000 の 80%",
+      "fact": "F-024"
+    },
+    "NODE_MAX_OUT_BYTES_PER_SEC": {
+      "value": 280000000,
+      "unit": "bytes/s",
+      "derivation": "実測上限 350 MB/s の 80%",
+      "fact": "F-024"
+    },
+    "NODE_MAX_IN_MESSAGES_PER_SEC": {
+      "value": 20000,
+      "unit": "msg/s",
+      "derivation": "送信側と同一予算",
+      "fact": "F-024"
+    }
+  },
+  "videoProfiles": {
+    "V_4K60": {
+      "spatialId": 3,
+      "width": 3840,
+      "height": 2160,
+      "framerate": 60,
+      "targetBitrate": 25000000,
+      "scalabilityMode": "L1T3",
+      "requiresHardwareEncoder": true,
+      "fact": "F-029"
+    },
+    "V_1080P60": {
+      "spatialId": 2,
+      "width": 1920,
+      "height": 1080,
+      "framerate": 60,
+      "targetBitrate": 6000000,
+      "scalabilityMode": "L1T3",
+      "requiresHardwareEncoder": false
+    },
+    "V_1080P30": {
+      "spatialId": 1,
+      "width": 1920,
+      "height": 1080,
+      "framerate": 30,
+      "targetBitrate": 3000000,
+      "scalabilityMode": "L1T3",
+      "requiresHardwareEncoder": false
+    },
+    "V_360P15": {
+      "spatialId": 0,
+      "width": 640,
+      "height": 360,
+      "framerate": 15,
+      "targetBitrate": 200000,
+      "scalabilityMode": "L1T2",
+      "requiresHardwareEncoder": false
+    },
+    "V_SCREEN_4K30": {
+      "spatialId": 3,
+      "width": 3840,
+      "height": 2160,
+      "framerate": 30,
+      "targetBitrate": 8000000,
+      "scalabilityMode": "L1T2",
+      "contentHint": "text",
+      "requiresHardwareEncoder": false
+    },
+    "V_SCREEN_1080P30": {
+      "spatialId": 1,
+      "width": 1920,
+      "height": 1080,
+      "framerate": 30,
+      "targetBitrate": 2000000,
+      "scalabilityMode": "L1T2",
+      "contentHint": "text",
+      "requiresHardwareEncoder": false
+    }
+  },
+  "audioProfiles": {
+    "A_VOICE": {
+      "bitrate": 32000,
+      "channels": 1,
+      "bytesPerPacket": 80,
+      "fact": "F-030"
+    },
+    "A_MUSIC": {
+      "bitrate": 128000,
+      "channels": 2,
+      "bytesPerPacket": 320,
+      "fact": "F-030"
+    }
+  },
+  "audio": {
+    "OPUS_FRAME_MS": {
+      "value": 20,
+      "derivation": "Opus の標準フレーム長"
+    },
+    "AUDIO_BUNDLE_MS": {
+      "value": 40,
+      "derivation": "収容 80 人→160 人。追加遅延 20ms",
+      "adr": "ADR-0005"
+    },
+    "AUDIO_UNITS_PER_MESSAGE": {
+      "value": 2,
+      "derivation": "AUDIO_BUNDLE_MS / OPUS_FRAME_MS"
+    },
+    "AUDIO_SELECTIVE_FORWARD_COUNT": {
+      "value": 5,
+      "derivation": "同時転送する発話者数の上限"
+    },
+    "AUDIO_SPEAKER_HOLD_MS": {
+      "value": 800,
+      "derivation": "発話停止後も転送対象に残す時間"
+    },
+    "AUDIO_DTX_ENABLED": {
+      "value": true
+    },
+    "AUDIO_FEC_ENABLED": {
+      "value": true
+    }
+  },
+  "shardCapacity": {
+    "V_SHARD_MAX_PARTICIPANTS": {
+      "value": 35,
+      "derivation": "標準構成（HQ 1 + LQ N-2）でメッセージ予算に到達する人数",
+      "fact": "F-024"
+    },
+    "A_SHARD_MAX_PARTICIPANTS": {
+      "value": 160,
+      "derivation": "選別転送 5 名 × 25 msg/s でメッセージ予算に到達する人数",
+      "fact": "F-024"
+    },
+    "V_FULL_MESH_MAX_4K60": {
+      "value": 9,
+      "derivation": "N(N-1) × 25Mbps / 8 <= 280MB/s",
+      "fact": "F-024"
+    },
+    "V_FULL_MESH_MAX_1080P60": {
+      "value": 18,
+      "derivation": "N(N-1) × 60 <= 20000"
+    },
+    "V_FULL_MESH_MAX_1080P30": {
+      "value": 26,
+      "derivation": "N(N-1) × 30 <= 20000"
+    },
+    "V_FULL_MESH_MAX_360P15": {
+      "value": 37,
+      "derivation": "N(N-1) × 15 <= 20000"
+    }
+  },
+  "congestion": {
+    "REPORT_INTERVAL_MS": {
+      "value": 200,
+      "derivation": "5 Hz。輻輳の立ち上がりに追従できる最小周期"
+    },
+    "DELAY_TREND_WINDOW": {
+      "value": 20,
+      "derivation": "200ms × 20 = 4 秒の観測窓"
+    },
+    "DELAY_TREND_DEGRADE": {
+      "value": 0.01,
+      "derivation": "暫定値",
+      "question": "Q-012"
+    },
+    "DELAY_TREND_RECOVER": {
+      "value": -0.005,
+      "derivation": "ヒステリシスのため劣化閾値より小さい",
+      "question": "Q-012"
+    },
+    "KEYFRAME_REQUEST_MIN_INTERVAL_MS": {
+      "value": 500
+    },
+    "AUDIO_STALL_RESET_MS": {
+      "value": 500
+    },
+    "VIDEO_STALL_RESET_MS": {
+      "value": 1500,
+      "derivation": "予備接続を常時保持するため短くできる"
+    },
+    "STANDBY_CONNECTION_ENABLED": {
+      "value": true,
+      "derivation": "切替時の停止を 0 にする"
+    },
+    "SHEDDING_HYSTERESIS_MS": {
+      "value": 500,
+      "derivation": "状態の振動を防ぐ最小滞留時間"
+    },
+    "SEND_WINDOW_MS": {
+      "value": 200,
+      "derivation": "ジッタバッファ最大深度 167 ms + 1 フレーム"
+    },
+    "ACK_INTERVAL_MS": {
+      "value": 50,
+      "derivation": "送信窓 200 ms を 4 分割する粒度"
+    },
+    "ACK_TIMEOUT_MS": {
+      "value": 5000,
+      "derivation": "ack 100 回連続欠落"
+    },
+    "UPLINK_BACKLOG_BYTES": {
+      "value": 100000,
+      "derivation": "4K60 の 2 フレーム分",
+      "adr": "ADR-0014"
+    },
+    "RATE_HOLD_MS": {
+      "value": 1000,
+      "derivation": "レート減少後の観測期間"
+    },
+    "RATE_PROBE_BPS": {
+      "value": 200000,
+      "derivation": "加算的増加の刻み。360p15 の 1 本分"
+    },
+    "RATE_DECREASE_FACTOR": {
+      "value": 0.85,
+      "derivation": "3 回で約 0.61 に収束する"
+    },
+    "LATE_FRAME_TOLERANCE_MS": {
+      "value": 33,
+      "derivation": "60 fps の 2 フレーム分"
+    },
+    "MIN_VIABLE_BPS": {
+      "value": 232000,
+      "derivation": "360p15 200,000 + 音声 32,000"
+    },
+    "DELAY_TREND_DEGRADE_NUM": {
+      "value": 1,
+      "derivation": "DELAY_TREND_DEGRADE を有理数 1/100 として表した分子。コアは浮動小数点を使わないため、閾値も整数対で与える",
+      "adr": "ADR-0017"
+    },
+    "DELAY_TREND_DEGRADE_DEN": {
+      "value": 100,
+      "derivation": "同分母",
+      "adr": "ADR-0017"
+    },
+    "DELAY_TREND_RECOVER_NUM": {
+      "value": -1,
+      "derivation": "DELAY_TREND_RECOVER を有理数 -1/200 として表した分子",
+      "adr": "ADR-0017"
+    },
+    "DELAY_TREND_RECOVER_DEN": {
+      "value": 200,
+      "derivation": "同分母",
+      "adr": "ADR-0017"
+    }
+  },
+  "jitterBuffer": {
+    "VIDEO_JITTER_MIN_FRAMES": {
+      "value": 2
+    },
+    "VIDEO_JITTER_MAX_FRAMES": {
+      "value": 10
+    },
+    "AUDIO_JITTER_MIN_PACKETS": {
+      "value": 2
+    },
+    "AUDIO_JITTER_MAX_PACKETS": {
+      "value": 8
+    },
+    "AV_SKEW_TOLERANCE_MS": {
+      "value": 20,
+      "derivation": "この範囲では補正しない"
+    },
+    "AV_SKEW_RESYNC_MS": {
+      "value": 200,
+      "derivation": "超過時は次のキーフレームまでスキップ"
+    }
+  },
+  "timeouts": {
+    "NODE_CONNECT_TIMEOUT_MS": {
+      "value": 5000,
+      "derivation": "DO 間接続の実測 438ms の 10 倍以上",
+      "fact": "F-016"
+    },
+    "RECONNECT_BACKOFF_MS": {
+      "value": [
+        500,
+        1000,
+        2000,
+        5000
+      ],
+      "derivation": "4 回目以降は 5000ms 固定"
+    },
+    "HEARTBEAT_INTERVAL_MS": {
+      "value": 3000
+    },
+    "HEARTBEAT_TIMEOUT_MS": {
+      "value": 9000,
+      "derivation": "3 回連続欠落で切断とみなす"
+    },
+    "DUAL_SUBSCRIBE_TIMEOUT_MS": {
+      "value": 2000,
+      "derivation": "epoch 移行で新シャードからフレームが来ない場合の打ち切り"
+    },
+    "STANDBY_SWAP_TIMEOUT_MS": {
+      "value": 3000
+    }
+  },
+  "auth": {
+    "TOKEN_MAX_AGE_SEC": {
+      "value": 60,
+      "derivation": "部屋名が決定論的であるため短命にする",
+      "adr": "ADR-0006"
+    },
+    "TOKEN_CLOCK_SKEW_SEC": {
+      "value": 5
+    },
+    "NODE_AUTH_TIME_WINDOW_SEC": {
+      "value": 300
+    },
+    "MAX_CONNECT_ATTEMPTS_PER_MIN": {
+      "value": 20
+    },
+    "MAX_INBOUND_MESSAGES_PER_SEC_PER_CLIENT": {
+      "value": 400,
+      "derivation": "映像 60 + 音声 25 + 制御 5 に余裕を持たせた値"
+    }
+  },
+  "naming": {
+    "MAX_ROOM_NAME_LENGTH": {
+      "value": 96,
+      "derivation": "最長は fanout 部屋の 60 文字。余裕を持たせた上限"
+    },
+    "FNV1A_OFFSET_BASIS": {
+      "value": 2166136261
+    },
+    "FNV1A_PRIME": {
+      "value": 16777619
+    },
+    "FMIX32_C1": {
+      "value": 2246822507
+    },
+    "FMIX32_C2": {
+      "value": 3266489909
+    }
+  },
+  "slo": {
+    "STALL_RATIO_P95": {
+      "value": 0.005
+    },
+    "AUDIO_GAP_RATIO_P95": {
+      "value": 0.001
+    },
+    "AV_SKEW_MS_P99": {
+      "value": 80,
+      "derivation": "人間の知覚閾値"
+    },
+    "KEYFRAME_REQUEST_RATE_P95": {
+      "value": 1,
+      "unit": "回/分"
+    },
+    "GLASS_TO_GLASS_MS_P50": {
+      "value": 150,
+      "derivation": "クライアント↔DO 往復 25ms + DO 間 2ms + 処理",
+      "fact": "F-017,F-018"
+    },
+    "NODE_UTILIZATION_P95": {
+      "value": 0.8,
+      "derivation": "constants.md 1 節の安全率と一致"
+    }
+  },
+  "conformance": {
+    "TRACE_FORMAT_VERSION": {
+      "value": 1,
+      "derivation": "トレースベクタの形式版。互換性を壊す変更で増やす",
+      "adr": "ADR-0016"
+    },
+    "FUZZ_STEPS_PER_RUN": {
+      "value": 2000,
+      "derivation": "1 回の差分ファジングで流す入力イベント数。プルリクエストごとの所要時間から決めた上限",
+      "adr": "ADR-0016"
+    },
+    "FUZZ_RUNS_PER_PULL_REQUEST": {
+      "value": 20,
+      "derivation": "プルリクエストごとの試行回数",
+      "adr": "ADR-0016"
+    },
+    "FUZZ_RUNS_NIGHTLY": {
+      "value": 5000,
+      "derivation": "夜間の試行回数",
+      "adr": "ADR-0016"
+    },
+    "PRNG_MULTIPLIER_SHIFTS": {
+      "value": "13,7,17",
+      "derivation": "conformance.md 3.2 の xorshift の移動量",
+      "adr": "ADR-0016"
+    }
+  },
+  "display": {
+    "DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID": {
+      "value": 0,
+      "derivation": "表示寸法の申告が無い相手に要求する層。最低品質（V_360P15）に相当する。既定を高品質にすると申告漏れが帯域予算を壊す",
+      "adr": "ADR-0015"
+    },
+    "DISPLAY_SIZE_REPORT_MIN_INTERVAL_MS": {
+      "value": 200,
+      "derivation": "寸法変化の申告の最小間隔。REPORT_INTERVAL_MS と同じ周期に揃える",
+      "adr": "ADR-0015"
+    }
+  },
+  "lineBudget": {
+    "LINE_BUDGET_TYPESCRIPT": {
+      "value": 6,
+      "derivation": "sdk-api.md 1 節の行数予算",
+      "adr": "ADR-0015"
+    },
+    "LINE_BUDGET_FRAMEWORK": {
+      "value": 6,
+      "derivation": "同上（React / Vue / Svelte）",
+      "adr": "ADR-0015"
+    },
+    "LINE_BUDGET_MOBILE": {
+      "value": 10,
+      "derivation": "同上（Flutter / Swift / Kotlin）",
+      "adr": "ADR-0015"
+    },
+    "LINE_BUDGET_NATIVE": {
+      "value": 10,
+      "derivation": "同上（Rust / C++）",
+      "adr": "ADR-0015"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+[package]
+name = "wheso-client"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Free, open-source video calling client."
+
+[dependencies]

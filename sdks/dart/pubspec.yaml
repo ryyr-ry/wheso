@@ -1,0 +1,6 @@
+name: wheso_client
+description: Free, open-source video calling. One-line integration.
+version: 0.0.0
+publish_to: none
+environment:
+  sdk: ^3.5.0

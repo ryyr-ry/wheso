@@ -1,0 +1,250 @@
+{
+  "description": "規範から独立に著述したベクタ。実装に合わせて変更してはならない。",
+  "hash": [
+    {
+      "input": "",
+      "fnv1a32": 2166136261,
+      "fmix32OfFnv": 2872998923
+    },
+    {
+      "input": "a",
+      "fnv1a32": 3826002220,
+      "fmix32OfFnv": 444641715
+    },
+    {
+      "input": "abc",
+      "fnv1a32": 440920331,
+      "fmix32OfFnv": 482950588
+    },
+    {
+      "input": "video:550e8400e29b41d4a716446655440000:0",
+      "fnv1a32": 1425218339,
+      "fmix32OfFnv": 2311643431
+    },
+    {
+      "input": "audio:6ba7b8109dad11d180b400c04fd430c8:3",
+      "fnv1a32": 1682300571,
+      "fmix32OfFnv": 4152820287
+    }
+  ],
+  "names": [
+    {
+      "kind": "meta",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa"
+      ],
+      "name": "meta-01jxy8kq2r3mz5v7h9abcderfa"
+    },
+    {
+      "kind": "ctl",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "550e8400e29b41d4a716446655440000"
+      ],
+      "name": "ctl-01jxy8kq2r3mz5v7h9abcderfa-550e8400e29b41d4a716446655440000"
+    },
+    {
+      "kind": "vs",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "550e8400e29b41d4a716446655440000"
+      ],
+      "name": "vs-01jxy8kq2r3mz5v7h9abcderfa-550e8400e29b41d4a716446655440000"
+    },
+    {
+      "kind": "vr",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "550e8400e29b41d4a716446655440000"
+      ],
+      "name": "vr-01jxy8kq2r3mz5v7h9abcderfa-550e8400e29b41d4a716446655440000"
+    },
+    {
+      "kind": "as",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "550e8400e29b41d4a716446655440000"
+      ],
+      "name": "as-01jxy8kq2r3mz5v7h9abcderfa-550e8400e29b41d4a716446655440000"
+    },
+    {
+      "kind": "ar",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "550e8400e29b41d4a716446655440000"
+      ],
+      "name": "ar-01jxy8kq2r3mz5v7h9abcderfa-550e8400e29b41d4a716446655440000"
+    },
+    {
+      "kind": "vsh",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "auto",
+        1,
+        0
+      ],
+      "name": "vsh-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0"
+    },
+    {
+      "kind": "ash",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "auto",
+        7,
+        3
+      ],
+      "name": "ash-01jxy8kq2r3mz5v7h9abcderfa-auto-7-3"
+    },
+    {
+      "kind": "vfo",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "auto",
+        2,
+        1,
+        4
+      ],
+      "name": "vfo-01jxy8kq2r3mz5v7h9abcderfa-auto-2-1-4"
+    },
+    {
+      "kind": "vco",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "auto",
+        5
+      ],
+      "name": "vco-01jxy8kq2r3mz5v7h9abcderfa-auto-5"
+    },
+    {
+      "kind": "aag",
+      "args": [
+        "01jxy8kq2r3mz5v7h9abcderfa",
+        "auto",
+        5
+      ],
+      "name": "aag-01jxy8kq2r3mz5v7h9abcderfa-auto-5"
+    }
+  ],
+  "assignments": [
+    {
+      "namespace": "video",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 1,
+      "shardIndex": 0
+    },
+    {
+      "namespace": "video",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 2,
+      "shardIndex": 1
+    },
+    {
+      "namespace": "video",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 3,
+      "shardIndex": 1
+    },
+    {
+      "namespace": "video",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 8,
+      "shardIndex": 1
+    },
+    {
+      "namespace": "video",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 35,
+      "shardIndex": 33
+    },
+    {
+      "namespace": "video",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 1,
+      "shardIndex": 0
+    },
+    {
+      "namespace": "video",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 2,
+      "shardIndex": 0
+    },
+    {
+      "namespace": "video",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 3,
+      "shardIndex": 2
+    },
+    {
+      "namespace": "video",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 8,
+      "shardIndex": 2
+    },
+    {
+      "namespace": "video",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 35,
+      "shardIndex": 23
+    },
+    {
+      "namespace": "audio",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 1,
+      "shardIndex": 0
+    },
+    {
+      "namespace": "audio",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 2,
+      "shardIndex": 1
+    },
+    {
+      "namespace": "audio",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 3,
+      "shardIndex": 2
+    },
+    {
+      "namespace": "audio",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 8,
+      "shardIndex": 2
+    },
+    {
+      "namespace": "audio",
+      "userId": "550e8400e29b41d4a716446655440000",
+      "shardCount": 35,
+      "shardIndex": 24
+    },
+    {
+      "namespace": "audio",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 1,
+      "shardIndex": 0
+    },
+    {
+      "namespace": "audio",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 2,
+      "shardIndex": 0
+    },
+    {
+      "namespace": "audio",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 3,
+      "shardIndex": 2
+    },
+    {
+      "namespace": "audio",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 8,
+      "shardIndex": 3
+    },
+    {
+      "namespace": "audio",
+      "userId": "6ba7b8109dad11d180b400c04fd430c8",
+      "shardCount": 35,
+      "shardIndex": 3
+    }
+  ]
+}

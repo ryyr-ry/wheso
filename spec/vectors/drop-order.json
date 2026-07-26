@@ -1,0 +1,50 @@
+[
+  {
+    "name": "audio-never-dropped",
+    "channel": 2,
+    "flags": 8,
+    "expectedPriority": null
+  },
+  {
+    "name": "video-key-never-dropped",
+    "channel": 1,
+    "flags": 1,
+    "expectedPriority": null
+  },
+  {
+    "name": "discardable-plain",
+    "channel": 1,
+    "flags": 2,
+    "expectedPriority": 1
+  },
+  {
+    "name": "discardable-active-speaker",
+    "channel": 1,
+    "flags": 34,
+    "expectedPriority": 2
+  },
+  {
+    "name": "discardable-screen-content",
+    "channel": 3,
+    "flags": 18,
+    "expectedPriority": 3
+  },
+  {
+    "name": "discardable-screen-and-speaker",
+    "channel": 3,
+    "flags": 50,
+    "expectedPriority": 3
+  },
+  {
+    "name": "non-discardable-plain",
+    "channel": 1,
+    "flags": 0,
+    "expectedPriority": 4
+  },
+  {
+    "name": "non-discardable-active-speaker",
+    "channel": 1,
+    "flags": 32,
+    "expectedPriority": 5
+  }
+]

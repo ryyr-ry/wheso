@@ -1,0 +1,24 @@
+{
+  "name": "wheso",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "codegen:check": "node tools/codegen.ts check",
+    "codegen:generate": "node tools/codegen.ts generate",
+    "vectors:check": "node tools/vectors.ts check",
+    "naming:check": "node tools/naming.ts check",
+    "auth:check": "node tools/auth.ts",
+    "capacity:check": "node tools/capacity.ts",
+    "forbidden:check": "node tools/forbidden.ts packages tools",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "ci": "npm run typecheck && npm run codegen:check && npm run vectors:check && npm run naming:check && npm run auth:check && npm run capacity:check && npm run forbidden:check && npm test"
+  },
+  "devDependencies": {
+    "typescript": "5.9.2",
+    "@types/node": "24.3.0"
+  }
+}

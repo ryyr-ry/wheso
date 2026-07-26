@@ -1,0 +1,130 @@
+/**
+ * 禁止構文の文字列検査。
+ *
+ * spec/lint-policy.md の禁止構文を、lint の抜け穴（コメント内の抑制指示、
+ * 設定ファイル、生成コード）まで含めて検出する。
+ *
+ * 実行: node tools/forbidden.ts
+ */
+import { readdir, readFile } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** 既定は公開ディレクトリのみ。追加の対象はコマンド引数で渡す。 */
+const SCAN_DIRS: readonly string[] =
+  process.argv.length > 2 ? process.argv.slice(2) : ["packages", "tools"];
+const SKIP_DIR_NAMES = new Set(["node_modules", ".git", "dist", "build", "generated", ".partykit"]);
+const SCAN_EXTENSIONS = [".ts", ".tsx"];
+
+interface Rule {
+  readonly name: string;
+  readonly pattern: RegExp;
+  readonly note: string;
+}
+
+const RULES: readonly Rule[] = [
+  { name: "explicit-any", pattern: /(:|<)\s*any\b/g, note: "型注釈での any" },
+  { name: "any-array", pattern: /\bany\[\]/g, note: "any の配列" },
+  { name: "type-assertion-as", pattern: /\bas\s+(?!const\b)[A-Z_$][A-Za-z0-9_$<>\[\]|.]*/g, note: "型アサーション as T" },
+  { name: "angle-assertion", pattern: /=\s*<[A-Z][A-Za-z0-9_$]*>\s*[A-Za-z_$]/g, note: "山括弧の型アサーション" },
+  { name: "ts-ignore", pattern: /@ts-(ignore|expect-error|nocheck)/g, note: "型検査の抑制" },
+  { name: "eslint-disable", pattern: /eslint-disable/g, note: "lint の抑制" },
+  { name: "non-null-assertion", pattern: /[A-Za-z0-9_$\])]![.[(]/g, note: "非 null 断定" },
+];
+
+interface DirEntryInfo {
+  readonly name: string;
+  isDirectory(): boolean;
+}
+
+async function readDirNames(dir: string): Promise<readonly DirEntryInfo[]> {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true, encoding: "utf8" });
+    const out: DirEntryInfo[] = [];
+    for (const entry of entries) {
+      const name: unknown = entry.name;
+      if (typeof name !== "string") {
+        continue;
+      }
+      const isDir = entry.isDirectory();
+      out.push({ name, isDirectory: (): boolean => isDir });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+async function collectFiles(dir: string, out: string[]): Promise<void> {
+  const names = await readDirNames(dir);
+  for (const entry of names) {
+    if (entry.isDirectory()) {
+      if (SKIP_DIR_NAMES.has(entry.name)) {
+        continue;
+      }
+      await collectFiles(join(dir, entry.name), out);
+      continue;
+    }
+    for (const extension of SCAN_EXTENSIONS) {
+      if (entry.name.endsWith(extension)) {
+        out.push(join(dir, entry.name));
+        break;
+      }
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  const files: string[] = [];
+  for (const dir of SCAN_DIRS) {
+    await collectFiles(join(root, dir), files);
+  }
+  files.sort();
+
+  let violations = 0;
+  for (const file of files) {
+    const content = await readFile(file, "utf8");
+    const lines = content.split("\n");
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (line === undefined) {
+        continue;
+      }
+      const trimmed = line.trim();
+      // 行コメントと本ファイル自身のルール定義は対象外とする
+      if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("import ")) {
+        continue;
+      }
+      if (file.endsWith("forbidden.ts")) {
+        continue;
+      }
+      for (const rule of RULES) {
+        rule.pattern.lastIndex = 0;
+        const match = rule.pattern.exec(line);
+        if (match !== null) {
+          violations += 1;
+          process.stdout.write(
+            `VIOLATION ${relative(root, file)}:${index + 1} [${rule.name}] ${rule.note}\n    ${trimmed}\n`,
+          );
+        }
+      }
+    }
+  }
+
+  process.stdout.write(`検査対象 ${files.length} ファイル\n`);
+  if (violations === 0) {
+    process.stdout.write("OK: 禁止構文なし\n");
+    return;
+  }
+  process.stdout.write(`${violations} 件の違反\n`);
+  process.exitCode = 1;
+}
+
+main().catch((error: unknown): void => {
+  const detail = error instanceof Error ? `${error.name}: ${error.message}` : "unknown";
+  process.stderr.write(`FAILED: ${detail}\n`);
+  process.exitCode = 1;
+});

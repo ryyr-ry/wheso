@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.25)
+project(wheso_client LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_library(wheso_client INTERFACE)
+target_include_directories(wheso_client INTERFACE include)

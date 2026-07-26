@@ -1,0 +1,19 @@
+{
+  "name": "@wheso/core",
+  "version": "0.0.0",
+  "description": "Protocol primitives: wire format, deterministic room naming, token verification.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": [
+    "src",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

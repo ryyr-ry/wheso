@@ -1,0 +1,12 @@
+Party SFU
+Copyright 2026 Party SFU contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This repository currently contains no source code and therefore no third-party
+runtime dependencies. When source code is added, list every dependency here with
+its license and upstream URL.

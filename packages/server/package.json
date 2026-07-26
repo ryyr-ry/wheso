@@ -1,0 +1,22 @@
+{
+  "name": "@wheso/server",
+  "version": "0.0.0",
+  "description": "Durable Object nodes: sender, receiver, shard, fanout, coordinator, meta, control.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": [
+    "src",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@wheso/core": "*"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

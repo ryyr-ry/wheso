@@ -1,0 +1,22 @@
+{
+  "name": "@wheso/client",
+  "version": "0.0.0",
+  "description": "Browser SDK. One-line entry point, media pipelines, default UI.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": [
+    "src",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@wheso/core": "*"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

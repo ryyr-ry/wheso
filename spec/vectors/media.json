@@ -1,0 +1,105 @@
+[
+  {
+    "name": "video-keyframe-minimal",
+    "description": "映像キーフレーム 1 ユニット。最小構成",
+    "bytesHex": "a101010100000001000000010000000000000000090000000000000412345678",
+    "message": {
+      "channel": 1,
+      "senderId": 1,
+      "units": [
+        {
+          "sequenceNumber": 1,
+          "captureTimestampUs": "0",
+          "flags": 9,
+          "spatialId": 0,
+          "temporalId": 0,
+          "payloadHex": "12345678"
+        }
+      ]
+    }
+  },
+  {
+    "name": "video-delta-top-temporal",
+    "description": "映像 delta。最上位 temporal 層なので DISCARDABLE=1",
+    "bytesHex": "a10101010001e240fffffffe000462d53c8abac00a03020000000003aabbcc",
+    "message": {
+      "channel": 1,
+      "senderId": 123456,
+      "units": [
+        {
+          "sequenceNumber": 4294967294,
+          "captureTimestampUs": "1234567890123456",
+          "flags": 10,
+          "spatialId": 3,
+          "temporalId": 2,
+          "payloadHex": "aabbcc"
+        }
+      ]
+    }
+  },
+  {
+    "name": "audio-bundle-two-units",
+    "description": "音声 40ms 束ね。2 ユニット。1 つは DTX",
+    "bytesHex": "a10102020000002a000003e80000000000004e2008000000000000050102030405000003e90000000000009c400c000000000000020607",
+    "message": {
+      "channel": 2,
+      "senderId": 42,
+      "units": [
+        {
+          "sequenceNumber": 1000,
+          "captureTimestampUs": "20000",
+          "flags": 8,
+          "spatialId": 0,
+          "temporalId": 0,
+          "payloadHex": "0102030405"
+        },
+        {
+          "sequenceNumber": 1001,
+          "captureTimestampUs": "40000",
+          "flags": 12,
+          "spatialId": 0,
+          "temporalId": 0,
+          "payloadHex": "0607"
+        }
+      ]
+    }
+  },
+  {
+    "name": "screen-keyframe-active-speaker",
+    "description": "画面共有キーフレーム。SCREEN_CONTENT と ACTIVE_SPEAKER",
+    "bytesHex": "a10103010000000700000005000000e8d4a50fff3901000000000001ff",
+    "message": {
+      "channel": 3,
+      "senderId": 7,
+      "units": [
+        {
+          "sequenceNumber": 5,
+          "captureTimestampUs": "999999999999",
+          "flags": 57,
+          "spatialId": 1,
+          "temporalId": 0,
+          "payloadHex": "ff"
+        }
+      ]
+    }
+  },
+  {
+    "name": "video-max-flags",
+    "description": "全フラグ立て。境界値確認",
+    "bytesHex": "a1010101ffffffffffffffffffffffffffffffff3f0307000000000100",
+    "message": {
+      "channel": 1,
+      "senderId": 4294967295,
+      "units": [
+        {
+          "sequenceNumber": 4294967295,
+          "captureTimestampUs": "18446744073709551615",
+          "flags": 63,
+          "spatialId": 3,
+          "temporalId": 7,
+          "payloadHex": "00"
+        }
+      ]
+    }
+  }
+]

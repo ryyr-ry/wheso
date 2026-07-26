@@ -1,0 +1,282 @@
+{
+  "$comment": "エラーの機械可読定義。規範はエラー規範（errors）。closeCode は WebSocket のクローズコード。",
+  "closeCodes": [
+    {
+      "name": "E_WIRE_MAGIC",
+      "closeCode": 4001,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.wire.magic"
+    },
+    {
+      "name": "E_WIRE_VERSION",
+      "closeCode": 4002,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.wire.version"
+    },
+    {
+      "name": "E_WIRE_LENGTH_MISMATCH",
+      "closeCode": 4003,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.wire.length"
+    },
+    {
+      "name": "E_WIRE_UNIT_COUNT",
+      "closeCode": 4004,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.wire.unitCount"
+    },
+    {
+      "name": "E_WIRE_SENDER_ID",
+      "closeCode": 4005,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.wire.senderId"
+    },
+    {
+      "name": "E_WIRE_PAYLOAD_EMPTY",
+      "closeCode": 4006,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.wire.payloadEmpty"
+    },
+    {
+      "name": "E_WIRE_UNIT_ORDER",
+      "closeCode": 4007,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.wire.unitOrder"
+    },
+    {
+      "name": "E_WIRE_TOO_LARGE",
+      "closeCode": 4008,
+      "recoverable": true,
+      "autoReconnect": true,
+      "i18nKey": "error.wire.tooLarge"
+    },
+    {
+      "name": "E_WIRE_CHANNEL",
+      "closeCode": 4003,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.wire.channel"
+    },
+    {
+      "name": "E_WIRE_FIELD_RANGE",
+      "closeCode": 4003,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.wire.fieldRange"
+    },
+    {
+      "name": "E_CTRL_VERSION",
+      "closeCode": 4010,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.ctrl.version"
+    },
+    {
+      "name": "E_CTRL_NO_HELLO",
+      "closeCode": 4011,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.ctrl.noHello"
+    },
+    {
+      "name": "E_CTRL_DUPLICATE_HELLO",
+      "closeCode": 4012,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.ctrl.duplicateHello"
+    },
+    {
+      "name": "E_CTRL_SCHEMA",
+      "closeCode": 4013,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.ctrl.schema"
+    },
+    {
+      "name": "E_AUTH",
+      "closeCode": 4020,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.auth.invalid"
+    },
+    {
+      "name": "E_AUTH_EXPIRED",
+      "closeCode": 4021,
+      "recoverable": true,
+      "autoReconnect": true,
+      "i18nKey": "error.auth.expired"
+    },
+    {
+      "name": "E_AUTH_AUDIENCE",
+      "closeCode": 4022,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.auth.audience"
+    },
+    {
+      "name": "E_NODE_AUTH",
+      "closeCode": 4023,
+      "recoverable": true,
+      "autoReconnect": true,
+      "i18nKey": "error.auth.node"
+    },
+    {
+      "name": "E_FORBIDDEN",
+      "closeCode": 4024,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.auth.forbidden"
+    },
+    {
+      "name": "E_AUTH_ROOM",
+      "closeCode": 4022,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.auth.room"
+    },
+    {
+      "name": "E_AUTH_KIND",
+      "closeCode": 4020,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.auth.kind"
+    },
+    {
+      "name": "E_RATE_LIMIT_MESSAGES",
+      "closeCode": 4030,
+      "recoverable": true,
+      "autoReconnect": true,
+      "i18nKey": "error.rate.messages"
+    },
+    {
+      "name": "E_RATE_LIMIT_CONNECT",
+      "closeCode": 4031,
+      "recoverable": true,
+      "autoReconnect": true,
+      "i18nKey": "error.rate.connect"
+    },
+    {
+      "name": "E_NODE_OVERLOADED",
+      "closeCode": 4032,
+      "recoverable": true,
+      "autoReconnect": true,
+      "i18nKey": "error.node.overloaded"
+    },
+    {
+      "name": "E_ROOM_FULL",
+      "closeCode": 4033,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.room.full"
+    },
+    {
+      "name": "E_EPOCH_STALE",
+      "closeCode": 4040,
+      "recoverable": true,
+      "autoReconnect": true,
+      "i18nKey": "error.epoch.stale"
+    },
+    {
+      "name": "E_MEETING_ENDED",
+      "closeCode": 4041,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.meeting.ended"
+    },
+    {
+      "name": "E_EVICTED",
+      "closeCode": 4042,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.meeting.evicted"
+    },
+    {
+      "name": "E_NAME_MEETING_ID",
+      "closeCode": 4050,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.name.meetingId"
+    },
+    {
+      "name": "E_NAME_USER_ID",
+      "closeCode": 4051,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.name.userId"
+    },
+    {
+      "name": "E_NAME_REGION",
+      "closeCode": 4052,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.name.region"
+    },
+    {
+      "name": "E_NAME_EPOCH",
+      "closeCode": 4053,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.name.epoch"
+    },
+    {
+      "name": "E_NAME_SHARD_INDEX",
+      "closeCode": 4054,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.name.shardIndex"
+    },
+    {
+      "name": "E_NAME_SHARD_COUNT",
+      "closeCode": 4055,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.name.shardCount"
+    },
+    {
+      "name": "E_NAME_TOO_LONG",
+      "closeCode": 4056,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.name.tooLong"
+    }
+  ],
+  "warnings": [
+    {
+      "name": "W_DECODE_FAILED",
+      "i18nKey": "warn.decodeFailed",
+      "notifyUser": false
+    },
+    {
+      "name": "W_ENCODER_UNSUPPORTED",
+      "i18nKey": "warn.encoderUnsupported",
+      "notifyUser": false
+    },
+    {
+      "name": "W_NO_HARDWARE_ENCODER",
+      "i18nKey": "warn.noHardwareEncoder",
+      "notifyUser": false
+    },
+    {
+      "name": "W_DEGRADED",
+      "i18nKey": "warn.degraded",
+      "notifyUser": true
+    },
+    {
+      "name": "W_STANDBY_SWAP",
+      "i18nKey": "warn.standbySwap",
+      "notifyUser": false
+    },
+    {
+      "name": "W_UNEXPECTED_EVENT",
+      "i18nKey": "warn.unexpectedEvent",
+      "notifyUser": false
+    }
+  ]
+}
