@@ -56,5 +56,11 @@ jobs:
       - name: forbidden:check
         run: npm run forbidden:check
 
+      - name: trace:check
+        run: npm run trace:check
+
+      - name: fuzz:check
+        run: npm run fuzz:check
+
       - name: tests
         run: npm test
