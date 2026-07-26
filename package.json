@@ -20,7 +20,8 @@
     "ci": "npm run typecheck && npm run codegen:check && npm run vectors:check && npm run naming:check && npm run auth:check && npm run capacity:check && npm run forbidden:check && npm run trace:check && npm run fuzz:check && npm test"
   },
   "devDependencies": {
-    "typescript": "5.9.2",
-    "@types/node": "24.3.0"
+    "@types/node": "24.3.0",
+    "partykit": "^0.0.115",
+    "typescript": "5.9.2"
   }
 }
