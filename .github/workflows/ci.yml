@@ -82,3 +82,11 @@ jobs:
 
       - name: C++ の適合試験（凍結ベクタとの一致）
         run: npm run test:cpp
+
+      - name: Dart を導入する
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Dart の適合試験（凍結ベクタとの一致）
+        run: npm run test:dart

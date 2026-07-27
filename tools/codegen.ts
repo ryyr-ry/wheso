@@ -17,6 +17,7 @@ const schemaDir = join(root, "spec", "schema");
 const tsOutDir = join(root, "packages", "core", "src", "generated");
 const rustOutDir = join(root, "sdks", "rust", "src", "generated");
 const cppOutDir = join(root, "sdks", "cpp", "include", "wheso", "generated");
+const dartOutDir = join(root, "sdks", "dart", "lib", "src", "generated");
 
 const BANNER = `/**
  * このファイルは自動生成されている。手で編集してはならない。
@@ -524,6 +525,116 @@ function generateWireHpp(schema: Record<string, unknown>): string {
   return `${lines.join("\n")}\n`;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* Dart 向けの生成                                                           */
+/* ------------------------------------------------------------------------- */
+
+const DART_BANNER = `// このファイルは自動生成されている。手で編集してはならない。
+//
+// 生成元: プロトコルのスキーマ定義
+// 再生成: 内部検証スクリプトを実行する
+`;
+
+/** Dart の値表現。整数は int、小数は double、真偽は bool、文字列は String とする。 */
+function formatDartValue(value: unknown): { readonly type: string; readonly literal: string } | null {
+  if (typeof value === "number") {
+    return Number.isInteger(value)
+      ? { type: "int", literal: `${value}` }
+      : { type: "double", literal: String(value) };
+  }
+  if (typeof value === "boolean") {
+    return { type: "bool", literal: String(value) };
+  }
+  if (typeof value === "string") {
+    return { type: "String", literal: JSON.stringify(value) };
+  }
+  if (Array.isArray(value)) {
+    const parts: string[] = [];
+    for (const item of value) {
+      const formatted = formatDartValue(item);
+      if (formatted === null || formatted.type !== "int") {
+        return null;
+      }
+      parts.push(formatted.literal);
+    }
+    return { type: "List<int>", literal: `[${parts.join(", ")}]` };
+  }
+  return null;
+}
+
+function generateConstantsDart(schema: Record<string, unknown>): string {
+  const lines: string[] = [DART_BANNER];
+  for (const [groupName, group] of Object.entries(schema)) {
+    if (groupName.startsWith("$") || !isRecord(group)) {
+      continue;
+    }
+    lines.push(`// ${groupName}`);
+    for (const [constantName, definition] of Object.entries(group)) {
+      if (constantName.startsWith("$") || !isRecord(definition)) {
+        continue;
+      }
+      if (!("value" in definition)) {
+        for (const [key, raw] of Object.entries(definition)) {
+          if (key.startsWith("$") || key === "derivation" || key === "fact" || key === "question" || key === "adr") {
+            continue;
+          }
+          const formatted = formatDartValue(raw);
+          if (formatted === null) {
+            continue;
+          }
+          const suffix = key.replace(/([A-Z])/g, "_$1").toUpperCase();
+          lines.push(`const ${formatted.type} ${constantName}_${suffix} = ${formatted.literal};`);
+        }
+        continue;
+      }
+      const formatted = formatDartValue(definition["value"]);
+      if (formatted === null) {
+        continue;
+      }
+      lines.push(`const ${formatted.type} ${constantName} = ${formatted.literal};`);
+    }
+    lines.push("");
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function generateWireDart(schema: Record<string, unknown>): string {
+  const messageHeader = readObject(schema, "messageHeader");
+  const unitHeader = readObject(schema, "unitHeader");
+  const limits = readObject(schema, "limits");
+  const lines: string[] = [DART_BANNER];
+  lines.push(`const int PROTOCOL_VERSION = ${readNumber(schema, "protocolVersion")};`);
+  lines.push(`const int WIRE_MAGIC = ${readNumber(schema, "magic")};`);
+  lines.push(`const int MESSAGE_HEADER_BYTES = ${readNumber(messageHeader, "bytes")};`);
+  lines.push(`const int UNIT_HEADER_BYTES = ${readNumber(unitHeader, "bytes")};`);
+  lines.push(`const int MAX_UNITS_PER_MESSAGE = ${readNumber(limits, "maxUnitsPerMessage")};`);
+  lines.push(`const int MAX_MESSAGE_BYTES = ${readNumber(limits, "maxMessageBytes")};`);
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "enums"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(`const int CHANNEL_${readString(entry, "name")} = ${readNumber(entry, "value")};`);
+      }
+    }
+  }
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "bitsets"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(`const int FLAG_${readString(entry, "name")} = ${1 << readNumber(entry, "bit")};`);
+      }
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 /* ------------------------------------------------------------------------- */
 /* 実行                                                                      */
 /* ------------------------------------------------------------------------- */
@@ -545,6 +656,8 @@ async function buildArtifacts(): Promise<readonly Artifact[]> {
     { path: join(rustOutDir, "wire_layout.rs"), content: generateWireRs(wire) },
     { path: join(cppOutDir, "constants.hpp"), content: generateConstantsHpp(constants) },
     { path: join(cppOutDir, "wire_layout.hpp"), content: generateWireHpp(wire) },
+    { path: join(dartOutDir, "constants.dart"), content: generateConstantsDart(constants) },
+    { path: join(dartOutDir, "wire_layout.dart"), content: generateWireDart(wire) },
   ];
 }
 
@@ -552,6 +665,7 @@ async function generate(): Promise<void> {
   await mkdir(tsOutDir, { recursive: true });
   await mkdir(rustOutDir, { recursive: true });
   await mkdir(cppOutDir, { recursive: true });
+  await mkdir(dartOutDir, { recursive: true });
   const artifacts = await buildArtifacts();
   for (const artifact of artifacts) {
     await writeFile(artifact.path, artifact.content, "utf8");
