@@ -18,6 +18,7 @@ const tsOutDir = join(root, "packages", "core", "src", "generated");
 const rustOutDir = join(root, "sdks", "rust", "src", "generated");
 const cppOutDir = join(root, "sdks", "cpp", "include", "wheso", "generated");
 const dartOutDir = join(root, "sdks", "dart", "lib", "src", "generated");
+const kotlinOutDir = join(root, "sdks", "kotlin", "src", "main", "kotlin", "dev", "wheso", "generated");
 
 const BANNER = `/**
  * このファイルは自動生成されている。手で編集してはならない。
@@ -635,6 +636,117 @@ function generateWireDart(schema: Record<string, unknown>): string {
   return `${lines.join("\n")}\n`;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* Kotlin 向けの生成                                                         */
+/* ------------------------------------------------------------------------- */
+
+const KOTLIN_BANNER = `// このファイルは自動生成されている。手で編集してはならない。
+//
+// 生成元: プロトコルのスキーマ定義
+// 再生成: 内部検証スクリプトを実行する
+package dev.wheso.generated
+`;
+
+/** Kotlin の値表現。整数は Long、小数は Double、真偽は Boolean、文字列は String とする。 */
+function formatKotlinValue(value: unknown): { readonly type: string; readonly literal: string } | null {
+  if (typeof value === "number") {
+    return Number.isInteger(value)
+      ? { type: "Long", literal: `${value}L` }
+      : { type: "Double", literal: String(value) };
+  }
+  if (typeof value === "boolean") {
+    return { type: "Boolean", literal: String(value) };
+  }
+  if (typeof value === "string") {
+    return { type: "String", literal: JSON.stringify(value) };
+  }
+  if (Array.isArray(value)) {
+    const parts: string[] = [];
+    for (const item of value) {
+      const formatted = formatKotlinValue(item);
+      if (formatted === null || formatted.type !== "Long") {
+        return null;
+      }
+      parts.push(formatted.literal);
+    }
+    return { type: "List<Long>", literal: `listOf(${parts.join(", ")})` };
+  }
+  return null;
+}
+
+function generateConstantsKt(schema: Record<string, unknown>): string {
+  const lines: string[] = [KOTLIN_BANNER];
+  for (const [groupName, group] of Object.entries(schema)) {
+    if (groupName.startsWith("$") || !isRecord(group)) {
+      continue;
+    }
+    lines.push(`// ${groupName}`);
+    for (const [constantName, definition] of Object.entries(group)) {
+      if (constantName.startsWith("$") || !isRecord(definition)) {
+        continue;
+      }
+      if (!("value" in definition)) {
+        for (const [key, raw] of Object.entries(definition)) {
+          if (key.startsWith("$") || key === "derivation" || key === "fact" || key === "question" || key === "adr") {
+            continue;
+          }
+          const formatted = formatKotlinValue(raw);
+          if (formatted === null) {
+            continue;
+          }
+          const suffix = key.replace(/([A-Z])/g, "_$1").toUpperCase();
+          lines.push(`public val ${constantName}_${suffix}: ${formatted.type} = ${formatted.literal}`);
+        }
+        continue;
+      }
+      const formatted = formatKotlinValue(definition["value"]);
+      if (formatted === null) {
+        continue;
+      }
+      lines.push(`public val ${constantName}: ${formatted.type} = ${formatted.literal}`);
+    }
+    lines.push("");
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function generateWireKt(schema: Record<string, unknown>): string {
+  const messageHeader = readObject(schema, "messageHeader");
+  const unitHeader = readObject(schema, "unitHeader");
+  const limits = readObject(schema, "limits");
+  const lines: string[] = [KOTLIN_BANNER];
+  lines.push(`public const val PROTOCOL_VERSION: Int = ${readNumber(schema, "protocolVersion")}`);
+  lines.push(`public const val WIRE_MAGIC: Int = ${readNumber(schema, "magic")}`);
+  lines.push(`public const val MESSAGE_HEADER_BYTES: Int = ${readNumber(messageHeader, "bytes")}`);
+  lines.push(`public const val UNIT_HEADER_BYTES: Int = ${readNumber(unitHeader, "bytes")}`);
+  lines.push(`public const val MAX_UNITS_PER_MESSAGE: Int = ${readNumber(limits, "maxUnitsPerMessage")}`);
+  lines.push(`public const val MAX_MESSAGE_BYTES: Int = ${readNumber(limits, "maxMessageBytes")}`);
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "enums"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(`public const val CHANNEL_${readString(entry, "name")}: Int = ${readNumber(entry, "value")}`);
+      }
+    }
+  }
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "bitsets"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(`public const val FLAG_${readString(entry, "name")}: Int = ${1 << readNumber(entry, "bit")}`);
+      }
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 /* ------------------------------------------------------------------------- */
 /* 実行                                                                      */
 /* ------------------------------------------------------------------------- */
@@ -658,6 +770,8 @@ async function buildArtifacts(): Promise<readonly Artifact[]> {
     { path: join(cppOutDir, "wire_layout.hpp"), content: generateWireHpp(wire) },
     { path: join(dartOutDir, "constants.dart"), content: generateConstantsDart(constants) },
     { path: join(dartOutDir, "wire_layout.dart"), content: generateWireDart(wire) },
+    { path: join(kotlinOutDir, "Constants.kt"), content: generateConstantsKt(constants) },
+    { path: join(kotlinOutDir, "WireLayout.kt"), content: generateWireKt(wire) },
   ];
 }
 
@@ -666,6 +780,7 @@ async function generate(): Promise<void> {
   await mkdir(rustOutDir, { recursive: true });
   await mkdir(cppOutDir, { recursive: true });
   await mkdir(dartOutDir, { recursive: true });
+  await mkdir(kotlinOutDir, { recursive: true });
   const artifacts = await buildArtifacts();
   for (const artifact of artifacts) {
     await writeFile(artifact.path, artifact.content, "utf8");

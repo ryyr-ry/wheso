@@ -23,7 +23,8 @@
     "test:e2e": "node --test \"tests/e2e/*.test.ts\"",
     "test:rust": "cargo test --manifest-path sdks/rust/Cargo.toml",
     "test:cpp": "bash sdks/cpp/run-tests.sh",
-    "test:dart": "cd sdks/dart && dart pub get && dart test"
+    "test:dart": "cd sdks/dart && dart pub get && dart test",
+    "test:kotlin": "cd sdks/kotlin && gradle test --no-daemon --quiet"
   },
   "devDependencies": {
     "@types/node": "24.3.0",

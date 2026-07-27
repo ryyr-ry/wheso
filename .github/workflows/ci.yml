@@ -90,3 +90,15 @@ jobs:
 
       - name: Dart の適合試験（凍結ベクタとの一致）
         run: npm run test:dart
+
+      - name: JDK を導入する
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle を導入する
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Kotlin の適合試験（凍結ベクタとの一致）
+        run: npm run test:kotlin

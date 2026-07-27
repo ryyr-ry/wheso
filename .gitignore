@@ -9,3 +9,6 @@ build/
 .partykit/
 target/
 sdks/cpp/build/
+sdks/kotlin/build/
+.gradle/
+sdks/dart/.dart_tool/

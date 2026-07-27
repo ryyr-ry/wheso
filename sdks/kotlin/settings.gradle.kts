@@ -1,1 +1,1 @@
-rootProject.name = "sfu-client-android"
+rootProject.name = "wheso-client-android"
