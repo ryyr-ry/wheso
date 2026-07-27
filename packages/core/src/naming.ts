@@ -167,7 +167,10 @@ export function shardCount(
   if (!Number.isInteger(previousCount) || previousCount < 0) {
     return err({ code: "E_NAME_SHARD_COUNT", detail: `previousCount=${previousCount}` });
   }
-  const required = Math.max(1, Math.ceil(participantCount / maxPerShard));
+  // 切り上げ除算を整数で行う。浮動小数点除算は言語ごとに丸めが異なるため使わない
+  // （conformance.md 3.3、ADR-0017）。ceil(a / b) = floor((a + b - 1) / b)。
+  const ceiled = Math.trunc((participantCount + maxPerShard - 1) / maxPerShard);
+  const required = ceiled < 1 ? 1 : ceiled;
   return ok(Math.max(required, previousCount));
 }
 

@@ -230,3 +230,34 @@ test("同じ入力列を 2 回流すと同じ出力になる（決定性）", ()
   ];
   assert.deepEqual(drive(events).commands, drive(events).commands);
 });
+
+test("FAILED では open() 以外のいかなるイベントでも復帰しない", () => {
+  // 監査で「FAILED に timeout を送ると復帰する実装」が試験を通り抜けた。
+  // 表 22 行目は open() のみを認めているため、全イベント種を網羅して確かめる。
+  const fatalCode = ERROR_DEFINITIONS.E_WIRE_MAGIC.closeCode;
+  const failed = drive([
+    { event: { kind: "open" }, t: 0 },
+    { event: { kind: "socketOpen" }, t: 10 },
+    { event: { kind: "socketClose", code: fatalCode }, t: 20 },
+  ]).state;
+  assert.equal(failed.phase, "FAILED");
+
+  const others: readonly ConnectionEvent[] = [
+    { kind: "timeout" },
+    { kind: "socketOpen" },
+    { kind: "socketError" },
+    { kind: "socketClose", code: 1000 },
+    { kind: "helloAck" },
+    { kind: "reportTimer" },
+    { kind: "trendDegrade" },
+    { kind: "trendRecover" },
+    { kind: "stall", durationMs: 100_000 },
+    { kind: "standbyKeyframe" },
+    { kind: "close" },
+  ];
+  for (const event of others) {
+    const result = connectionStep(failed, event, 1000);
+    assert.equal(result.state.phase, "FAILED", `${event.kind} では復帰しない`);
+    assert.equal(result.commands.length, 0, `${event.kind} では副作用を出さない`);
+  }
+});

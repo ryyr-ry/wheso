@@ -26,6 +26,19 @@ interface Rule {
 }
 
 /** 言語ごとに適用する規則を分ける。拡張子で判定する。 */
+/**
+ * コア（判断を行う層）でのみ適用する規則。
+ * lint-policy.md 9 節: コアで浮動小数点・時刻・乱数・入出力を使わない。
+ * 対象は packages/core/src と packages/client/src の sync / transport / quality である。
+ */
+const CORE_RULES: readonly Rule[] = [
+  { name: "core-float-type", pattern: /:\s*(number)\s*=\s*[0-9]+\.[0-9]/g, note: "小数リテラルの代入" },
+  { name: "core-clock", pattern: /\b(Date\.now|performance\.now)\b/g, note: "時刻の取得" },
+  { name: "core-random", pattern: /\bMath\.random\b/g, note: "言語標準の乱数" },
+  { name: "core-timer", pattern: /\b(setTimeout|setInterval)\b/g, note: "待機（出力コマンドで表す）" },
+  { name: "core-float-div", pattern: /Math\.(ceil|floor)\s*\(\s*[A-Za-z_$][A-Za-z0-9_$.]*\s*\//g, note: "浮動小数点除算の切り上げ・切り捨て" },
+];
+
 const RUST_RULES: readonly Rule[] = [
   { name: "rust-unwrap", pattern: /\.unwrap\(/g, note: "unwrap（パニックする）" },
   { name: "rust-expect", pattern: /\.expect\(/g, note: "expect（パニックする）" },
@@ -115,7 +128,19 @@ async function main(): Promise<void> {
       // 規範（lint-policy.md 9 節）はコアと製品コードを対象とする。
       const isRust = file.endsWith(".rs");
       const isTest = file.includes("/tests/") || file.endsWith(".test.ts");
-      const activeRules = isRust ? (isTest ? [] : RUST_RULES) : RULES;
+      const isCore =
+        !isTest &&
+        (file.includes("/packages/core/src/") ||
+          file.includes("/packages/client/src/sync/") ||
+          file.includes("/packages/client/src/transport/") ||
+          file.includes("/packages/client/src/quality/"));
+      const activeRules = isRust
+        ? isTest
+          ? []
+          : RUST_RULES
+        : isCore
+          ? [...RULES, ...CORE_RULES]
+          : RULES;
       for (const rule of activeRules) {
         rule.pattern.lastIndex = 0;
         const match = rule.pattern.exec(line);

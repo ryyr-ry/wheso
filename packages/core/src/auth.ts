@@ -10,6 +10,7 @@
  *   any / 型アサーション / 非 null 断定を使用しない。例外を投げない。
  */
 
+import { truncDiv } from "./fixed.ts";
 import { err, ok, type Result } from "./wire.ts";
 import { personalRoom, validateMeetingId, validateUserId } from "./naming.ts";
 
@@ -343,7 +344,11 @@ export async function deriveMeetingSecret(
 }
 
 export function nodeAuthTimeWindow(nowSec: number): number {
-  return Math.floor(nowSec / NODE_AUTH_TIME_WINDOW_SEC);
+  // 整数除算を使う。浮動小数点除算は言語ごとに丸めが異なる（ADR-0017）。
+  // 時刻は非負であるため切り捨てと切り下げは一致する。
+  const divided = truncDiv(nowSec, NODE_AUTH_TIME_WINDOW_SEC);
+  // 窓の長さは定数であり 0 にならない。範囲外は時刻が異常な場合のみで、その場合は 0 とする。
+  return divided.ok ? divided.value : 0;
 }
 
 export async function nodeAuthTag(

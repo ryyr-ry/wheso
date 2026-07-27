@@ -281,6 +281,10 @@ fn handle_leave(state: &ShardState, id: i64) -> StepResult {
     next.participants.retain(|value| *value != id);
     next.subscriptions
         .retain(|sub| sub.subscriber_id != id && sub.target_id != id);
+    // 退出者の遅延勾配と観測した spatialId も除去する。
+    // 残すと、居なくなった相手の古い観測が輻輳の判定に影響し続ける。
+    next.trends.retain(|trend| trend.subscriber_id != id);
+    next.max_spatial.retain(|entry| entry.from != id);
     StepResult { state: next, commands: Vec::new() }
 }
 

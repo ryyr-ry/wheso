@@ -427,8 +427,18 @@ function handleLeave(state: ShardState, event: LeaveEvent, _t: number): StepResu
   const newSubscriptions = state.subscriptions.filter(
     (s) => s.subscriberId !== event.id && s.targetId !== event.id,
   );
+  // 退出者の遅延勾配と観測した spatialId も除去する。
+  // 残すと、居なくなった相手の古い観測が輻輳の判定に影響し続ける。
+  const newTrends = state.trends.filter((trend) => trend.subscriberId !== event.id);
+  const newMaxSpatial = state.maxSpatial.filter((entry) => entry.from !== event.id);
   return {
-    state: { ...state, participants: newParticipants, subscriptions: newSubscriptions },
+    state: {
+      ...state,
+      participants: newParticipants,
+      subscriptions: newSubscriptions,
+      trends: newTrends,
+      maxSpatial: newMaxSpatial,
+    },
     commands: [],
   };
 }

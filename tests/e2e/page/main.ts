@@ -208,10 +208,13 @@ async function run(wsBase: string, room: string, subscribeSenderId = 1): Promise
     frame.close();
   }
 
-  // 縞（白）が 8 画素分入るため、平均は模様の色より明るくなる。許容幅を持たせる。
+  // 縞（白）が 8/320 画素分入るため平均はわずかに明るくなる。AV1 は非可逆であるため
+  // 完全一致はしないが、実測の差は 4〜5 である。許容幅 10 とし、別の映像が来たら落ちるようにする。
+  // 監査の指摘: 許容幅 40 では「近い色のノイズ」を通してしまう。
+  const TOLERANCE = 10;
   const withinTolerance = PATTERN_COLOR.every((expected, index) => {
     const actual = color[index] ?? 0;
-    return Math.abs(actual - expected) <= 40;
+    return Math.abs(actual - expected) <= TOLERANCE;
   });
 
   return {
