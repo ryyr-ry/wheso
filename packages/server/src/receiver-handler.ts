@@ -71,6 +71,7 @@ export function handleUpstreamBinary(
       key: (unit.flags & 0x01) !== 0,
       bytes: unit.payload.length,
       flags: unit.flags,
+      seq: unit.sequenceNumber,
     };
     const result = receiverStep(core, event);
     core = result.state;
@@ -111,6 +112,21 @@ export function handleClientText(
     }
   }
   return { core };
+}
+
+/**
+ * ACK_INTERVAL_MS の周期で呼ばれ、受信済みの位置を ack として上流へ返す。
+ * 周期の管理は入口（Durable Object）が行う。コアは時刻を持たない。
+ */
+export function handleAckTimer(
+  state: ReceiverHandlerState,
+  transport: ReceiverTransport,
+): ReceiverHandlerState {
+  const result = receiverStep(state.core, { kind: "timer" });
+  for (const command of result.commands) {
+    applyCommand(command, transport);
+  }
+  return { core: result.state };
 }
 
 /** 送信者の退出を入力イベントへ翻訳する。 */
@@ -184,6 +200,19 @@ function applyCommand(command: ReceiverCommand, transport: ReceiverTransport): v
       return;
     case "notify":
       transport.sendTextToClient(JSON.stringify({ t: "warning", code: command.code }));
+      return;
+    case "ack":
+      // ack は制御リンクで上流へ返す。媒体リンクが詰まると ack が届かず
+      // 送信窓が閉じたまま復帰できないためである（wire-format.md 2.5.1）。
+      transport.sendUpstream(
+        JSON.stringify({
+          t: "ack",
+          senderId: command.senderId,
+          channel: command.channel,
+          spatialId: command.spatialId,
+          highestSeq: command.highestSeq,
+        }),
+      );
       return;
     case "drop":
       // 破棄は送らないことで表現される。

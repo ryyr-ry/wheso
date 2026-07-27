@@ -16,8 +16,11 @@ import type * as Party from "partykit/server";
 
 import { NODE_MAX_OUT_BYTES_PER_SEC } from "@wheso/core/src/generated/constants.ts";
 
+import { ACK_INTERVAL_MS } from "@wheso/core/src/generated/constants.ts";
+
 import {
   createReceiverHandlerState,
+  handleAckTimer,
   handleClientBinary,
   handleClientText,
   handleUpstreamBinary,
@@ -62,8 +65,16 @@ export class ReceiverNode implements Party.Server {
     };
   }
 
+  onAlarm(): void {
+    // ACK_INTERVAL_MS ごとに受信位置を上流へ返す（congestion.md 2 節）。
+    this.state = handleAckTimer(this.state, this.transport);
+    void this.room.storage.setAlarm(Date.now() + ACK_INTERVAL_MS);
+  }
+
   onConnect(connection: Party.Connection, context: Party.ConnectionContext): void {
     const role = roleFromUrl(context.request.url);
+    // 最初の接続で ack の周期を始める。
+    void this.room.storage.setAlarm(Date.now() + ACK_INTERVAL_MS);
     this.roles.set(connection.id, role);
     if (role === "client") {
       this.clientConnectionId = connection.id;

@@ -54,6 +54,20 @@ export interface ReceiverState {
   readonly degraded: boolean;
   /** 表に無いイベントの記録。 */
   readonly unexpectedEvents: readonly string[];
+  /**
+   * (senderId, channel, spatialId) ごとに受信した最大の sequenceNumber。
+   * 送信側が送信窓を計算するために ack で返す（congestion.md 2 節）。
+   * senderId, channel, spatialId の昇順で保持する。
+   */
+  readonly received: readonly ReceivedMark[];
+}
+
+/** 受信済みの位置。ack の内容になる。 */
+export interface ReceivedMark {
+  readonly senderId: number;
+  readonly channel: number;
+  readonly spatialId: number;
+  readonly highestSeq: number;
 }
 
 export interface SubscribeEntry {
@@ -80,6 +94,8 @@ export type ReceiverEvent =
       readonly key: boolean;
       readonly bytes: number;
       readonly flags: number;
+      /** 受信した sequenceNumber。ack の算出に使う。既定は 0（不明）。 */
+      readonly seq?: number;
     }
   | { readonly kind: "timer" };
 
@@ -89,7 +105,14 @@ export type ReceiverCommand =
   | { readonly kind: "setTier"; readonly for: number; readonly channel: number; readonly tier: number }
   | { readonly kind: "forward"; readonly to: readonly number[] }
   | { readonly kind: "drop"; readonly priority: number; readonly count: number }
-  | { readonly kind: "notify"; readonly code: string };
+  | { readonly kind: "notify"; readonly code: string }
+  | {
+      readonly kind: "ack";
+      readonly senderId: number;
+      readonly channel: number;
+      readonly spatialId: number;
+      readonly highestSeq: number;
+    };
 
 export interface ReceiverStepResult {
   readonly state: ReceiverState;
@@ -108,6 +131,7 @@ export function initialReceiverState(targetBytesPerSec: number): ReceiverState {
     trend: { numerator: 0, denominator: 1 },
     degraded: false,
     unexpectedEvents: [],
+    received: [],
   };
 }
 
@@ -131,7 +155,18 @@ export function receiverStep(state: ReceiverState, event: ReceiverEvent): Receiv
     case "media":
       return handleMedia(state, event);
     case "timer":
-      return { state, commands: [] };
+      // ACK_INTERVAL_MS ごとに、受信済みの位置を ack として返す。
+      // 呼び出し側が周期を管理する（コアは時刻を持たない）。
+      return {
+        state,
+        commands: state.received.map((mark) => ({
+          kind: "ack" as const,
+          senderId: mark.senderId,
+          channel: mark.channel,
+          spatialId: mark.spatialId,
+          highestSeq: mark.highestSeq,
+        })),
+      };
   }
 }
 
@@ -193,7 +228,9 @@ function handleLeave(state: ReceiverState, id: number): ReceiverStepResult {
   if (streams.length === state.streams.length) {
     return { state, commands: [] };
   }
-  return reallocate({ ...state, streams });
+  // 退出者の受信位置も除去する。残すと居ない相手へ ack を返し続ける。
+  const received = state.received.filter((mark) => mark.senderId !== id);
+  return reallocate({ ...state, streams, received });
 }
 
 /** 表示・非表示。表 7 行目と 8 行目に対応する。 */
@@ -301,7 +338,9 @@ function handleMedia(
   if (event.sid > stream.spatialId || event.tid > stream.temporalId) {
     return { state, commands: [{ kind: "drop", priority: 1, count: 1 }] };
   }
-  return { state, commands: [{ kind: "forward", to: [RECEIVER_SELF_ID] }] };
+  // 受信した位置を記録する。ack はタイマーでまとめて返す（congestion.md 2 節）。
+  // フレームごとに返さない理由は、メッセージレートが中継ノードの制約であるためである。
+  return { state: markReceived(state, event), commands: [{ kind: "forward", to: [RECEIVER_SELF_ID] }] };
 }
 
 /**
@@ -386,6 +425,35 @@ function priorityOrder(state: ReceiverState, a: StreamState, b: StreamState): nu
     return a.senderId - b.senderId;
   }
   return a.channel - b.channel;
+}
+
+/**
+ * 受信した位置を更新する。後戻りする値では更新しない。
+ * 順序は senderId, channel, spatialId の昇順に保つ（決定性のため）。
+ */
+function markReceived(state: ReceiverState, event: Extract<ReceiverEvent, { kind: "media" }>): ReceiverState {
+  const seq = event.seq ?? 0;
+  if (seq <= 0) {
+    return state;
+  }
+  const existing = state.received.find(
+    (mark) => mark.senderId === event.from && mark.channel === event.ch && mark.spatialId === event.sid,
+  );
+  if (existing !== undefined && existing.highestSeq >= seq) {
+    return state;
+  }
+  const rest = state.received.filter(
+    (mark) => !(mark.senderId === event.from && mark.channel === event.ch && mark.spatialId === event.sid),
+  );
+  const merged = [...rest, { senderId: event.from, channel: event.ch, spatialId: event.sid, highestSeq: seq }].sort(
+    (a, b) =>
+      a.senderId !== b.senderId
+        ? a.senderId - b.senderId
+        : a.channel !== b.channel
+          ? a.channel - b.channel
+          : a.spatialId - b.spatialId,
+  );
+  return { ...state, received: merged };
 }
 
 function streamOrder(a: StreamState, b: StreamState): number {
