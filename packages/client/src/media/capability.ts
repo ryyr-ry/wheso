@@ -74,8 +74,43 @@ export function spatialIdOf(profile: ProfileId): number {
   }
 }
 
-/** 報告に載せる観測値。すべて整数である。 */
-export interface ReportInput {
+/** プロファイル識別子から fps を引く。定数から取り、数値を書かない。 */
+export function framerateOf(profile: ProfileId): number {
+  switch (profile) {
+    case "V_4K60":
+      return V_4K60.framerate;
+    case "V_1080P60":
+      return V_1080P60.framerate;
+    case "V_1080P30":
+    case "H264_1080P30":
+      return V_1080P30.framerate;
+    case "V_360P15":
+    case "H264_360P15":
+      return V_360P15.framerate;
+  }
+}
+
+/**
+ * プロファイル識別子から時間層数を引く。
+ * H.264 は時間スケーラビリティを使えないため 1 層である（F-027）。
+ */
+export function temporalLayersOf(profile: ProfileId): number {
+  switch (profile) {
+    case "V_4K60":
+      return V_4K60.temporalLayers;
+    case "V_1080P60":
+      return V_1080P60.temporalLayers;
+    case "V_1080P30":
+      return V_1080P30.temporalLayers;
+    case "V_360P15":
+      return V_360P15.temporalLayers;
+    case "H264_1080P30":
+    case "H264_360P15":
+      return 1;
+  }
+}
+
+/** 報告に載せる観測値。すべて整数である。 */export interface ReportInput {
   /** 下り帯域の推定（bits/sec）。 */
   readonly downlinkBps: number;
   /** 片道遅延の標本列（マイクロ秒）。上限は DELAY_TREND_WINDOW。 */

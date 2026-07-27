@@ -21,6 +21,11 @@ export interface JoinTarget {
   readonly host: string;
   readonly meetingId: string;
   readonly token: string;
+  /**
+   * 暗号化された経路か。参加 URL の scheme から決める。
+   * 開発用の実行環境は http で動くため、そこでは ws を使う必要がある。
+   */
+  readonly secure: boolean;
 }
 
 /**
@@ -50,7 +55,7 @@ export function parseJoinUrl(url: string): Result<JoinTarget, JoinUrlError> {
   if (token.length === 0) {
     return err({ code: "E_JOIN_URL", detail: "トークンがフラグメントに無い" });
   }
-  return ok({ host: parsed.host, meetingId: validated.value, token });
+  return ok({ host: parsed.host, meetingId: validated.value, token, secure: parsed.protocol !== "http:" });
 }
 
 /** 個人部屋の役割。auth.md 3.4 の 5 つに限る。 */

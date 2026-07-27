@@ -313,10 +313,33 @@ export async function verifyClientToken(options: VerifyOptions): Promise<Result<
 }
 
 /**
+ * 署名を検証せずに主張を読む。
+ *
+ * **認可の判断に使ってはならない。** 用途はクライアントが自分の部屋名を導くこと
+ * （`sub` が必要である）に限る。偽の `sub` を書いても、接続先の全ノードが署名を
+ * 検証し、部屋名が `(aud, sub)` から導出できるかを確かめるため（`auth.md` 3.4）、
+ * 不正な部屋へは接続できない。サーバ側でこの関数を使ってはならない。
+ */
+export function readClaimsUnverified(token: string): Result<TokenClaims, AuthError> {
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    return err({ code: "E_AUTH", detail: "token must have 3 parts" });
+  }
+  const payloadPart = parts[1];
+  if (payloadPart === undefined) {
+    return err({ code: "E_AUTH", detail: "token part missing" });
+  }
+  const payloadBytes = base64UrlDecode(payloadPart);
+  if (!payloadBytes.ok) {
+    return payloadBytes;
+  }
+  return parseClaims(new TextDecoder().decode(payloadBytes.value));
+}
+
+/**
  * クライアントが接続を許可される部屋の一覧。
  * 共有部屋（シャード、コーディネータ、MetaRoom）へクライアントは接続できない。
- */
-export function allowedClientRooms(meetingId: string, userId: string): readonly string[] {
+ */export function allowedClientRooms(meetingId: string, userId: string): readonly string[] {
   const rooms: string[] = [];
   for (const role of ["ctl", "vs", "vr", "as", "ar"] as const) {
     const name = personalRoom(role, meetingId, userId);
