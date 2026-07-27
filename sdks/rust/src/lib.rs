@@ -13,6 +13,7 @@
 
 pub mod fixed;
 pub mod generated;
+pub mod receiver_core;
 pub mod shard_core;
 pub mod wire;
 

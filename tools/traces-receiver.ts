@@ -59,6 +59,11 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
 
   const events: ReceiverEvent[] = [];
   const senders = [11, 12, 13, 14];
+  /**
+   * 送信者ごとの sequenceNumber。ack の算出（受信位置の記録）を覆うために必要である。
+   * 番号を持たないメディアだけを流すと、後戻りの判定と ack の出力が検証されない。
+   */
+  const nextSeq = new Map<number, number>();
 
   // 購読の確立
   events.push({
@@ -90,6 +95,13 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
       const sid = randRange(advance(), 0, V_4K60.spatialId);
       const tid = randRange(advance(), 0, 2);
       const ch = roll < 34 ? CHANNEL_VIDEO : CHANNEL_AUDIO;
+      // 番号は基本的に増やすが、一定の割合で後戻りさせる（順序の逆転で更新しないことを検証する）。
+      const previous = nextSeq.get(from) ?? 0;
+      const shape = randRange(advance(), 0, 9);
+      // 8 割は前進、1 割は同じ番号の再送、1 割は後戻り。
+      // 同じ番号の再送を入れないと「後戻りでは更新しない」判定が検証されない。
+      const seq = shape === 0 && previous > 0 ? previous : shape === 1 && previous > 3 ? previous - 3 : previous + 1;
+      nextSeq.set(from, seq > previous ? seq : previous);
       events.push({
         kind: "media",
         from,
@@ -99,7 +111,13 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
         key: sid === 0 && tid === 0,
         bytes: randRange(advance(), 200, 50_000),
         flags: tid === 2 ? 0b1010 : 0b1000,
+        seq,
       });
+      continue;
+    }
+    if (roll < 44) {
+      // ack の周期。受信位置をまとめて返す経路を覆う。
+      events.push({ kind: "timer" });
       continue;
     }
     if (roll < 55) {
