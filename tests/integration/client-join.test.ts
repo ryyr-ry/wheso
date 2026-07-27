@@ -19,7 +19,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { issueToken } from "../../packages/core/src/auth.ts";
 import {
   applyControlMessage,
-  joinMeeting,
+  joinWith,
   type JoinSocket,
 } from "../../packages/client/src/api/join-meeting.ts";
 import type { VideoSinkHandle } from "../../packages/client/src/api/meeting.ts";
@@ -178,7 +178,7 @@ test("参加 URL から 5 個の部屋へ接続し helloAck で active になる
   const closeCodes: number[] = [];
   const received: string[] = [];
   const url = await joinUrlFor(USER_ID);
-  const joined = await joinMeeting(url, {
+  const joined = await joinWith(url, {
     openSocket: (address) => realSocket(address, closeCodes),
     createSink: () => sink(),
     capability: { hardwareAv1For4K60: false, encodeAv1: true, mobile: false, charging: true },

@@ -34,7 +34,7 @@ import {
 import { createMeeting, type VideoSinkHandle } from "../packages/client/src/api/meeting.ts";
 import {
   applyControlMessage,
-  joinMeeting,
+  joinWith,
   resolveProfiles,
   senderIdFrom,
   type JoinSocket,
@@ -165,6 +165,7 @@ test("Meeting は状態と参加者の変化をイベントで通知する", () 
       sendControl: (text) => sent.push(text),
       sendVideoControl: (text) => sent.push(text),
       sendAudioControl: (text) => sent.push(text),
+      sendVideoReceiveControl: (text) => sent.push(text),
       closeAll: () => sent.push("closeAll"),
     },
     sinks: { create: () => sink() },
@@ -208,6 +209,7 @@ test("Meeting の操作は制御メッセージになり、フレーム通知は
       sendControl: (text) => sent.push(text),
       sendVideoControl: (text) => sent.push(text),
       sendAudioControl: (text) => sent.push(text),
+      sendVideoReceiveControl: (text) => sent.push(text),
       closeAll: () => sent.push("closeAll"),
     },
     sinks: { create: () => sink() },
@@ -245,6 +247,7 @@ test("ctl 部屋のメッセージが Meeting へ反映される", () => {
       sendControl: (): void => undefined,
       sendVideoControl: (): void => undefined,
       sendAudioControl: (): void => undefined,
+      sendVideoReceiveControl: (): void => undefined,
       closeAll: (): void => undefined,
     },
     sinks: { create: () => sink() },
@@ -350,8 +353,8 @@ test("参加は 5 個の部屋へ接続し hello と streamAnnounce を送る", 
     now: (): number => T0,
   };
 
-  const url = `https://example.partykit.dev/j/${MEETING_ID}#${fakeToken(MEETING_ID, USER_ID)}`;
-  const joined = await joinMeeting(url, deps);
+  const url = `https://example.test/j/${MEETING_ID}#${fakeToken(MEETING_ID, USER_ID)}`;
+  const joined = await joinWith(url, deps);
   assert.equal(joined.ok, true);
   if (!joined.ok) {
     return;
@@ -384,11 +387,11 @@ test("参加は不正な URL とトークンで失敗を返す（例外を投げ
     capability: { hardwareAv1For4K60: false, encodeAv1: true, mobile: false, charging: true },
     now: (): number => T0,
   };
-  const noToken = await joinMeeting(`https://example.partykit.dev/j/${MEETING_ID}`, deps);
+  const noToken = await joinWith(`https://example.test/j/${MEETING_ID}`, deps);
   assert.equal(noToken.ok, false);
-  const badPath = await joinMeeting(`https://example.partykit.dev/x/${MEETING_ID}#t`, deps);
+  const badPath = await joinWith(`https://example.test/x/${MEETING_ID}#t`, deps);
   assert.equal(badPath.ok, false);
-  const badToken = await joinMeeting(`https://example.partykit.dev/j/${MEETING_ID}#not-a-token`, deps);
+  const badToken = await joinWith(`https://example.test/j/${MEETING_ID}#not-a-token`, deps);
   assert.equal(badToken.ok, false);
 });
 
@@ -411,8 +414,8 @@ test("接続を開けない場合は開いた分を閉じて失敗を返す", as
     capability: { hardwareAv1For4K60: false, encodeAv1: true, mobile: false, charging: true },
     now: (): number => T0,
   };
-  const url = `https://example.partykit.dev/j/${MEETING_ID}#${fakeToken(MEETING_ID, USER_ID)}`;
-  const result = await joinMeeting(url, deps);
+  const url = `https://example.test/j/${MEETING_ID}#${fakeToken(MEETING_ID, USER_ID)}`;
+  const result = await joinWith(url, deps);
   assert.equal(result.ok, false);
   assert.deepEqual(closed, ["ctl", "vs"], "開いた接続を残さない");
 });

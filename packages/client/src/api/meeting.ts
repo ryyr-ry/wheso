@@ -78,6 +78,11 @@ export interface MeetingLinks {
   readonly sendVideoControl: (text: string) => void;
   /** 音声送信部屋へ制御メッセージを送る。 */
   readonly sendAudioControl: (text: string) => void;
+  /**
+   * 映像受信部屋へ制御メッセージを送る。
+   * 表示寸法の申告と購読の要求はここへ送る（画質の判断主体は受信側ユーザー部屋である）。
+   */
+  readonly sendVideoReceiveControl: (text: string) => void;
   /** 5 本の接続をすべて閉じる。 */
   readonly closeAll: () => void;
 }
@@ -226,6 +231,20 @@ export class Meeting {
     this.options.links.sendControl(JSON.stringify({ t: "pin", participantId }));
   }
 
+  /**
+   * 表示寸法を申告する（sdk-api.md 5.1）。
+   * 申告が無い相手は最低品質に留まる。受け皿は自動でこれを呼ぶ。
+   */
+  reportDisplaySize(participantId: string, channel: number, width: number): void {
+    const target = this.members.get(participantId);
+    if (target === undefined) {
+      return;
+    }
+    this.options.links.sendVideoReceiveControl(
+      JSON.stringify({ t: "displaySize", senderId: senderIdOf(participantId), channel, width }),
+    );
+  }
+
   sendChat(text: string): void {
     this.options.links.sendControl(JSON.stringify({ t: "chat", text }));
   }
@@ -339,6 +358,19 @@ export class Meeting {
       handler(value);
     }
   }
+}
+
+/**
+ * 利用者 ID からワイヤの senderId を導く。
+ * 入口と同じ算出でなければ申告が別人に届く。算出は 1 箇所に置く。
+ */
+export function senderIdOf(userId: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < userId.length; index += 1) {
+    hash = (hash ^ userId.charCodeAt(index)) >>> 0;
+    hash = Math.trunc(hash * 0x01000193) >>> 0;
+  }
+  return hash === 0 ? 1 : hash;
 }
 
 /** `Meeting` を作る。入口（join-meeting.ts）から使う。 */

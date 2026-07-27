@@ -5,8 +5,9 @@ Free, open-source video calling for the web. Headless by design: the SDK moves t
 ```ts
 import { joinMeeting } from "@wheso/client";
 
-const meeting = await joinMeeting(location.href);
-meeting.on("participant", (p) => {
+const joined = await joinMeeting(location.href);
+if (!joined.ok) throw new Error(joined.error.code);
+joined.value.meeting.on("participantJoined", (p) => {
   const el = document.createElement("video");
   p.video.attach(el);
   stage.append(el);
@@ -15,7 +16,8 @@ meeting.on("participant", (p) => {
 
 Camera and microphone are requested, video starts flowing, and every participant hands you a
 video sink you can place anywhere in your own layout. There is no bundled interface to fight
-with, no theme to override, no markup you did not write.
+with, no theme to override, no markup you did not write. Failures come back as values, not
+exceptions.
 
 > **Status: pre-release.** The protocol and reference implementation are being built. The
 > client SDKs are not published yet. Watch this repository for the first release.
@@ -87,8 +89,29 @@ They exist so the protocol is proven by products, not only by tests.
 
 ## Development
 
-The protocol design and measurements are complete; the implementation is not yet published.
-Once the first packages land, this section will describe how to build and test them.
+The reference implementation lives in this repository. Node 24 or newer is required.
+
+```
+npm ci
+npm run ci                 # types, generated code, frozen vectors, traces, fuzzing, unit tests
+npm run test:integration   # real WebSockets against a local dev server
+npm run test:e2e           # real AV1 video and Opus audio through the browser (needs Chromium)
+```
+
+Language SDKs are checked against the same frozen vectors:
+
+```
+npm run test:rust
+npm run test:cpp
+npm run test:dart
+npm run test:kotlin
+npm run test:swift         # macOS
+```
+
+Constants and wire layout are generated from `spec/schema/`. Do not edit files under
+`generated/` by hand; run `node tools/codegen.ts generate` instead. Test vectors in
+`spec/vectors/` are frozen: if an implementation disagrees with a vector, fix the
+implementation.
 
 ## License
 

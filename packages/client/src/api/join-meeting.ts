@@ -14,9 +14,18 @@
 import { type Result, err, ok } from "@wheso/core/src/result.ts";
 import { readClaimsUnverified } from "@wheso/core/src/auth.ts";
 import { CHANNEL_VIDEO, PROTOCOL_VERSION } from "@wheso/core/src/generated/wire-layout.ts";
+import { V_1080P60, V_4K60 } from "@wheso/core/src/generated/constants.ts";
+
+import { createParticipantSink } from "../render/participant-sink.ts";
 
 import { parseJoinUrl, planRooms, roomUrl, type PersonalRoomRole } from "./join-url.ts";
-import { createMeeting, type Meeting, type ParticipantRole, type VideoSinkHandle } from "./meeting.ts";
+import {
+  createMeeting,
+  senderIdOf,
+  type Meeting,
+  type ParticipantRole,
+  type VideoSinkHandle,
+} from "./meeting.ts";
 import {
   buildStreamAnnounce,
   framerateOf,
@@ -72,16 +81,126 @@ export interface JoinedMeeting {
   readonly sockets: ReadonlyMap<PersonalRoomRole, JoinSocket>;
 }
 
-/** 参加 URL から senderId を導く。ワイヤの senderId は 32 bit の非 0 整数である。 */
-export function senderIdFrom(userId: string): number {
-  // FNV-1a の 32 bit。乱数を使わない（同じ利用者は同じ値になる必要がある）。
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < userId.length; index += 1) {
-    hash = (hash ^ userId.charCodeAt(index)) >>> 0;
-    hash = Math.trunc(hash * 0x01000193) >>> 0;
+/**
+ * 参加 URL から senderId を導く。ワイヤの senderId は 32 bit の非 0 整数である。
+ * 算出は `meeting.ts` の 1 箇所に置く（表示寸法の申告でも同じ値が必要である）。
+ */
+export const senderIdFrom = senderIdOf;
+
+/**
+ * ブラウザ既定の注入。
+ *
+ * 規範 1 節の最小例は `joinMeeting(location.href)` である。注入を必須にすると
+ * 行数予算を満たせないため、既定を用意する。ブラウザ以外（試験・移植）では
+ * 呼び出し側が注入を渡す。
+ *
+ * 能力探査は非同期であるため、ここでは結果を引数で受ける。探査の実行は
+ * `probeCapability` が行う（判定そのものは `capability.ts` の純関数である）。
+ */
+export function browserDeps(capability: DeviceCapability, onDisplaySize: DisplaySizeSink): JoinDeps | null {
+  if (typeof globalThis.WebSocket !== "function") {
+    // WebSocket が無い環境では既定を作れない。呼び出し側が注入する。
+    return null;
   }
-  // 0 は不正である（wire-format.md 1.1）。0 になった場合は 1 に寄せる。
-  return hash === 0 ? 1 : hash;
+  return {
+    openSocket: (url) => {
+      const socket = new globalThis.WebSocket(url);
+      const pending: string[] = [];
+      const handlers: ((text: string) => void)[] = [];
+      let open = false;
+      socket.addEventListener("open", () => {
+        open = true;
+        for (const text of pending) {
+          socket.send(text);
+        }
+        pending.length = 0;
+      });
+      socket.addEventListener("message", (event: MessageEvent) => {
+        if (typeof event.data !== "string") {
+          return;
+        }
+        for (const handler of handlers) {
+          handler(event.data);
+        }
+      });
+      return {
+        send: (text: string): void => {
+          // 接続確立前の送信は溜める。捨てると hello が失われて参加できない。
+          if (open) {
+            socket.send(text);
+            return;
+          }
+          pending.push(text);
+        },
+        close: (): void => socket.close(),
+        onText: (handler): void => {
+          handlers.push(handler);
+        },
+      };
+    },
+    createSink: (participantId) =>
+      createParticipantSink((width, height) => {
+        onDisplaySize(participantId, width, height);
+      }),
+    capability,
+    now: () => Date.now(),
+  };
+}
+
+/** 表示寸法の申告の受け手。入口が `Meeting` へ写す。 */
+export type DisplaySizeSink = (participantId: string, width: number, height: number) => void;
+
+/**
+ * ブラウザの符号化能力を探る（sdk-api.md 2 節の手順 1〜3）。
+ *
+ * 判定そのものは純関数（`selectProfiles`）が行う。ここは探査だけである。
+ * 探査できない環境では「AV1 不可」として扱う。安全側に倒す。
+ */
+export async function probeCapability(): Promise<DeviceCapability> {
+  const fallback: DeviceCapability = {
+    hardwareAv1For4K60: false,
+    encodeAv1: false,
+    mobile: false,
+    charging: true,
+  };
+  const encoder = Reflect.get(globalThis, "VideoEncoder");
+  if (typeof encoder !== "function") {
+    return fallback;
+  }
+  const isConfigSupported = Reflect.get(encoder, "isConfigSupported");
+  if (typeof isConfigSupported !== "function") {
+    return fallback;
+  }
+  const check = async (config: Record<string, unknown>): Promise<boolean> => {
+    try {
+      const result: unknown = await Reflect.apply(isConfigSupported, encoder, [config]);
+      if (typeof result !== "object" || result === null) {
+        return false;
+      }
+      return Reflect.get(result, "supported") === true;
+    } catch {
+      // 探査の失敗は「使えない」として扱う。例外を上へ投げない。
+      return false;
+    }
+  };
+  const hardware4K60 = await check({
+    codec: "av01.0.08M.08",
+    width: V_4K60.width,
+    height: V_4K60.height,
+    framerate: V_4K60.framerate,
+    bitrate: V_4K60.targetBitrate,
+    scalabilityMode: V_4K60.scalabilityMode,
+    hardwareAcceleration: "prefer-hardware",
+  });
+  const av1 = await check({
+    codec: "av01.0.08M.08",
+    width: V_1080P60.width,
+    height: V_1080P60.height,
+    framerate: V_1080P60.framerate,
+    bitrate: V_1080P60.targetBitrate,
+    scalabilityMode: V_1080P60.scalabilityMode,
+  });
+  return { hardwareAv1For4K60: hardware4K60, encodeAv1: av1, mobile: false, charging: true };
 }
 
 /**
@@ -95,8 +214,32 @@ export function senderIdFrom(userId: string): number {
  *   5. ctl 部屋の `participants` を `Meeting` へ反映する
  *
  * 描画は行わない（ADR-0015）。受け皿は参加者ごとに作る。
+ * `deps` を省略した場合はブラウザ既定を使う。
  */
 export async function joinMeeting(
+  url: string,
+  options: JoinOptions = {},
+  deps?: JoinDeps,
+): Promise<Result<JoinedMeeting, JoinError>> {
+  const resolved = deps ?? (await defaultDeps());
+  if (resolved === null) {
+    return err({ code: "E_TRANSPORT", detail: "この環境には既定の注入が無い" });
+  }
+  return await joinWith(url, resolved, options);
+}
+
+/** 既定の注入を作る。表示寸法の申告は参加後に配線するため、遅延して差し替える。 */
+let displaySizeRelay: DisplaySizeSink = () => undefined;
+
+async function defaultDeps(): Promise<JoinDeps | null> {
+  const capability = await probeCapability();
+  return browserDeps(capability, (participantId, width, height) => {
+    displaySizeRelay(participantId, width, height);
+  });
+}
+
+/** 注入を明示して参加する。試験と移植で使う。 */
+export async function joinWith(
   url: string,
   deps: JoinDeps,
   options: JoinOptions = {},
@@ -150,10 +293,16 @@ export async function joinMeeting(
       sendControl: (text) => sockets.get("ctl")?.send(text),
       sendVideoControl: (text) => sockets.get("vs")?.send(text),
       sendAudioControl: (text) => sockets.get("as")?.send(text),
+      sendVideoReceiveControl: (text) => sockets.get("vr")?.send(text),
       closeAll: () => closeAll(sockets),
     },
     sinks: { create: (participantId) => deps.createSink(participantId) },
   });
+
+  // 受け皿の申告を受信部屋へ写す。既定の注入はこの中継を通す。
+  displaySizeRelay = (participantId, width) => {
+    meeting.reportDisplaySize(participantId, CHANNEL_VIDEO, width);
+  };
 
   // 制御メッセージの受信を配線する。ctl 以外は自ノードからの通知のみを扱う。
   const control = sockets.get("ctl");
