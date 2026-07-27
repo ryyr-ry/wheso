@@ -4,36 +4,105 @@
 // ベクタを実装に合わせて変更してはならない。実装を直す（ADR-0012）。
 //
 // 実行: swift test（sdks/swift で）
+//
+// 動的型（Any）を使わない（lint-policy.md 1 節）。JSON は Decodable で構造を宣言して読む。
+// 欠損したフィールドを既定値へ落とさない。落とすと、ベクタの取り違えを試験が検出できなくなる。
 
 import Foundation
 import XCTest
 
 @testable import WhesoClient
 
+private struct PrngFile: Decodable {
+    let vectors: [PrngVector]
+}
+
+private struct PrngVector: Decodable {
+    let seed: String
+    let outputs: [String]
+}
+
+private struct MediaVector: Decodable {
+    let name: String
+    let bytesHex: String
+    let message: MediaMessageVector
+}
+
+private struct MediaMessageVector: Decodable {
+    let channel: Int
+    let senderId: Int
+    let units: [UnitVector]
+}
+
+private struct UnitVector: Decodable {
+    let sequenceNumber: Int
+    let captureTimestampUs: String
+    let flags: Int
+    let spatialId: Int
+    let temporalId: Int
+    let payloadHex: String
+}
+
+private struct InvalidVector: Decodable {
+    let name: String
+    let bytesHex: String
+    let expectedErrorCode: String
+}
+
+/// `expectedPriority` は null を取り得る（破棄禁止の意味）。
+/// ただしキーの欠落は誤りであるため、`decodeIfPresent` を使わず復号を失敗させる。
+private struct DropVector: Decodable {
+    let name: String
+    let channel: Int
+    let flags: Int
+    let expectedPriority: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case channel
+        case flags
+        case expectedPriority
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        channel = try container.decode(Int.self, forKey: .channel)
+        flags = try container.decode(Int.self, forKey: .flags)
+        expectedPriority = try container.decode(Int?.self, forKey: .expectedPriority)
+    }
+}
+
 final class ConformanceTests: XCTestCase {
     /// 凍結ベクタを読む。リポジトリ直下の spec/vectors を参照する。
-    private func readVector(_ name: String) throws -> Any {
+    private func readVector<T: Decodable>(_ name: String, _ type: T.Type) throws -> T {
         let here = URL(fileURLWithPath: #filePath)
         let root = here
+            .deletingLastPathComponent()  // ConformanceTests.swift を落とす
             .deletingLastPathComponent()  // WhesoClientTests
             .deletingLastPathComponent()  // Tests
             .deletingLastPathComponent()  // swift
             .deletingLastPathComponent()  // sdks
         let path = root.appendingPathComponent("spec/vectors/\(name)")
         let data = try Data(contentsOf: path)
-        return try JSONSerialization.jsonObject(with: data, options: [])
+        return try JSONDecoder().decode(type, from: data)
     }
 
-    private func hexToBytes(_ hex: String) -> [UInt8] {
+    /// 16 進文字列をバイト列にする。不正な入力は nil を返す（0 で埋めない）。
+    private func hexToBytes(_ hex: String) -> [UInt8]? {
+        if hex.count % 2 != 0 {
+            return nil
+        }
         var bytes: [UInt8] = []
         var index = hex.startIndex
         while index < hex.endIndex {
-            let next = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
-            if next == index {
-                break
+            guard let next = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) else {
+                return nil
             }
-            let part = String(hex[index..<next])
-            bytes.append(UInt8(part, radix: 16) ?? 0)
+            guard let value = UInt8(hex[index..<next], radix: 16) else {
+                return nil
+            }
+            bytes.append(value)
             index = next
         }
         return bytes
@@ -43,32 +112,14 @@ final class ConformanceTests: XCTestCase {
         bytes.map { String(format: "%02x", $0) }.joined()
     }
 
-    private func intValue(_ value: Any?) -> Int64 {
-        if let number = value as? NSNumber {
-            return number.int64Value
-        }
-        if let text = value as? String {
-            return Int64(text) ?? 0
-        }
-        return 0
-    }
-
-    private func unsignedValue(_ value: Any?) -> UInt64 {
-        if let text = value as? String {
-            return UInt64(text) ?? 0
-        }
-        if let number = value as? NSNumber {
-            return number.uint64Value
-        }
-        return 0
-    }
-
     func testPrngMatchesFrozenVectors() throws {
-        let root = try readVector("prng.json") as? [String: Any]
-        let vectors = root?["vectors"] as? [[String: Any]] ?? []
-        XCTAssertFalse(vectors.isEmpty, "ベクタが空でない")
-        for entry in vectors {
-            let seed = unsignedValue(entry["seed"])
+        let file = try readVector("prng.json", PrngFile.self)
+        XCTAssertFalse(file.vectors.isEmpty, "ベクタが空でない")
+        for entry in file.vectors {
+            guard let seed = UInt64(entry.seed) else {
+                XCTFail("種を整数として読める: \(entry.seed)")
+                continue
+            }
             let created = whesoCreatePrng(seed: seed)
             if seed == 0 {
                 XCTAssertTrue(isFailure(created), "種 0 は失敗する")
@@ -78,87 +129,103 @@ final class ConformanceTests: XCTestCase {
                 XCTFail("擬似乱数器を作れる")
                 continue
             }
-            let outputs = entry["outputs"] as? [Any] ?? []
-            for expected in outputs {
+            XCTAssertFalse(entry.outputs.isEmpty, "出力列が空でない")
+            for expectedText in entry.outputs {
+                guard let expected = UInt64(expectedText) else {
+                    XCTFail("期待値を整数として読める: \(expectedText)")
+                    break
+                }
                 guard case .success(let step) = whesoPrngNext(state) else {
                     XCTFail("状態遷移できる")
                     break
                 }
                 state = step.state
-                XCTAssertEqual(step.output, unsignedValue(expected), "出力が一致する")
+                XCTAssertEqual(step.output, expected, "出力が一致する")
             }
         }
     }
 
     func testMediaVectorsRoundTrip() throws {
-        let entries = try readVector("media.json") as? [[String: Any]] ?? []
+        let entries = try readVector("media.json", [MediaVector].self)
         XCTAssertFalse(entries.isEmpty)
         for entry in entries {
-            let name = entry["name"] as? String ?? "(名前なし)"
-            let expectedHex = entry["bytesHex"] as? String ?? ""
-            let message = entry["message"] as? [String: Any] ?? [:]
             var units: [WhesoUnit] = []
-            for unit in message["units"] as? [[String: Any]] ?? [] {
+            var payloadFailed = false
+            for unit in entry.message.units {
+                guard let payload = hexToBytes(unit.payloadHex),
+                      let timestamp = UInt64(unit.captureTimestampUs)
+                else {
+                    XCTFail("\(entry.name): ユニットの 16 進とタイムスタンプを読める")
+                    payloadFailed = true
+                    break
+                }
                 units.append(
                     WhesoUnit(
-                        sequenceNumber: UInt32(truncatingIfNeeded: intValue(unit["sequenceNumber"])),
-                        captureTimestampUs: unsignedValue(unit["captureTimestampUs"]),
-                        flags: UInt8(truncatingIfNeeded: intValue(unit["flags"])),
-                        spatialId: UInt8(truncatingIfNeeded: intValue(unit["spatialId"])),
-                        temporalId: UInt8(truncatingIfNeeded: intValue(unit["temporalId"])),
-                        payload: hexToBytes(unit["payloadHex"] as? String ?? "")
+                        sequenceNumber: UInt32(truncatingIfNeeded: unit.sequenceNumber),
+                        captureTimestampUs: timestamp,
+                        flags: UInt8(truncatingIfNeeded: unit.flags),
+                        spatialId: UInt8(truncatingIfNeeded: unit.spatialId),
+                        temporalId: UInt8(truncatingIfNeeded: unit.temporalId),
+                        payload: payload
                     )
                 )
             }
+            if payloadFailed {
+                continue
+            }
             let built = WhesoMediaMessage(
-                channel: UInt8(truncatingIfNeeded: intValue(message["channel"])),
-                senderId: UInt32(truncatingIfNeeded: intValue(message["senderId"])),
+                channel: UInt8(truncatingIfNeeded: entry.message.channel),
+                senderId: UInt32(truncatingIfNeeded: entry.message.senderId),
                 units: units
             )
             guard case .success(let encoded) = whesoEncodeMediaMessage(built) else {
-                XCTFail("\(name): 符号化できる")
+                XCTFail("\(entry.name): 符号化できる")
                 continue
             }
-            XCTAssertEqual(bytesToHex(encoded), expectedHex, "\(name): バイト列が一致する")
+            XCTAssertEqual(bytesToHex(encoded), entry.bytesHex, "\(entry.name): バイト列が一致する")
 
-            guard case .success(let decoded) = whesoDecodeMediaMessage(hexToBytes(expectedHex)) else {
-                XCTFail("\(name): 復号できる")
+            guard let expectedBytes = hexToBytes(entry.bytesHex) else {
+                XCTFail("\(entry.name): 期待バイト列を読める")
                 continue
             }
-            XCTAssertEqual(decoded, built, "\(name): 復号が一致する")
+            guard case .success(let decoded) = whesoDecodeMediaMessage(expectedBytes) else {
+                XCTFail("\(entry.name): 復号できる")
+                continue
+            }
+            XCTAssertEqual(decoded, built, "\(entry.name): 復号が一致する")
         }
     }
 
     func testInvalidVectorsRejectWithSameError() throws {
-        let entries = try readVector("invalid.json") as? [[String: Any]] ?? []
+        let entries = try readVector("invalid.json", [InvalidVector].self)
         XCTAssertFalse(entries.isEmpty)
         for entry in entries {
-            let name = entry["name"] as? String ?? "(名前なし)"
-            let bytes = hexToBytes(entry["bytesHex"] as? String ?? "")
-            let expected = entry["expectedErrorCode"] as? String ?? ""
+            guard let bytes = hexToBytes(entry.bytesHex) else {
+                XCTFail("\(entry.name): 16 進を読める")
+                continue
+            }
             switch whesoDecodeMediaMessage(bytes) {
             case .success:
-                XCTFail("\(name): 受理してはならない")
+                XCTFail("\(entry.name): 受理してはならない")
             case .failure(let error):
-                XCTAssertEqual(error.name, expected, "\(name): 同じエラーで拒否する")
+                XCTAssertEqual(error.name, entry.expectedErrorCode, "\(entry.name): 同じエラーで拒否する")
             }
         }
     }
 
     func testDropOrderMatchesFrozenVectors() throws {
-        let entries = try readVector("drop-order.json") as? [[String: Any]] ?? []
+        let entries = try readVector("drop-order.json", [DropVector].self)
         XCTAssertFalse(entries.isEmpty)
         for entry in entries {
-            let name = entry["name"] as? String ?? "(名前なし)"
-            let channel = UInt8(truncatingIfNeeded: intValue(entry["channel"]))
-            let flags = UInt8(truncatingIfNeeded: intValue(entry["flags"]))
-            let actual = whesoDropPriority(channel: channel, flags: flags)
-            let expectedRaw = entry["expectedPriority"]
-            if expectedRaw == nil || expectedRaw is NSNull {
-                XCTAssertNil(actual, "\(name): 破棄禁止")
+            let actual = whesoDropPriority(
+                channel: UInt8(truncatingIfNeeded: entry.channel),
+                flags: UInt8(truncatingIfNeeded: entry.flags)
+            )
+            guard let expected = entry.expectedPriority else {
+                XCTAssertNil(actual, "\(entry.name): 破棄禁止")
                 continue
             }
-            XCTAssertEqual(actual, UInt8(truncatingIfNeeded: intValue(expectedRaw)), "\(name): 優先順位が一致する")
+            XCTAssertEqual(actual, UInt8(truncatingIfNeeded: expected), "\(entry.name): 優先順位が一致する")
         }
     }
 

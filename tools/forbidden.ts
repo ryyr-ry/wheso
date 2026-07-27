@@ -16,8 +16,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 /** 既定は公開ディレクトリのみ。追加の対象はコマンド引数で渡す。 */
 const SCAN_DIRS: readonly string[] =
   process.argv.length > 2 ? process.argv.slice(2) : ["packages", "tools"];
-const SKIP_DIR_NAMES = new Set(["node_modules", ".git", "dist", "build", "generated", ".partykit"]);
-const SCAN_EXTENSIONS = [".ts", ".tsx", ".rs"];
+const SKIP_DIR_NAMES = new Set(["node_modules", ".git", "dist", "build", "generated", ".partykit", ".build"]);
+const SCAN_EXTENSIONS = [".ts", ".tsx", ".rs", ".swift", ".kt", ".dart", ".cpp", ".hpp"];
 
 interface Rule {
   readonly name: string;
@@ -47,7 +47,65 @@ const RUST_RULES: readonly Rule[] = [
   { name: "rust-allow", pattern: /#\[allow\(/g, note: "検査の抑制" },
 ];
 
-const RULES: readonly Rule[] = [
+const SWIFT_RULES: readonly Rule[] = [
+  // 動的型: Any。ただし AnyObject / AnyHashable / AnyCancellable 等の合成語は除外する
+  { name: "swift-any", pattern: /\bAny\b(?![A-Za-z])/g, note: "動的型 Any" },
+  // 強制キャスト: as!
+  { name: "swift-force-cast", pattern: /\bas!\s/g, note: "強制キャスト as!" },
+  // 強制 try: try!
+  { name: "swift-force-try", pattern: /\btry!\s/g, note: "強制 try" },
+  // fatalError
+  { name: "swift-fatal-error", pattern: /\bfatalError\s*\(/g, note: "fatalError" },
+  // unsafeBitCast
+  { name: "swift-unsafe-bit-cast", pattern: /\bunsafeBitCast\s*\(/g, note: "unsafeBitCast" },
+  // 強制アンラップ: 後置 ! だが、条件が複雑。
+  // パターン: 識別子または ] または ) の直後に ! が来て、その後が . / [ / ( / 空白 / 行末 / , / ) である場合。
+  // as? や比較演算子 != は除外する。
+  { name: "swift-force-unwrap", pattern: /[A-Za-z0-9_\])]!\s*[.[\](,;)\n]/g, note: "強制アンラップ" },
+];
+
+const KOTLIN_RULES: readonly Rule[] = [
+  // 動的型: Any。ただし equals(other: Any?) は Kotlin の言語要件であるため除外する。
+  { name: "kotlin-any", pattern: /\bAny\b/g, note: "動的型 Any" },
+  // 非 null 断定: !!
+  { name: "kotlin-double-bang", pattern: /!!/g, note: "非 null 断定 !!" },
+  // lateinit
+  { name: "kotlin-lateinit", pattern: /\blateinit\b/g, note: "lateinit" },
+  // @Suppress
+  { name: "kotlin-suppress", pattern: /@Suppress\b/g, note: "検査の抑制 @Suppress" },
+  // error( — Kotlin stdlib の error() 関数（IllegalStateException を投げる）
+  { name: "kotlin-error", pattern: /\berror\s*\(/g, note: "パニック相当 error()" },
+];
+
+const DART_RULES: readonly Rule[] = [
+  // 動的型: dynamic
+  { name: "dart-dynamic", pattern: /\bdynamic\b/g, note: "動的型 dynamic" },
+  // late キーワード（後に空白が続く）
+  { name: "dart-late", pattern: /\blate\s+/g, note: "late 変数" },
+  // 検査の抑制: // ignore:
+  { name: "dart-ignore", pattern: /\/\/\s*ignore:/g, note: "検査の抑制 // ignore:" },
+  // 後置 !（非 null 断定）。パターン: 識別子 / ] / ) の直後に ! が来て . / [ / ( / , / ; / ) / 空白が続く
+  { name: "dart-non-null-assert", pattern: /[A-Za-z0-9_\])]!\s*[.[\](,;)\s]/g, note: "非 null 断定 !" },
+  // as キャスト（安全でないキャスト）。ただし is / as は条件式ではないので禁止。
+  // パターン: `as ` の後に型名（大文字始まり）が続く場合を検出
+  { name: "dart-as-cast", pattern: /\bas\s+[A-Z]/g, note: "型キャスト as" },
+];
+
+const CPP_RULES: readonly Rule[] = [
+  // 動的型: void*
+  { name: "cpp-void-ptr", pattern: /\bvoid\s*\*/g, note: "動的型 void*" },
+  // 動的型: std::any
+  { name: "cpp-std-any", pattern: /\bstd::any\b/g, note: "動的型 std::any" },
+  // reinterpret_cast
+  { name: "cpp-reinterpret-cast", pattern: /\breinterpret_cast\s*</g, note: "reinterpret_cast" },
+  // C 形式キャスト: (type)expr のパターン。ただし (void) は除外しにくいため、
+  // 型名（大文字始まりまたは基本型）が括弧内に来る場合を検出する。
+  { name: "cpp-c-style-cast", pattern: /\(\s*(int|long|short|char|unsigned|signed|float|double|size_t|uint[0-9]+_t|int[0-9]+_t)\s*\)/g, note: "C 形式キャスト" },
+  // #pragma warning(disable)
+  { name: "cpp-pragma-disable", pattern: /#pragma\s+warning\s*\(\s*disable/g, note: "検査の抑制 #pragma warning(disable)" },
+];
+
+const TS_RULES: readonly Rule[] = [
   { name: "explicit-any", pattern: /(:|<)\s*any\b/g, note: "型注釈での any" },
   { name: "any-array", pattern: /\bany\[\]/g, note: "any の配列" },
   { name: "type-assertion-as", pattern: /\bas\s+(?!const\b)[A-Z_$][A-Za-z0-9_$<>\[\]|.]*/g, note: "型アサーション as T" },
@@ -99,6 +157,43 @@ async function collectFiles(dir: string, out: string[]): Promise<void> {
   }
 }
 
+/** 行がコメントまたはインポートとして無視すべきかを判定する。 */
+function shouldSkipLine(trimmed: string): boolean {
+  // 行コメント（各言語共通で // か * で始まる行）
+  if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
+    return true;
+  }
+  // インポート文
+  if (trimmed.startsWith("import ")) {
+    return true;
+  }
+  // Swift の #が付くプリプロセッサ指令（#if, #filePath 等）は除外しない
+  return false;
+}
+
+/** Kotlin の equals(other: Any?) オーバーライドを判定する。言語要件のため除外する。 */
+function isKotlinEqualsOverride(line: string): boolean {
+  return /override\s+fun\s+equals\s*\(\s*other\s*:\s*Any\??\s*\)/.test(line);
+}
+
+/** 試験ファイルか否かを判定する */
+function isTestFile(file: string): boolean {
+  // Rust: /tests/ ディレクトリ
+  // TypeScript: .test.ts, .spec.ts, /tests/ ディレクトリ
+  // Swift: /Tests/ ディレクトリ
+  // Kotlin: /test/ ディレクトリ
+  // Dart: /test/ ディレクトリ
+  // C++: /tests/ ディレクトリ
+  return (
+    file.includes("/tests/") ||
+    file.includes("/Tests/") ||
+    file.includes("/test/") ||
+    file.endsWith(".test.ts") ||
+    file.endsWith(".spec.ts") ||
+    file.endsWith("_test.dart")
+  );
+}
+
 async function main(): Promise<void> {
   const files: string[] = [];
   for (const dir of SCAN_DIRS) {
@@ -110,41 +205,98 @@ async function main(): Promise<void> {
   for (const file of files) {
     const content = await readFile(file, "utf8");
     const lines = content.split("\n");
+
+    // 自身は検査対象外
+    if (file.endsWith("forbidden.ts")) {
+      continue;
+    }
+
+    const isRust = file.endsWith(".rs");
+    const isSwift = file.endsWith(".swift");
+    const isKotlin = file.endsWith(".kt");
+    const isDart = file.endsWith(".dart");
+    const isCpp = file.endsWith(".cpp") || file.endsWith(".hpp");
+    const isTs = file.endsWith(".ts") || file.endsWith(".tsx");
+    const test = isTestFile(file);
+    const isCore =
+      !test &&
+      isTs &&
+      (file.includes("/packages/core/src/") ||
+        file.includes("/packages/client/src/sync/") ||
+        file.includes("/packages/client/src/transport/") ||
+        file.includes("/packages/client/src/quality/"));
+
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
       if (line === undefined) {
         continue;
       }
       const trimmed = line.trim();
-      // 行コメントと本ファイル自身のルール定義は対象外とする
-      if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("import ")) {
+
+      // コメントとインポート行は対象外とする
+      if (shouldSkipLine(trimmed)) {
         continue;
       }
-      if (file.endsWith("forbidden.ts")) {
-        continue;
+
+      // 文字列リテラル内の検出を減らす: 行が引用符で囲まれた内容のみの場合はスキップ
+      // （完全な解析は行わないが、明らかな文字列行は除外する）
+
+      // 拡張子で規則を切り替える
+      let activeRules: readonly Rule[];
+      if (isRust) {
+        // 試験ファイルは lint-policy.md 9.3.1 により パニック相当のみ除外
+        // 動的型は Rust にはない
+        activeRules = test ? [] : RUST_RULES;
+      } else if (isSwift) {
+        // 試験ファイルの除外: パニック相当（try!, fatalError）のみ。動的型 Any は試験でも禁止。
+        if (test) {
+          activeRules = SWIFT_RULES.filter(
+            (rule) => rule.name === "swift-any",
+          );
+        } else {
+          activeRules = SWIFT_RULES;
+        }
+      } else if (isKotlin) {
+        // 試験ファイルの除外: パニック相当（error()）のみ。動的型 Any は試験でも禁止。
+        if (test) {
+          activeRules = KOTLIN_RULES.filter(
+            (rule) => rule.name === "kotlin-any",
+          );
+        } else {
+          activeRules = KOTLIN_RULES;
+        }
+      } else if (isDart) {
+        // 試験ファイルの除外: パニック相当は Dart には無い。動的型 dynamic は試験でも禁止。
+        if (test) {
+          activeRules = DART_RULES.filter(
+            (rule) => rule.name === "dart-dynamic",
+          );
+        } else {
+          activeRules = DART_RULES;
+        }
+      } else if (isCpp) {
+        // 試験ファイルの除外: C++ にはパニック相当の構文が規範に無い。動的型は試験でも禁止。
+        if (test) {
+          activeRules = CPP_RULES.filter(
+            (rule) => rule.name === "cpp-void-ptr" || rule.name === "cpp-std-any",
+          );
+        } else {
+          activeRules = CPP_RULES;
+        }
+      } else if (isTs) {
+        activeRules = isCore ? [...TS_RULES, ...CORE_RULES] : TS_RULES;
+      } else {
+        activeRules = [];
       }
-      // 拡張子で規則を切り替える。TypeScript の規則を Rust に当てても意味がない。
-      // 試験ファイルは対象外とする。試験の失敗は停止として表すのが自然であり、
-      // 規範（lint-policy.md 9 節）はコアと製品コードを対象とする。
-      const isRust = file.endsWith(".rs");
-      const isTest = file.includes("/tests/") || file.endsWith(".test.ts");
-      const isCore =
-        !isTest &&
-        (file.includes("/packages/core/src/") ||
-          file.includes("/packages/client/src/sync/") ||
-          file.includes("/packages/client/src/transport/") ||
-          file.includes("/packages/client/src/quality/"));
-      const activeRules = isRust
-        ? isTest
-          ? []
-          : RUST_RULES
-        : isCore
-          ? [...RULES, ...CORE_RULES]
-          : RULES;
+
       for (const rule of activeRules) {
         rule.pattern.lastIndex = 0;
         const match = rule.pattern.exec(line);
         if (match !== null) {
+          // 言語固有の誤検出除外
+          if (isKotlin && rule.name === "kotlin-any" && isKotlinEqualsOverride(line)) {
+            continue;
+          }
           violations += 1;
           process.stdout.write(
             `VIOLATION ${relative(root, file)}:${index + 1} [${rule.name}] ${rule.note}\n    ${trimmed}\n`,

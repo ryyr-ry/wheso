@@ -12,3 +12,5 @@ sdks/cpp/build/
 sdks/kotlin/build/
 .gradle/
 sdks/dart/.dart_tool/
+sdks/dart/pubspec.lock
+sdks/swift/.build/

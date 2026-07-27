@@ -36,7 +36,10 @@ public func whesoPrngShifts() -> [UInt64]? {
     }
     var shifts: [UInt64] = []
     for part in parts {
-        guard let parsed = UInt64(part.trimmingCharacters(in: .whitespaces)) else {
+        // Foundation に依存しない。コアは標準ライブラリのみで成立させる
+        // （trimmingCharacters は Foundation の API であり、この層では使えない）。
+        let trimmed = String(part.filter { !$0.isWhitespace })
+        guard let parsed = UInt64(trimmed) else {
             return nil
         }
         shifts.append(parsed)

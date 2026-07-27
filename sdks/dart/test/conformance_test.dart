@@ -4,6 +4,10 @@
 // ベクタを実装に合わせて変更してはならない。実装を直す（ADR-0012）。
 //
 // 実行: dart test（sdks/dart で）
+//
+// 動的型（dynamic）を使わない（lint-policy.md 1 節）。JSON は Object? で受け、
+// `is` による実行時検査で絞る（原則 2: 外部入力は未知の型で受け取り実行時に検査する）。
+// 欠損したフィールドを既定値へ落とさない。落とすとベクタの取り違えを検出できない。
 
 import 'dart:convert';
 import 'dart:io';
@@ -14,13 +18,70 @@ import 'package:wheso_client/src/fixed.dart';
 import 'package:wheso_client/src/wire.dart';
 
 /// 凍結ベクタの位置。リポジトリ直下の spec/vectors を参照する。
-dynamic readVector(String name) {
+Object? readVector(String name) {
   final file = File('../../spec/vectors/$name');
   final text = file.readAsStringSync();
   return jsonDecode(text);
 }
 
+/// 配列として読む。配列でなければ試験を失敗させる。
+List<Object?> readList(Object? value, String where) {
+  if (value is List<Object?>) {
+    return value;
+  }
+  throw StateError('$where: 配列ではない');
+}
+
+/// 連想配列として読む。
+Map<String, Object?> readMap(Object? value, String where) {
+  if (value is Map<String, Object?>) {
+    return value;
+  }
+  throw StateError('$where: 連想配列ではない');
+}
+
+/// 整数として読む。欠損や型違いは失敗させる。
+int readInt(Map<String, Object?> map, String key, String where) {
+  final value = map[key];
+  if (value is int) {
+    return value;
+  }
+  throw StateError('$where: $key が整数ではない');
+}
+
+/// null を許す整数として読む。キーの欠落は失敗させる。
+int? readNullableInt(Map<String, Object?> map, String key, String where) {
+  if (!map.containsKey(key)) {
+    throw StateError('$where: $key が無い');
+  }
+  final value = map[key];
+  if (value == null) {
+    return null;
+  }
+  if (value is int) {
+    return value;
+  }
+  throw StateError('$where: $key が整数でも null でもない');
+}
+
+/// 文字列として読む。
+String readString(Map<String, Object?> map, String key, String where) {
+  final value = map[key];
+  if (value is String) {
+    return value;
+  }
+  throw StateError('$where: $key が文字列ではない');
+}
+
+/// 64 bit の符号なし整数を、同じビット列の符号付き整数として読む。
+int readUnsigned64(Map<String, Object?> map, String key, String where) {
+  return BigInt.parse(readString(map, key, where)).toSigned(64).toInt();
+}
+
 Uint8List hexToBytes(String hex) {
+  if (hex.length % 2 != 0) {
+    throw StateError('16 進の長さが偶数ではない');
+  }
   final bytes = Uint8List(hex.length ~/ 2);
   for (var index = 0; index + 1 < hex.length; index += 2) {
     bytes[index ~/ 2] = int.parse(hex.substring(index, index + 2), radix: 16);
@@ -38,13 +99,13 @@ String bytesToHex(Uint8List bytes) {
 
 void main() {
   test('擬似乱数が凍結ベクタと一致する', () {
-    final root = readVector('prng.json');
-    final vectors = root['vectors'] as List<dynamic>;
+    final root = readMap(readVector('prng.json'), 'prng.json');
+    final vectors = readList(root['vectors'], 'prng.json vectors');
     expect(vectors, isNotEmpty);
-    for (final entry in vectors) {
-      final seedText = entry['seed'] as String;
+    for (final rawEntry in vectors) {
+      final entry = readMap(rawEntry, 'prng ベクタ');
       // 64 bit の符号なし整数は Dart の int（64 bit 符号付き）と同じビット列で扱う。
-      final seed = BigInt.parse(seedText).toSigned(64).toInt();
+      final seed = readUnsigned64(entry, 'seed', 'prng ベクタ');
       final created = createPrng(seed);
       if (seed == 0) {
         expect(created.isOk, isFalse, reason: '種 0 は失敗する');
@@ -52,42 +113,49 @@ void main() {
       }
       expect(created.isOk, isTrue);
       var state = created.value!;
-      final outputs = entry['outputs'] as List<dynamic>;
-      for (final expected in outputs) {
+      final outputs = readList(entry['outputs'], 'prng outputs');
+      expect(outputs, isNotEmpty);
+      for (final rawExpected in outputs) {
+        if (rawExpected is! String) {
+          throw StateError('prng outputs: 文字列ではない');
+        }
         final stepped = prngNext(state);
         expect(stepped.isOk, isTrue);
         state = stepped.value!.state;
-        final expectedValue = BigInt.parse(expected as String).toSigned(64).toInt();
+        final expectedValue = BigInt.parse(rawExpected).toSigned(64).toInt();
         expect(stepped.value!.output, equals(expectedValue), reason: '出力が一致する');
       }
     }
   });
 
   test('メディアベクタが符号化・復号で一致する', () {
-    final entries = readVector('media.json') as List<dynamic>;
+    final entries = readList(readVector('media.json'), 'media.json');
     expect(entries, isNotEmpty);
-    for (final entry in entries) {
-      final expectedHex = entry['bytesHex'] as String;
-      final message = entry['message'] as Map<String, dynamic>;
+    for (final rawEntry in entries) {
+      final entry = readMap(rawEntry, 'media ベクタ');
+      final name = readString(entry, 'name', 'media ベクタ');
+      final expectedHex = readString(entry, 'bytesHex', name);
+      final message = readMap(entry['message'], '$name message');
       final units = <Unit>[];
-      for (final unit in message['units'] as List<dynamic>) {
+      for (final rawUnit in readList(message['units'], '$name units')) {
+        final unit = readMap(rawUnit, '$name unit');
         units.add(Unit(
-          sequenceNumber: unit['sequenceNumber'] as int,
-          captureTimestampUs: BigInt.parse(unit['captureTimestampUs'] as String).toSigned(64).toInt(),
-          flags: unit['flags'] as int,
-          spatialId: unit['spatialId'] as int,
-          temporalId: unit['temporalId'] as int,
-          payload: hexToBytes(unit['payloadHex'] as String),
+          sequenceNumber: readInt(unit, 'sequenceNumber', name),
+          captureTimestampUs: readUnsigned64(unit, 'captureTimestampUs', name),
+          flags: readInt(unit, 'flags', name),
+          spatialId: readInt(unit, 'spatialId', name),
+          temporalId: readInt(unit, 'temporalId', name),
+          payload: hexToBytes(readString(unit, 'payloadHex', name)),
         ));
       }
       final built = MediaMessage(
-        channel: message['channel'] as int,
-        senderId: message['senderId'] as int,
+        channel: readInt(message, 'channel', name),
+        senderId: readInt(message, 'senderId', name),
         units: units,
       );
       final encoded = encodeMediaMessage(built);
       expect(encoded.isOk, isTrue, reason: '符号化できる');
-      expect(bytesToHex(encoded.value!), equals(expectedHex), reason: '${entry['name']}: バイト列が一致する');
+      expect(bytesToHex(encoded.value!), equals(expectedHex), reason: '$name: バイト列が一致する');
 
       final decoded = decodeMediaMessage(hexToBytes(expectedHex));
       expect(decoded.isOk, isTrue, reason: '復号できる');
@@ -103,23 +171,28 @@ void main() {
   });
 
   test('不正なベクタが同じエラー名で拒否される', () {
-    final entries = readVector('invalid.json') as List<dynamic>;
+    final entries = readList(readVector('invalid.json'), 'invalid.json');
     expect(entries, isNotEmpty);
-    for (final entry in entries) {
-      final bytes = hexToBytes(entry['bytesHex'] as String);
+    for (final rawEntry in entries) {
+      final entry = readMap(rawEntry, 'invalid ベクタ');
+      final name = readString(entry, 'name', 'invalid ベクタ');
+      final bytes = hexToBytes(readString(entry, 'bytesHex', name));
       final decoded = decodeMediaMessage(bytes);
-      expect(decoded.isOk, isFalse, reason: '${entry['name']}: 受理しない');
-      expect(wireErrorName(decoded.error!), equals(entry['expectedErrorCode'] as String),
-          reason: '${entry['name']}: 同じエラー');
+      expect(decoded.isOk, isFalse, reason: '$name: 受理しない');
+      expect(wireErrorName(decoded.error!),
+          equals(readString(entry, 'expectedErrorCode', name)),
+          reason: '$name: 同じエラー');
     }
   });
 
   test('破棄順位が凍結ベクタと一致する', () {
-    final entries = readVector('drop-order.json') as List<dynamic>;
+    final entries = readList(readVector('drop-order.json'), 'drop-order.json');
     expect(entries, isNotEmpty);
-    for (final entry in entries) {
-      final actual = dropPriority(entry['channel'] as int, entry['flags'] as int);
-      expect(actual, equals(entry['expectedPriority']), reason: '${entry['name']}');
+    for (final rawEntry in entries) {
+      final entry = readMap(rawEntry, 'drop ベクタ');
+      final name = readString(entry, 'name', 'drop ベクタ');
+      final actual = dropPriority(readInt(entry, 'channel', name), readInt(entry, 'flags', name));
+      expect(actual, equals(readNullableInt(entry, 'expectedPriority', name)), reason: name);
     }
   });
 
