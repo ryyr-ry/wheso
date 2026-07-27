@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 
 import { encodeMediaMessage } from "../../packages/core/src/wire.ts";
+import { deriveMeetingSecret, nodeAuthTag, nodeAuthTimeWindow } from "../../packages/core/src/auth.ts";
 import {
   CHANNEL_VIDEO,
   FLAG_DISCARDABLE,
@@ -53,6 +54,27 @@ function roomFor(index: number): string {
 }
 const ROOM = roomFor(0);
 
+/**
+ * 局所実行環境で使う開発用のノード鍵。
+ * 本番の鍵は環境の秘密として与える（Q-019）。この値は試験専用であり秘密ではない。
+ */
+const DEV_NODE_KEY = "wheso-dev-node-key-not-a-secret";
+
+/** 中継部屋へノードとして認証する。認証前のメディアは破棄される（wire-format.md 2.8）。 */
+async function sendNodeHello(socket: globalThis.WebSocket, room: string, role: string): Promise<void> {
+  const parts = room.split("-");
+  const meetingId = parts[1] ?? "";
+  const secret = await deriveMeetingSecret(new TextEncoder().encode(DEV_NODE_KEY), meetingId);
+  assert.equal(secret.ok, true, "会議シークレットを導出できる");
+  if (!secret.ok) {
+    return;
+  }
+  const window = nodeAuthTimeWindow(Math.trunc(Date.now() / 1000));
+  const tag = await nodeAuthTag(secret.value, room, role, window);
+  assert.equal(tag.ok, true, "authTag を作れる");
+  socket.send(JSON.stringify({ t: "nodeHello", role, nodeId: room, authTag: tag.ok ? tag.value : "" }));
+}
+
 let server: ChildProcess | null = null;
 
 /** 起動を待つ。主入口の健全性応答が返れば準備完了とする。 */
@@ -78,7 +100,7 @@ before(async () => {
   WS_BASE = `ws://127.0.0.1:${PORT}`;
   // detached で起動し、終了時にプロセス群ごと落とす。
   // partykit dev は子プロセス（実行環境）を起動するため、親だけ落とすと残る。
-  server = spawn("npx", ["partykit", "dev", "--port", String(PORT)], {
+  server = spawn("npx", ["partykit", "dev", "--port", String(PORT), "--var", `WHESO_NODE_KEY=${DEV_NODE_KEY}`], {
     cwd: new URL("../..", import.meta.url).pathname,
     stdio: "ignore",
     detached: true,
@@ -232,6 +254,7 @@ function mediaBytes(senderId: number, spatialId: number, payloadBytes = 64): Uin
 test("実行環境で購読者へメディアが転送される", { timeout: 60_000 }, async () => {
   const subscriber = await connectReady(2);
   const sender = await connectReady(1);
+  await sendNodeHello(sender, ROOM, "sender");
 
   subscriber.send(
     JSON.stringify({
@@ -263,6 +286,7 @@ test("実行環境で tier を超える spatialId は転送されない", { time
   const room = roomFor(1);
   const subscriber = await connectReady(4, room);
   const sender = await connectReady(3, room);
+  await sendNodeHello(sender, room, "sender");
 
   subscriber.send(
     JSON.stringify({
@@ -293,6 +317,8 @@ test("実行環境で tier を超える spatialId は転送されない", { time
 
 test("実行環境で形式違反のメディアは接続が閉じられる", { timeout: 60_000 }, async () => {
   const sender = await connectReady(5, roomFor(2));
+  await sendNodeHello(sender, roomFor(2), "sender");
+  await new Promise((resolve) => setTimeout(resolve, 200));
   const closed = new Promise<number>((resolve) => {
     sender.addEventListener("close", (event: CloseEvent) => resolve(event.code), { once: true });
     setTimeout(() => resolve(-1), 5000);
@@ -304,3 +330,43 @@ test("実行環境で形式違反のメディアは接続が閉じられる", { 
 });
 
 void FLAG_DISCARDABLE;
+
+test("実行環境で nodeHello なしのメディアは転送されない", { timeout: 60_000 }, async () => {
+  // 監査の指摘（重大度 高）「DO 間接続が無認証」への対処を実環境で確かめる。
+  // 認証しない送信者のメディアは破棄され、認証した送信者のメディアだけが届く。
+  const room = roomFor(3);
+  const subscriber = await connectReady(7, room);
+  const unauthenticated = await connectReady(6, room);
+
+  subscriber.send(
+    JSON.stringify({
+      t: "subscribe",
+      entries: [
+        { senderId: 6, channel: CHANNEL_VIDEO, maxSpatialId: 3, maxTemporalId: 7 },
+        { senderId: 8, channel: CHANNEL_VIDEO, maxSpatialId: 3, maxTemporalId: 7 },
+      ],
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  // 認証していない接続からの送信（届いてはならない）
+  unauthenticated.send(mediaBytes(6, 0, 64));
+
+  // 認証した別の接続からの送信（標識。これが最初に届くべきである）
+  const authenticated = await connectReady(8, room);
+  await sendNodeHello(authenticated, room, "sender");
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const marker = mediaBytes(8, 0, 128);
+  authenticated.send(marker);
+
+  const received = await nextMessage(subscriber, 10_000);
+  assert.ok(received instanceof ArrayBuffer, "標識が届く");
+  assert.equal(
+    received instanceof ArrayBuffer ? received.byteLength : 0,
+    marker.length,
+    "認証していない送信者のメディアは転送されない",
+  );
+  subscriber.close();
+  unauthenticated.close();
+  authenticated.close();
+});

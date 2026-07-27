@@ -16,6 +16,7 @@
 
 import { packEncoded } from "../../../packages/client/src/media/encoder-set.ts";
 import { decodeMediaMessage } from "../../../packages/core/src/wire.ts";
+import { deriveMeetingSecret, nodeAuthTag, nodeAuthTimeWindow } from "../../../packages/core/src/auth.ts";
 import { CHANNEL_VIDEO } from "../../../packages/core/src/generated/wire-layout.ts";
 
 interface E2eResult {
@@ -33,9 +34,9 @@ interface E2eResult {
 declare global {
   interface Window {
     __whesoResult?: E2eResult;
-    __whesoRun?: (wsBase: string, room: string) => Promise<E2eResult>;
+    __whesoRun?: (wsBase: string, room: string, nodeKey: string) => Promise<E2eResult>;
     /** 否定対照。購読しない送信者を指定するため、何も届かず失敗するはずである。 */
-    __whesoRunNegative?: (wsBase: string, room: string) => Promise<E2eResult>;
+    __whesoRunNegative?: (wsBase: string, room: string, nodeKey: string) => Promise<E2eResult>;
   }
 }
 
@@ -78,7 +79,7 @@ async function pickCodec(): Promise<string | null> {
   return null;
 }
 
-async function run(wsBase: string, room: string, subscribeSenderId = 1): Promise<E2eResult> {
+async function run(wsBase: string, room: string, nodeKey: string, subscribeSenderId = 1): Promise<E2eResult> {
   const fail = (detail: string, codec = ""): E2eResult => ({
     ok: false,
     detail,
@@ -107,6 +108,7 @@ async function run(wsBase: string, room: string, subscribeSenderId = 1): Promise
       entries: [{ senderId: subscribeSenderId, channel: CHANNEL_VIDEO, maxSpatialId: 3, maxTemporalId: 7 }],
     }),
   );
+  await sendNodeHello(sender, room, nodeKey);
   await sleep(300);
 
   // --- 復号器を用意する ---
@@ -281,6 +283,25 @@ function waitOpen(socket: WebSocket): Promise<void> {
   });
 }
 
+/**
+ * 中継部屋へノードとして認証する（wire-format.md 2.8）。
+ * 認証前のメディアは破棄されるため、送信の前に必ず送る。
+ */
+async function sendNodeHello(socket: WebSocket, room: string, nodeKey: string): Promise<void> {
+  const parts = room.split("-");
+  const meetingId = parts[1] ?? "";
+  const secret = await deriveMeetingSecret(new TextEncoder().encode(nodeKey), meetingId);
+  if (!secret.ok) {
+    return;
+  }
+  const window = nodeAuthTimeWindow(Math.trunc(Date.now() / 1000));
+  const tag = await nodeAuthTag(secret.value, room, "sender", window);
+  if (!tag.ok) {
+    return;
+  }
+  socket.send(JSON.stringify({ t: "nodeHello", role: "sender", nodeId: room, authTag: tag.value }));
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -296,16 +317,16 @@ async function waitUntil(condition: () => boolean, timeoutMs: number): Promise<b
   return condition();
 }
 
-window.__whesoRunNegative = async (wsBase: string, room: string): Promise<E2eResult> => {
+window.__whesoRunNegative = async (wsBase: string, room: string, nodeKey: string): Promise<E2eResult> => {
   // 購読していない送信者を指定する。中継ノードは転送しないため、復号できるフレームは 0 になる。
-  const result = await run(wsBase, room, 999);
+  const result = await run(wsBase, room, nodeKey, 999);
   window.__whesoResult = result;
   return result;
 };
 
-window.__whesoRun = async (wsBase: string, room: string): Promise<E2eResult> => {
+window.__whesoRun = async (wsBase: string, room: string, nodeKey: string): Promise<E2eResult> => {
   try {
-    const result = await run(wsBase, room);
+    const result = await run(wsBase, room, nodeKey);
     window.__whesoResult = result;
     return result;
   } catch (error) {

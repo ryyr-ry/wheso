@@ -10,6 +10,7 @@
  */
 
 import { encodeMediaMessage, decodeMediaMessage } from "../../../packages/core/src/wire.ts";
+import { deriveMeetingSecret, nodeAuthTag, nodeAuthTimeWindow } from "../../../packages/core/src/auth.ts";
 import {
   AUDIO_BUNDLE_MS,
   AUDIO_UNITS_PER_MESSAGE,
@@ -33,7 +34,7 @@ interface AudioE2eResult {
 
 declare global {
   interface Window {
-    __whesoAudioRun?: (wsBase: string, room: string) => Promise<AudioE2eResult>;
+    __whesoAudioRun?: (wsBase: string, room: string, nodeKey: string) => Promise<AudioE2eResult>;
   }
 }
 
@@ -72,6 +73,25 @@ function waitOpen(socket: WebSocket): Promise<void> {
   });
 }
 
+/**
+ * 中継部屋へノードとして認証する（wire-format.md 2.8）。
+ * 認証前のメディアは破棄されるため、送信の前に必ず送る。
+ */
+async function sendNodeHello(socket: WebSocket, room: string, nodeKey: string): Promise<void> {
+  const parts = room.split("-");
+  const meetingId = parts[1] ?? "";
+  const secret = await deriveMeetingSecret(new TextEncoder().encode(nodeKey), meetingId);
+  if (!secret.ok) {
+    return;
+  }
+  const window = nodeAuthTimeWindow(Math.trunc(Date.now() / 1000));
+  const tag = await nodeAuthTag(secret.value, room, "sender", window);
+  if (!tag.ok) {
+    return;
+  }
+  socket.send(JSON.stringify({ t: "nodeHello", role: "sender", nodeId: room, authTag: tag.value }));
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -87,7 +107,7 @@ async function waitUntil(condition: () => boolean, timeoutMs: number): Promise<b
   return condition();
 }
 
-async function run(wsBase: string, room: string): Promise<AudioE2eResult> {
+async function run(wsBase: string, room: string, nodeKey: string): Promise<AudioE2eResult> {
   const fail = (detail: string): AudioE2eResult => ({
     ok: false,
     detail,
@@ -120,6 +140,7 @@ async function run(wsBase: string, room: string): Promise<AudioE2eResult> {
       entries: [{ senderId: 1, channel: CHANNEL_AUDIO, maxSpatialId: 0, maxTemporalId: 0 }],
     }),
   );
+  await sendNodeHello(sender, room, nodeKey);
   await sleep(300);
 
   const arrivals: ArrayBuffer[] = [];
@@ -273,9 +294,9 @@ async function run(wsBase: string, room: string): Promise<AudioE2eResult> {
   };
 }
 
-window.__whesoAudioRun = async (wsBase: string, room: string): Promise<AudioE2eResult> => {
+window.__whesoAudioRun = async (wsBase: string, room: string, nodeKey: string): Promise<AudioE2eResult> => {
   try {
-    return await run(wsBase, room);
+    return await run(wsBase, room, nodeKey);
   } catch (error) {
     const detail = error instanceof Error ? `${error.name}: ${error.message}` : "unknown";
     return {

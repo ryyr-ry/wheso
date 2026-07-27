@@ -24,6 +24,9 @@ import { chromium, type Browser } from "playwright";
 const ROOM = "vsh-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0";
 const root = new URL("../..", import.meta.url).pathname;
 
+/** 局所実行環境で使う開発用のノード鍵。試験専用であり秘密ではない。 */
+const DEV_NODE_KEY = "wheso-dev-node-key-not-a-secret";
+
 let devServer: ChildProcess | null = null;
 let pageServer: Server | null = null;
 let browser: Browser | null = null;
@@ -78,7 +81,7 @@ before(async () => {
   devPort = await findFreePort();
   pagePort = await findFreePort();
 
-  devServer = spawn("npx", ["partykit", "dev", "--port", String(devPort)], {
+  devServer = spawn("npx", ["partykit", "dev", "--port", String(devPort), "--var", `WHESO_NODE_KEY=${DEV_NODE_KEY}`], {
     cwd: root,
     stdio: "ignore",
     detached: true,
@@ -158,14 +161,14 @@ test("実映像が符号化・転送・復号され、画素が一致する", { 
   await page.waitForFunction("typeof window.__whesoRun === 'function'", undefined, { timeout: 30_000 });
 
   const result = await page.evaluate(
-    async ([wsBase, room]) => {
+    async ([wsBase, room, nodeKey]) => {
       const run = window.__whesoRun;
       if (run === undefined) {
         return { ok: false, detail: "本体が読み込まれていない" };
       }
-      return await run(String(wsBase), String(room));
+      return await run(String(wsBase), String(room), String(nodeKey));
     },
-    [`ws://127.0.0.1:${devPort}`, ROOM],
+    [`ws://127.0.0.1:${devPort}`, ROOM, DEV_NODE_KEY],
   );
 
   assert.equal(
@@ -196,14 +199,14 @@ test("否定対照: 購読していない送信者の映像は届かず、検査
     timeout: 30_000,
   });
   const result = await page.evaluate(
-    async ([wsBase, room]) => {
+    async ([wsBase, room, nodeKey]) => {
       const run = window.__whesoRunNegative;
       if (run === undefined) {
         return { ok: true, detail: "本体が読み込まれていない" };
       }
-      return await run(String(wsBase), String(room));
+      return await run(String(wsBase), String(room), String(nodeKey));
     },
-    [`ws://127.0.0.1:${devPort}`, ROOM],
+    [`ws://127.0.0.1:${devPort}`, ROOM, DEV_NODE_KEY],
   );
   process.stdout.write(`否定対照の結果: ${JSON.stringify(result)}\n`);
   assert.equal(result.ok, false, "届かない構成では失敗する");
@@ -223,14 +226,14 @@ test("実音声が Opus で符号化・束ね・転送・復号され、波形�
   await page.waitForFunction("typeof window.__whesoAudioRun === 'function'", undefined, { timeout: 30_000 });
 
   const result = await page.evaluate(
-    async ([wsBase, room]) => {
+    async ([wsBase, room, nodeKey]) => {
       const run = window.__whesoAudioRun;
       if (run === undefined) {
         return { ok: false, detail: "本体が読み込まれていない" };
       }
-      return await run(String(wsBase), String(room));
+      return await run(String(wsBase), String(room), String(nodeKey));
     },
-    [`ws://127.0.0.1:${devPort}`, "ash-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0"],
+    [`ws://127.0.0.1:${devPort}`, "ash-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0", DEV_NODE_KEY],
   );
 
   process.stdout.write(`音声 E2E 結果: ${JSON.stringify(result)}\n`);
