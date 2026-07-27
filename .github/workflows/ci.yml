@@ -62,6 +62,9 @@ jobs:
       - name: trace:receiver:check
         run: npm run trace:receiver:check
 
+      - name: real-media:check（実 AV1 / Opus の凍結資産）
+        run: npm run real-media:check
+
       - name: fuzz:check
         run: npm run fuzz:check
 
