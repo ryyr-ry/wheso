@@ -102,3 +102,19 @@ jobs:
 
       - name: Kotlin の適合試験（凍結ベクタとの一致）
         run: npm run test:kotlin
+
+  # Swift は macOS でのみ構築できる。public リポジトリでは実行時間が無償である。
+  verify-swift:
+    runs-on: macos-latest
+    steps:
+      - name: このリポジトリが public であることを確認する
+        run: |
+          if [ "${{ github.event.repository.private }}" = "true" ]; then
+            echo "private リポジトリでは実行しない（課金を避けるため）"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Swift の適合試験（凍結ベクタとの一致）
+        run: bash sdks/swift/run-tests.sh

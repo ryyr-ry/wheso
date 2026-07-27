@@ -19,6 +19,7 @@ const rustOutDir = join(root, "sdks", "rust", "src", "generated");
 const cppOutDir = join(root, "sdks", "cpp", "include", "wheso", "generated");
 const dartOutDir = join(root, "sdks", "dart", "lib", "src", "generated");
 const kotlinOutDir = join(root, "sdks", "kotlin", "src", "main", "kotlin", "dev", "wheso", "generated");
+const swiftOutDir = join(root, "sdks", "swift", "Sources", "WhesoClient", "Generated");
 
 const BANNER = `/**
  * このファイルは自動生成されている。手で編集してはならない。
@@ -747,6 +748,122 @@ function generateWireKt(schema: Record<string, unknown>): string {
   return `${lines.join("\n")}\n`;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* Swift 向けの生成                                                          */
+/* ------------------------------------------------------------------------- */
+
+const SWIFT_BANNER = `// このファイルは自動生成されている。手で編集してはならない。
+//
+// 生成元: プロトコルのスキーマ定義
+// 再生成: 内部検証スクリプトを実行する
+`;
+
+/** Swift の値表現。整数は Int64、小数は Double、真偽は Bool、文字列は String とする。 */
+function formatSwiftValue(value: unknown): { readonly type: string; readonly literal: string } | null {
+  if (typeof value === "number") {
+    return Number.isInteger(value)
+      ? { type: "Int64", literal: `${value}` }
+      : { type: "Double", literal: String(value) };
+  }
+  if (typeof value === "boolean") {
+    return { type: "Bool", literal: String(value) };
+  }
+  if (typeof value === "string") {
+    return { type: "String", literal: JSON.stringify(value) };
+  }
+  if (Array.isArray(value)) {
+    const parts: string[] = [];
+    for (const item of value) {
+      const formatted = formatSwiftValue(item);
+      if (formatted === null || formatted.type !== "Int64") {
+        return null;
+      }
+      parts.push(formatted.literal);
+    }
+    return { type: "[Int64]", literal: `[${parts.join(", ")}]` };
+  }
+  return null;
+}
+
+function generateConstantsSwift(schema: Record<string, unknown>): string {
+  const lines: string[] = [SWIFT_BANNER, "public enum WhesoConstants {"];
+  for (const [groupName, group] of Object.entries(schema)) {
+    if (groupName.startsWith("$") || !isRecord(group)) {
+      continue;
+    }
+    lines.push(`    // ${groupName}`);
+    for (const [constantName, definition] of Object.entries(group)) {
+      if (constantName.startsWith("$") || !isRecord(definition)) {
+        continue;
+      }
+      if (!("value" in definition)) {
+        for (const [key, raw] of Object.entries(definition)) {
+          if (key.startsWith("$") || key === "derivation" || key === "fact" || key === "question" || key === "adr") {
+            continue;
+          }
+          const formatted = formatSwiftValue(raw);
+          if (formatted === null) {
+            continue;
+          }
+          const suffix = key.replace(/([A-Z])/g, "_$1").toUpperCase();
+          lines.push(`    public static let ${constantName}_${suffix}: ${formatted.type} = ${formatted.literal}`);
+        }
+        continue;
+      }
+      const formatted = formatSwiftValue(definition["value"]);
+      if (formatted === null) {
+        continue;
+      }
+      lines.push(`    public static let ${constantName}: ${formatted.type} = ${formatted.literal}`);
+    }
+    lines.push("");
+  }
+  lines.push("}");
+  return `${lines.join("\n")}\n`;
+}
+
+function generateWireSwift(schema: Record<string, unknown>): string {
+  const messageHeader = readObject(schema, "messageHeader");
+  const unitHeader = readObject(schema, "unitHeader");
+  const limits = readObject(schema, "limits");
+  const lines: string[] = [SWIFT_BANNER, "public enum WhesoWireLayout {"];
+  lines.push(`    public static let PROTOCOL_VERSION: UInt8 = ${readNumber(schema, "protocolVersion")}`);
+  lines.push(`    public static let WIRE_MAGIC: UInt8 = ${readNumber(schema, "magic")}`);
+  lines.push(`    public static let MESSAGE_HEADER_BYTES: Int = ${readNumber(messageHeader, "bytes")}`);
+  lines.push(`    public static let UNIT_HEADER_BYTES: Int = ${readNumber(unitHeader, "bytes")}`);
+  lines.push(`    public static let MAX_UNITS_PER_MESSAGE: Int = ${readNumber(limits, "maxUnitsPerMessage")}`);
+  lines.push(`    public static let MAX_MESSAGE_BYTES: Int = ${readNumber(limits, "maxMessageBytes")}`);
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "enums"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(
+          `    public static let CHANNEL_${readString(entry, "name")}: UInt8 = ${readNumber(entry, "value")}`,
+        );
+      }
+    }
+  }
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "bitsets"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(
+          `    public static let FLAG_${readString(entry, "name")}: UInt8 = ${1 << readNumber(entry, "bit")}`,
+        );
+      }
+    }
+  }
+  lines.push("}");
+  return `${lines.join("\n")}\n`;
+}
+
 /* ------------------------------------------------------------------------- */
 /* 実行                                                                      */
 /* ------------------------------------------------------------------------- */
@@ -772,6 +889,8 @@ async function buildArtifacts(): Promise<readonly Artifact[]> {
     { path: join(dartOutDir, "wire_layout.dart"), content: generateWireDart(wire) },
     { path: join(kotlinOutDir, "Constants.kt"), content: generateConstantsKt(constants) },
     { path: join(kotlinOutDir, "WireLayout.kt"), content: generateWireKt(wire) },
+    { path: join(swiftOutDir, "Constants.swift"), content: generateConstantsSwift(constants) },
+    { path: join(swiftOutDir, "WireLayout.swift"), content: generateWireSwift(wire) },
   ];
 }
 
@@ -781,6 +900,7 @@ async function generate(): Promise<void> {
   await mkdir(cppOutDir, { recursive: true });
   await mkdir(dartOutDir, { recursive: true });
   await mkdir(kotlinOutDir, { recursive: true });
+  await mkdir(swiftOutDir, { recursive: true });
   const artifacts = await buildArtifacts();
   for (const artifact of artifacts) {
     await writeFile(artifact.path, artifact.content, "utf8");
