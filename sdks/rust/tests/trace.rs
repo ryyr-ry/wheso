@@ -77,6 +77,9 @@ fn to_json(command: &ShardCommand) -> Value {
             json!({ "kind": "drop", "priority": priority, "count": count })
         }
         ShardCommand::Notify { code } => json!({ "kind": "notify", "code": code }),
+        ShardCommand::SetTier { target_id, tier } => {
+            json!({ "kind": "setTier", "for": target_id, "tier": tier })
+        }
     }
 }
 

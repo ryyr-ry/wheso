@@ -21,6 +21,7 @@ export const V_4K60 = {
   framerate: 60,
   targetBitrate: 25000000,
   scalabilityMode: "L1T3",
+  temporalLayers: 3,
   requiresHardwareEncoder: true,
 } as const;
 export const V_1080P60 = {
@@ -30,6 +31,7 @@ export const V_1080P60 = {
   framerate: 60,
   targetBitrate: 6000000,
   scalabilityMode: "L1T3",
+  temporalLayers: 3,
   requiresHardwareEncoder: false,
 } as const;
 export const V_1080P30 = {
@@ -39,6 +41,7 @@ export const V_1080P30 = {
   framerate: 30,
   targetBitrate: 3000000,
   scalabilityMode: "L1T3",
+  temporalLayers: 3,
   requiresHardwareEncoder: false,
 } as const;
 export const V_360P15 = {
@@ -48,6 +51,7 @@ export const V_360P15 = {
   framerate: 15,
   targetBitrate: 200000,
   scalabilityMode: "L1T2",
+  temporalLayers: 2,
   requiresHardwareEncoder: false,
 } as const;
 export const V_SCREEN_4K30 = {
@@ -57,6 +61,7 @@ export const V_SCREEN_4K30 = {
   framerate: 30,
   targetBitrate: 8000000,
   scalabilityMode: "L1T2",
+  temporalLayers: 2,
   contentHint: "text",
   requiresHardwareEncoder: false,
 } as const;
@@ -67,6 +72,7 @@ export const V_SCREEN_1080P30 = {
   framerate: 30,
   targetBitrate: 2000000,
   scalabilityMode: "L1T2",
+  temporalLayers: 2,
   contentHint: "text",
   requiresHardwareEncoder: false,
 } as const;

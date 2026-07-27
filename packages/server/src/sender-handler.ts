@@ -17,6 +17,18 @@ import {
   type SenderState,
 } from "@wheso/core/src/sender-core.ts";
 import { decodeMediaMessage, wireErrorCloseCode } from "@wheso/core/src/wire.ts";
+import {
+  admit,
+  admitKeyframeRequest,
+  initialRateWindow,
+  type KeyframeMark,
+  type RateWindow,
+} from "@wheso/core/src/rate-limit.ts";
+import { MAX_INBOUND_MESSAGES_PER_SEC_PER_CLIENT } from "@wheso/core/src/generated/constants.ts";
+import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
+
+/** 受信メッセージレートの窓の長さ。1 秒あたりの件数で規定されている（auth.md 5 節）。 */
+const INBOUND_WINDOW_MS = 1000;
 
 /** 送信の口。実装は Durable Object 側が与える。 */
 export interface SenderTransport {
@@ -24,6 +36,11 @@ export interface SenderTransport {
   sendToShard(peer: number, bytes: Uint8Array): void;
   /** 割当先シャードへ制御メッセージを送る。 */
   sendTextToShard(peer: number, text: string): void;
+  /**
+   * 送信側クライアントへ制御メッセージを送る。
+   * キーフレーム要求（wire-format.md 2.5）とエンコーダ指令（2.7）の宛先はクライアントである。
+   */
+  sendTextToClient(text: string): void;
   /** シャードへの接続を開く。 */
   connectShard(peer: number): void;
   /** シャードへの接続を閉じる。 */
@@ -38,10 +55,17 @@ export interface SenderTransport {
 
 export interface SenderHandlerState {
   readonly core: SenderState;
+  /**
+   * クライアントへ通したキーフレーム要求の記録。
+   * 上流から届いた要求のうち、規定間隔内の重複は無視する（wire-format.md 2.5）。
+   */
+  readonly keyframeMarks: readonly KeyframeMark[];
+  /** クライアント接続からの受信メッセージ数の窓（auth.md 5 節）。 */
+  readonly inbound: RateWindow;
 }
 
-export function createSenderHandlerState(epoch: number): SenderHandlerState {
-  return { core: initialSenderState(epoch) };
+export function createSenderHandlerState(epoch: number, nowMs: number): SenderHandlerState {
+  return { core: initialSenderState(epoch), keyframeMarks: [], inbound: initialRateWindow(nowMs) };
 }
 
 /**
@@ -56,13 +80,17 @@ export function handleClientMedia(
   nowMs: number,
   transport: SenderTransport,
 ): SenderHandlerState {
+  const limited = countInbound(state, nowMs, transport);
+  if (limited.exceeded) {
+    return limited.state;
+  }
   const decoded = decodeMediaMessage(bytes);
   if (!decoded.ok) {
     transport.closeClient(wireErrorCloseCode(decoded.error.code), decoded.error.code);
-    return state;
+    return limited.state;
   }
 
-  let core = state.core;
+  let core = limited.state.core;
   let sent = false;
   for (const unit of decoded.value.units) {
     const event: SenderEvent = {
@@ -89,11 +117,66 @@ export function handleClientMedia(
       applyCommand(command, transport);
     }
   }
-  return { core };
+  return { ...limited.state, core };
 }
 
 /** クライアントの制御メッセージを処理する。未知の `t` は無視する。 */
 export function handleClientText(
+  state: SenderHandlerState,
+  text: string,
+  nowMs: number,
+  transport: SenderTransport,
+): SenderHandlerState {
+  const limited = countInbound(state, nowMs, transport);
+  if (limited.exceeded) {
+    return limited.state;
+  }
+  return stepText(limited.state, text, nowMs, transport);
+}
+
+/**
+ * 上流（シャードや制御系）からのメッセージを処理する。
+ *
+ * ack と epochChange はコアへ渡す。keyframeRequest と encoderDirective は
+ * 送信側クライアントが宛先であるため中継する。中継は判断ではない。
+ * キーフレーム要求は規定間隔内の重複を無視する（wire-format.md 2.5）。
+ */
+export function handleUpstreamText(
+  state: SenderHandlerState,
+  text: string,
+  nowMs: number,
+  transport: SenderTransport,
+): SenderHandlerState {
+  const message = parseObject(text);
+  if (message === null) {
+    return state;
+  }
+  const t = message["t"];
+  if (t === "keyframeRequest") {
+    const senderId = message["senderId"];
+    const channel = message["channel"];
+    const spatialId = message["spatialId"];
+    if (!isInteger(senderId) || !isInteger(channel) || !isInteger(spatialId)) {
+      return state;
+    }
+    const decision = admitKeyframeRequest(state.keyframeMarks, { senderId, channel, spatialId }, nowMs);
+    if (!decision.allowed) {
+      // 超過分は無視する。無視した事実は記録の対象であり、接続は閉じない。
+      return { ...state, keyframeMarks: decision.marks };
+    }
+    transport.sendTextToClient(JSON.stringify({ t: "keyframeRequest", senderId, channel, spatialId }));
+    return { ...state, keyframeMarks: decision.marks };
+  }
+  if (t === "encoderDirective") {
+    // 指令の内容は中継元（中継ノード）が決める。ここでは形を変えずに渡す。
+    transport.sendTextToClient(text);
+    return state;
+  }
+  return stepText(state, text, nowMs, transport);
+}
+
+/** 制御メッセージをコアへ渡し、出力コマンドを実行する。 */
+function stepText(
   state: SenderHandlerState,
   text: string,
   nowMs: number,
@@ -111,17 +194,25 @@ export function handleClientText(
       applyCommand(command, transport);
     }
   }
-  return { core };
+  return { ...state, core };
 }
 
-/** 上流（シャードや制御系）からのメッセージを処理する。ack と epochChange を受ける。 */
-export function handleUpstreamText(
+/**
+ * クライアント接続からの受信を 1 件計上する。
+ * 上限を超えた接続は閉じる（auth.md 5 節、E_RATE_LIMIT_MESSAGES）。
+ */
+function countInbound(
   state: SenderHandlerState,
-  text: string,
   nowMs: number,
   transport: SenderTransport,
-): SenderHandlerState {
-  return handleClientText(state, text, nowMs, transport);
+): { readonly state: SenderHandlerState; readonly exceeded: boolean } {
+  const decision = admit(state.inbound, nowMs, INBOUND_WINDOW_MS, MAX_INBOUND_MESSAGES_PER_SEC_PER_CLIENT);
+  const next: SenderHandlerState = { ...state, inbound: decision.window };
+  if (decision.allowed) {
+    return { state: next, exceeded: false };
+  }
+  transport.closeClient(ERROR_DEFINITIONS.E_RATE_LIMIT_MESSAGES.closeCode, "E_RATE_LIMIT_MESSAGES");
+  return { state: next, exceeded: true };
 }
 
 /** 新 epoch のシャードから最初のフレームが届いたことを伝える。 */
@@ -134,7 +225,7 @@ export function handleNewEpochFrame(
   for (const command of result.commands) {
     applyCommand(command, transport);
   }
-  return { core: result.state };
+  return { ...state, core: result.state };
 }
 
 /** 旧接続の残量を伝える。0 になったら旧接続を閉じる判断が下る。 */
@@ -148,7 +239,7 @@ export function handleStaleBacklog(
   for (const command of result.commands) {
     applyCommand(command, transport);
   }
-  return { core: result.state };
+  return { ...state, core: result.state };
 }
 
 /** タイマー満了。二重購読の時限を判定する。 */
@@ -161,7 +252,7 @@ export function handleTimer(
   for (const command of result.commands) {
     applyCommand(command, transport);
   }
-  return { core: result.state };
+  return { ...state, core: result.state };
 }
 
 function applyCommand(command: SenderCommand, transport: SenderTransport): void {

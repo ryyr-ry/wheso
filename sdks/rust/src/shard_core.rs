@@ -65,6 +65,13 @@ pub struct MaxSpatial {
     pub sid: i64,
 }
 
+/// 送信者 1 人に指令したエンコーダの上限層。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderTier {
+    pub target_id: i64,
+    pub tier: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardState {
     pub congestion: Congestion,
@@ -78,6 +85,8 @@ pub struct ShardState {
     pub unexpected_events: Vec<String>,
     pub trends: Vec<ReceiverTrend>,
     pub max_spatial: Vec<MaxSpatial>,
+    /// 送信者ごとに指令したエンコーダの上限層。target_id の昇順で保持する（ADR-0022）。
+    pub encoder_tiers: Vec<EncoderTier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +131,8 @@ pub enum ShardCommand {
     Forward { to: Vec<i64> },
     Drop { priority: i64, count: i64 },
     Notify { code: i64 },
+    /// 送信者のエンコーダの上限層を変える。宛先は送信ノードである（ADR-0022）。
+    SetTier { target_id: i64, tier: i64 },
 }
 
 pub struct StepResult {
@@ -142,6 +153,7 @@ pub fn initial_state(t: i64) -> ShardState {
         unexpected_events: Vec::new(),
         trends: Vec::new(),
         max_spatial: Vec::new(),
+        encoder_tiers: Vec::new(),
     }
 }
 
@@ -263,7 +275,44 @@ fn handle_subscribe(
             (a.subscriber_id, a.target_id).cmp(&(b.subscriber_id, b.target_id))
         });
     }
-    StepResult { state: next, commands: Vec::new() }
+    with_encoder_tiers(next)
+}
+
+/// 購読の和集合から送信者ごとの必要な上限層を求め、変化した送信者へ `SetTier` を出す。
+///
+/// TypeScript の参照実装（`withEncoderTiers`）と同一の結果を返さなければならない。
+/// 出力の順序は target_id の昇順に固定する（conformance.md 4.4 の完全一致）。
+fn with_encoder_tiers(mut state: ShardState) -> StepResult {
+    let mut targets: Vec<i64> = Vec::new();
+    for sub in &state.subscriptions {
+        if !targets.contains(&sub.target_id) {
+            targets.push(sub.target_id);
+        }
+    }
+    targets.sort_unstable();
+
+    let mut next_tiers: Vec<EncoderTier> = Vec::new();
+    let mut commands: Vec<ShardCommand> = Vec::new();
+    for target_id in targets {
+        let mut tier = 0_i64;
+        for sub in &state.subscriptions {
+            if sub.target_id == target_id && sub.max_spatial_id > tier {
+                tier = sub.max_spatial_id;
+            }
+        }
+        next_tiers.push(EncoderTier { target_id, tier });
+        let previous = state
+            .encoder_tiers
+            .iter()
+            .find(|entry| entry.target_id == target_id);
+        // 購読者が居なくなった送信者には指令を出さない（記録のみ除去する）。
+        match previous {
+            Some(entry) if entry.tier == tier => {}
+            _ => commands.push(ShardCommand::SetTier { target_id, tier }),
+        }
+    }
+    state.encoder_tiers = next_tiers;
+    StepResult { state, commands }
 }
 
 fn handle_join(state: &ShardState, id: i64) -> StepResult {
@@ -285,7 +334,9 @@ fn handle_leave(state: &ShardState, id: i64) -> StepResult {
     // 残すと、居なくなった相手の古い観測が輻輳の判定に影響し続ける。
     next.trends.retain(|trend| trend.subscriber_id != id);
     next.max_spatial.retain(|entry| entry.from != id);
-    StepResult { state: next, commands: Vec::new() }
+    // 退出者への指令の記録も除去する。残すと再参加時に指令が出ない。
+    next.encoder_tiers.retain(|entry| entry.target_id != id);
+    with_encoder_tiers(next)
 }
 
 fn handle_report(state: &ShardState, from: i64, delay_us: &[i64], t: i64) -> StepResult {

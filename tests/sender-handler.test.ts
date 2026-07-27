@@ -33,6 +33,7 @@ interface Log {
   readonly closed: number[];
   readonly notified: string[];
   readonly scheduled: number[];
+  readonly textToClient: string[];
 }
 
 function recorder(): { transport: SenderTransport; log: Log } {
@@ -44,6 +45,7 @@ function recorder(): { transport: SenderTransport; log: Log } {
     closed: [],
     notified: [],
     scheduled: [],
+    textToClient: [],
   };
   const transport: SenderTransport = {
     sendToShard(peer, bytes) {
@@ -51,6 +53,9 @@ function recorder(): { transport: SenderTransport; log: Log } {
     },
     sendTextToShard(peer, text) {
       log.textToShard.push({ peer, text });
+    },
+    sendTextToClient(text) {
+      log.textToClient.push(text);
     },
     connectShard(peer) {
       log.connected.push(peer);
@@ -93,7 +98,7 @@ function mediaBytes(seq: number): Uint8Array {
 }
 
 function announced(transport: SenderTransport): SenderHandlerState {
-  const state = createSenderHandlerState(1);
+  const state = createSenderHandlerState(1, 0);
   return handleClientText(
     state,
     JSON.stringify({ t: "streamAnnounce", streams: [{ channel: CHANNEL_VIDEO, spatialId: 3, framerate: FPS }] }),

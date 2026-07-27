@@ -101,7 +101,7 @@ export type ReceiverEvent =
 
 export type ReceiverCommand =
   | { readonly kind: "subscribeChange"; readonly to: number; readonly channel: number; readonly want: boolean; readonly maxSpatialId: number; readonly maxTemporalId: number }
-  | { readonly kind: "keyframeRequest"; readonly for: number; readonly channel: number }
+  | { readonly kind: "keyframeRequest"; readonly for: number; readonly channel: number; readonly spatialId: number }
   | { readonly kind: "setTier"; readonly for: number; readonly channel: number; readonly tier: number }
   | { readonly kind: "forward"; readonly to: readonly number[] }
   | { readonly kind: "drop"; readonly priority: number; readonly count: number }
@@ -187,7 +187,12 @@ function handleSubscribe(state: ReceiverState, entries: readonly SubscribeEntry[
         maxSpatialId: entry.maxSpatialId,
         maxTemporalId: entry.maxTemporalId,
       });
-      commands.push({ kind: "keyframeRequest", for: entry.senderId, channel: entry.channel });
+      commands.push({
+        kind: "keyframeRequest",
+        for: entry.senderId,
+        channel: entry.channel,
+        spatialId: entry.maxSpatialId,
+      });
       kept.push({
         senderId: entry.senderId,
         channel: entry.channel,
@@ -263,7 +268,12 @@ function handleVisibility(state: ReceiverState, visible: boolean): ReceiverStepR
         maxSpatialId: stream.spatialId,
         maxTemporalId: stream.temporalId,
       });
-      commands.push({ kind: "keyframeRequest", for: stream.senderId, channel: stream.channel });
+      commands.push({
+        kind: "keyframeRequest",
+        for: stream.senderId,
+        channel: stream.channel,
+        spatialId: stream.spatialId,
+      });
       streams.push({ ...stream, phase: "SUBSCRIBED" });
       continue;
     }
@@ -320,7 +330,12 @@ function handleReport(state: ReceiverState, delayUs: readonly number[]): Receive
     commands.push({ kind: "setTier", for: stream.senderId, channel: stream.channel, tier: nextSpatial });
     // spatialId が変わる場合のみキーフレームを要求する（表 4 行目と 3 行目の違い）。
     if (nextSpatial > stream.spatialId) {
-      commands.push({ kind: "keyframeRequest", for: stream.senderId, channel: stream.channel });
+      commands.push({
+        kind: "keyframeRequest",
+        for: stream.senderId,
+        channel: stream.channel,
+        spatialId: nextSpatial,
+      });
     }
   }
   return { state: { ...state, trend, streams }, commands };
@@ -400,7 +415,12 @@ function reallocate(state: ReceiverState): ReceiverStepResult {
       commands.push({ kind: "setTier", for: stream.senderId, channel: stream.channel, tier: nextSpatial });
       if (nextSpatial > stream.spatialId) {
         // spatialId が上がる場合はエンコーダ出力が切り替わるためキーフレームが必要である。
-        commands.push({ kind: "keyframeRequest", for: stream.senderId, channel: stream.channel });
+        commands.push({
+          kind: "keyframeRequest",
+          for: stream.senderId,
+          channel: stream.channel,
+          spatialId: nextSpatial,
+        });
       }
     }
     streams.push({ ...stream, spatialId: nextSpatial });

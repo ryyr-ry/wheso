@@ -24,7 +24,7 @@ import {
   FLAG_KEY,
   WIRE_MAGIC,
 } from "../packages/core/src/generated/wire-layout.ts";
-import { V_4K60 } from "../packages/core/src/generated/constants.ts";
+import { KEYFRAME_REQUEST_MIN_INTERVAL_MS, V_4K60 } from "../packages/core/src/generated/constants.ts";
 
 interface Log {
   readonly client: number[];
@@ -76,17 +76,21 @@ const BUDGET = Math.trunc((V_4K60.targetBitrate * 10) / (8 * 9)) + 1;
 
 function subscribed(): { state: ReceiverHandlerState; transport: ReceiverTransport; log: Log } {
   const { transport, log } = recorder();
-  let state = createReceiverHandlerState(BUDGET);
+  let state = createReceiverHandlerState(BUDGET, T0);
   state = handleClientText(
     state,
     JSON.stringify({
       t: "subscribe",
       entries: [{ senderId: 7, channel: CHANNEL_VIDEO, maxSpatialId: V_4K60.spatialId, maxTemporalId: 7 }],
     }),
+    T0,
     transport,
   );
   return { state, transport, log };
 }
+
+/** 試験で使う論理時刻。伝送層は時刻を引数で受け取る（lint-policy.md 9 節）。 */
+const T0 = 1_000_000;
 
 test("購読メッセージは上流への購読要求とキーフレーム要求になる", () => {
   const { log } = subscribed();
@@ -108,23 +112,26 @@ test("購読メッセージは上流への購読要求とキーフレーム要�
 
 test("要求 tier 以下のメディアはクライアントへ転送される", () => {
   const { state, transport, log } = subscribed();
-  handleUpstreamBinary(state, mediaBytes(7, 0, 0), transport);
+  handleUpstreamBinary(state, mediaBytes(7, 0, 0), T0, transport);
   assert.equal(log.client.length, 1, "クライアントへ 1 回転送する");
 });
 
 test("要求 tier を超えるメディアは転送されない", () => {
   const { state, transport, log } = subscribed();
   // 表示寸法の申告が無いため tier は 0 に留まる（ADR-0015）。
-  handleUpstreamBinary(state, mediaBytes(7, 3, 0), transport);
+  handleUpstreamBinary(state, mediaBytes(7, 3, 0), T0, transport);
   assert.equal(log.client.length, 0);
 });
 
 test("表示寸法を申告すると上流へ tier の更新が送られる", () => {
   const { state, transport, log } = subscribed();
   const before = log.upstream.length;
+  // 購読時に同じ (senderId, channel, spatialId) へ要求を出しているため、
+  // 間隔制限（wire-format.md 2.5）を越える時刻で申告する。
   handleClientText(
     state,
     JSON.stringify({ t: "displaySize", senderId: 7, channel: CHANNEL_VIDEO, width: 3840 }),
+    T0 + KEYFRAME_REQUEST_MIN_INTERVAL_MS,
     transport,
   );
   assert.ok(log.upstream.length > before, "上流へ購読の更新が送られる");
@@ -140,7 +147,7 @@ test("表示寸法を申告すると上流へ tier の更新が送られる", ()
 test("上流の壊れたメディアはクライアント接続を閉じない", () => {
   const { state, transport, log } = subscribed();
   const broken = new Uint8Array([WIRE_MAGIC ^ 0xff, 1, CHANNEL_VIDEO, 1, 0, 0, 0, 1]);
-  handleUpstreamBinary(state, broken, transport);
+  handleUpstreamBinary(state, broken, T0, transport);
   assert.equal(log.closed.length, 0, "上流の不正で利用者を切断しない");
   assert.equal(log.client.length, 0);
 });
@@ -148,7 +155,7 @@ test("上流の壊れたメディアはクライアント接続を閉じない",
 test("クライアントが送った壊れたメディアは接続を閉じる", () => {
   const { state, transport, log } = subscribed();
   const broken = new Uint8Array([WIRE_MAGIC ^ 0xff, 1, CHANNEL_VIDEO, 1, 0, 0, 0, 1]);
-  handleClientBinary(state, broken, transport);
+  handleClientBinary(state, broken, T0, transport);
   assert.equal(log.closed.length, 1);
 });
 
@@ -158,6 +165,7 @@ test("report の下り帯域が予算に反映される", () => {
   const after = handleClientText(
     state,
     JSON.stringify({ t: "report", downlinkBps: 400_000, arrivalDelaySamplesUs: [1000, 1000, 1000] }),
+    T0,
     transport,
   );
   assert.equal(after.core.targetBytesPerSec, Math.trunc(400_000 / 8));
@@ -166,24 +174,24 @@ test("report の下り帯域が予算に反映される", () => {
 
 test("送信者の退出で購読が消える", () => {
   const { state, transport } = subscribed();
-  const after = handleSenderLeave(state, 7, transport);
+  const after = handleSenderLeave(state, 7, T0, transport);
   assert.equal(after.core.streams.length, 0);
 });
 
 test("未知の制御メッセージと壊れた JSON は無視される", () => {
   const { state, transport, log } = subscribed();
-  const a = handleClientText(state, JSON.stringify({ t: "未知", x: 1 }), transport);
-  const b = handleClientText(a, "{壊れている", transport);
+  const a = handleClientText(state, JSON.stringify({ t: "未知", x: 1 }), T0, transport);
+  const b = handleClientText(a, "{壊れている", T0, transport);
   assert.equal(log.closed.length, 0);
   assert.equal(b.core.streams.length, state.core.streams.length);
 });
 
 test("非表示の通知で購読が解除され、再表示で購読とキーフレーム要求が出る", () => {
   const { state, transport, log } = subscribed();
-  const hidden = handleClientText(state, JSON.stringify({ t: "visibility", visible: false }), transport);
+  const hidden = handleClientText(state, JSON.stringify({ t: "visibility", visible: false }), T0, transport);
   assert.equal(hidden.core.streams[0]?.phase, "PAUSED");
   const beforeShow = log.upstream.length;
-  const shown = handleClientText(hidden, JSON.stringify({ t: "visibility", visible: true }), transport);
+  const shown = handleClientText(hidden, JSON.stringify({ t: "visibility", visible: true }), T0, transport);
   assert.equal(shown.core.streams[0]?.phase, "SUBSCRIBED");
   assert.ok(log.upstream.length > beforeShow);
 });

@@ -40,7 +40,7 @@ export class ReceiverNode implements Party.Server {
   private readonly transport: ReceiverTransport;
 
   constructor(readonly room: Party.Room) {
-    this.state = createReceiverHandlerState(NODE_MAX_OUT_BYTES_PER_SEC);
+    this.state = createReceiverHandlerState(NODE_MAX_OUT_BYTES_PER_SEC, Date.now());
     this.transport = {
       sendToClient: (bytes) => {
         this.withClient((connection) => connection.send(bytes));
@@ -67,8 +67,9 @@ export class ReceiverNode implements Party.Server {
 
   onAlarm(): void {
     // ACK_INTERVAL_MS ごとに受信位置を上流へ返す（congestion.md 2 節）。
-    this.state = handleAckTimer(this.state, this.transport);
-    void this.room.storage.setAlarm(Date.now() + ACK_INTERVAL_MS);
+    const now = Date.now();
+    this.state = handleAckTimer(this.state, now, this.transport);
+    void this.room.storage.setAlarm(now + ACK_INTERVAL_MS);
   }
 
   onConnect(connection: Party.Connection, context: Party.ConnectionContext): void {
@@ -89,21 +90,22 @@ export class ReceiverNode implements Party.Server {
   }
 
   onMessage(message: string | ArrayBuffer, sender: Party.Connection): void {
+    const now = Date.now();
     const role = this.roles.get(sender.id) ?? "client";
     if (typeof message === "string") {
       if (role === "client") {
-        this.state = handleClientText(this.state, message, this.transport);
+        this.state = handleClientText(this.state, message, now, this.transport);
       }
       // 上流からの制御メッセージは現時点で扱う対象が無い。未知として無視する。
       return;
     }
     const bytes = new Uint8Array(message);
     if (role === "upstream") {
-      this.state = handleUpstreamBinary(this.state, bytes, this.transport);
+      this.state = handleUpstreamBinary(this.state, bytes, now, this.transport);
       return;
     }
     // 受信ノードはクライアントからのメディアを扱わない。形式違反のみ検出して閉じる。
-    this.state = handleClientBinary(this.state, bytes, this.transport);
+    this.state = handleClientBinary(this.state, bytes, now, this.transport);
   }
 
   private withClient(action: (connection: Party.Connection) => void): void {

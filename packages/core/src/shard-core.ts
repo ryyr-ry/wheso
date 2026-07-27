@@ -241,6 +241,20 @@ export interface ShardState {
    * senderId, channel の昇順で保持する。
    */
   readonly maxSpatial: readonly MaxSpatial[];
+  /**
+   * 送信者ごとに指令したエンコーダの上限層。targetId の昇順で保持する。
+   *
+   * 購読の和集合から決まる。誰も高い層を要求していない送信者に高い層を作らせ続けると、
+   * 送信側の負荷と上りの帯域が無駄になる。指令の宛先は送信ノードであり、
+   * 送信ノードがクライアントへ中継する（ADR-0022）。
+   */
+  readonly encoderTiers: readonly EncoderTier[];
+}
+
+/** 送信者 1 人に指令したエンコーダの上限層。 */
+export interface EncoderTier {
+  readonly targetId: number;
+  readonly tier: number;
 }
 
 /** 受信者 1 人の遅延勾配。分子と分母の整数対で持つ（ADR-0017）。 */
@@ -272,6 +286,7 @@ export function initialState(t: number): ShardState {
     unexpectedEvents: [],
     trends: [],
     maxSpatial: [],
+    encoderTiers: [],
   };
 }
 
@@ -390,19 +405,51 @@ function handleSubscribe(state: ShardState, event: SubscribeEvent, _t: number): 
       maxSpatialId: event.maxSpatialId,
     };
     const newSubscriptions = [...filtered, newSub].sort(subscriptionOrder);
-    return {
-      state: { ...state, subscriptions: newSubscriptions },
-      commands: [],
-    };
+    return withEncoderTiers({ ...state, subscriptions: newSubscriptions });
   }
   // 購読解除
   const newSubscriptions = state.subscriptions.filter(
     (s) => !(s.subscriberId === event.from && s.targetId === event.to),
   );
-  return {
-    state: { ...state, subscriptions: newSubscriptions },
-    commands: [],
-  };
+  return withEncoderTiers({ ...state, subscriptions: newSubscriptions });
+}
+
+/**
+ * 購読の和集合から送信者ごとの必要な上限層を求め、変化した送信者へ `setTier` を出す。
+ *
+ * 判断の規則:
+ *   必要な上限層 = その送信者を購読している者の maxSpatialId の最大値
+ *   購読者が居なくなった送信者には指令を出さない（記録のみ除去する）。
+ *     指令の宛先が存在せず、送信側の設定は次の購読で決まるためである。
+ *
+ * 出力の順序は targetId の昇順に固定する。順序が実装で揺れると
+ * トレースベクタの完全一致（conformance.md 4.4）が壊れる。
+ */
+function withEncoderTiers(state: ShardState): StepResult {
+  const targets: number[] = [];
+  for (const sub of state.subscriptions) {
+    if (!targets.includes(sub.targetId)) {
+      targets.push(sub.targetId);
+    }
+  }
+  targets.sort((a, b) => a - b);
+
+  const nextTiers: EncoderTier[] = [];
+  const commands: ShardCommand[] = [];
+  for (const targetId of targets) {
+    let tier = 0;
+    for (const sub of state.subscriptions) {
+      if (sub.targetId === targetId && sub.maxSpatialId > tier) {
+        tier = sub.maxSpatialId;
+      }
+    }
+    nextTiers.push({ targetId, tier });
+    const previous = state.encoderTiers.find((entry) => entry.targetId === targetId);
+    if (previous === undefined || previous.tier !== tier) {
+      commands.push({ kind: "setTier", for: targetId, tier });
+    }
+  }
+  return { state: { ...state, encoderTiers: nextTiers }, commands };
 }
 
 // --- 内部: 参加イベント処理 ---
@@ -431,16 +478,15 @@ function handleLeave(state: ShardState, event: LeaveEvent, _t: number): StepResu
   // 残すと、居なくなった相手の古い観測が輻輳の判定に影響し続ける。
   const newTrends = state.trends.filter((trend) => trend.subscriberId !== event.id);
   const newMaxSpatial = state.maxSpatial.filter((entry) => entry.from !== event.id);
-  return {
-    state: {
-      ...state,
-      participants: newParticipants,
-      subscriptions: newSubscriptions,
-      trends: newTrends,
-      maxSpatial: newMaxSpatial,
-    },
-    commands: [],
-  };
+  return withEncoderTiers({
+    ...state,
+    participants: newParticipants,
+    subscriptions: newSubscriptions,
+    trends: newTrends,
+    maxSpatial: newMaxSpatial,
+    // 退出者への指令の記録も除去する。残すと再参加時に指令が出ない。
+    encoderTiers: state.encoderTiers.filter((entry) => entry.targetId !== event.id),
+  });
 }
 
 // --- 内部: リンクイベント処理 ---

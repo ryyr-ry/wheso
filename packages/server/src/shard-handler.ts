@@ -18,6 +18,8 @@ import {
   type ShardState,
 } from "@wheso/core/src/shard-core.ts";
 import { decodeMediaMessage, wireErrorCloseCode } from "@wheso/core/src/wire.ts";
+import { videoProfileForSpatialId } from "@wheso/core/src/profiles.ts";
+import { CHANNEL_VIDEO } from "@wheso/core/src/generated/wire-layout.ts";
 import { DELAY_TREND_WINDOW } from "@wheso/core/src/generated/constants.ts";
 import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
 
@@ -179,12 +181,24 @@ function applyNonForward(command: ShardCommand, transport: ShardTransport): void
     case "keyframeRequest":
       transport.sendText(command.for, JSON.stringify({ t: "keyframeRequest", senderId: command.for }));
       return;
-    case "setTier":
+    case "setTier": {
+      // エンコーダ指令は規範（ワイヤ形式 2.7）の 5 フィールドをすべて満たす。
+      // 値は tier に対応するプロファイルの定数から引く。数値を書かない。
+      const profile = videoProfileForSpatialId(command.tier);
       transport.sendText(
         command.for,
-        JSON.stringify({ t: "encoderDirective", maxSpatialLayers: command.tier + 1 }),
+        JSON.stringify({
+          t: "encoderDirective",
+          channel: CHANNEL_VIDEO,
+          maxSpatialLayers: command.tier + 1,
+          maxTemporalLayers: profile.temporalLayers,
+          targetBitrate: profile.targetBitrate,
+          // キーフレームは keyframeRequest で個別に要求する（ワイヤ形式 2.5）。
+          forceKeyframe: false,
+        }),
       );
       return;
+    }
     case "connect":
     case "disconnect":
     case "schedule":

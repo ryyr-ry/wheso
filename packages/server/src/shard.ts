@@ -20,6 +20,7 @@ import { deriveMeetingSecret } from "@wheso/core/src/auth.ts";
 import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
 
 import {
+  buildNodeHelloAck,
   createNodeGateState,
   forgetNode,
   isNodeAuthenticated,
@@ -166,6 +167,8 @@ export class ShardNode implements Party.Server {
       return;
     }
     this.gate = markNodeAuthenticated(this.gate, sender.id, parsed.value.role);
+    // 受理したことを伝える。接続元はこれを受けて転送を開始する（state-machines.md 4 節）。
+    sender.send(buildNodeHelloAck(this.room.id));
   }
 
   onAlarm(): void {

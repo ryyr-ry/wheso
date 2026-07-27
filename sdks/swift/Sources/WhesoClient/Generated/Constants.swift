@@ -16,6 +16,7 @@ public enum WhesoConstants {
     public static let V_4K60_FRAMERATE: Int64 = 60
     public static let V_4K60_TARGET_BITRATE: Int64 = 25000000
     public static let V_4K60_SCALABILITY_MODE: String = "L1T3"
+    public static let V_4K60_TEMPORAL_LAYERS: Int64 = 3
     public static let V_4K60_REQUIRES_HARDWARE_ENCODER: Bool = true
     public static let V_1080P60_SPATIAL_ID: Int64 = 2
     public static let V_1080P60_WIDTH: Int64 = 1920
@@ -23,6 +24,7 @@ public enum WhesoConstants {
     public static let V_1080P60_FRAMERATE: Int64 = 60
     public static let V_1080P60_TARGET_BITRATE: Int64 = 6000000
     public static let V_1080P60_SCALABILITY_MODE: String = "L1T3"
+    public static let V_1080P60_TEMPORAL_LAYERS: Int64 = 3
     public static let V_1080P60_REQUIRES_HARDWARE_ENCODER: Bool = false
     public static let V_1080P30_SPATIAL_ID: Int64 = 1
     public static let V_1080P30_WIDTH: Int64 = 1920
@@ -30,6 +32,7 @@ public enum WhesoConstants {
     public static let V_1080P30_FRAMERATE: Int64 = 30
     public static let V_1080P30_TARGET_BITRATE: Int64 = 3000000
     public static let V_1080P30_SCALABILITY_MODE: String = "L1T3"
+    public static let V_1080P30_TEMPORAL_LAYERS: Int64 = 3
     public static let V_1080P30_REQUIRES_HARDWARE_ENCODER: Bool = false
     public static let V_360P15_SPATIAL_ID: Int64 = 0
     public static let V_360P15_WIDTH: Int64 = 640
@@ -37,6 +40,7 @@ public enum WhesoConstants {
     public static let V_360P15_FRAMERATE: Int64 = 15
     public static let V_360P15_TARGET_BITRATE: Int64 = 200000
     public static let V_360P15_SCALABILITY_MODE: String = "L1T2"
+    public static let V_360P15_TEMPORAL_LAYERS: Int64 = 2
     public static let V_360P15_REQUIRES_HARDWARE_ENCODER: Bool = false
     public static let V_SCREEN_4K30_SPATIAL_ID: Int64 = 3
     public static let V_SCREEN_4K30_WIDTH: Int64 = 3840
@@ -44,6 +48,7 @@ public enum WhesoConstants {
     public static let V_SCREEN_4K30_FRAMERATE: Int64 = 30
     public static let V_SCREEN_4K30_TARGET_BITRATE: Int64 = 8000000
     public static let V_SCREEN_4K30_SCALABILITY_MODE: String = "L1T2"
+    public static let V_SCREEN_4K30_TEMPORAL_LAYERS: Int64 = 2
     public static let V_SCREEN_4K30_CONTENT_HINT: String = "text"
     public static let V_SCREEN_4K30_REQUIRES_HARDWARE_ENCODER: Bool = false
     public static let V_SCREEN_1080P30_SPATIAL_ID: Int64 = 1
@@ -52,6 +57,7 @@ public enum WhesoConstants {
     public static let V_SCREEN_1080P30_FRAMERATE: Int64 = 30
     public static let V_SCREEN_1080P30_TARGET_BITRATE: Int64 = 2000000
     public static let V_SCREEN_1080P30_SCALABILITY_MODE: String = "L1T2"
+    public static let V_SCREEN_1080P30_TEMPORAL_LAYERS: Int64 = 2
     public static let V_SCREEN_1080P30_CONTENT_HINT: String = "text"
     public static let V_SCREEN_1080P30_REQUIRES_HARDWARE_ENCODER: Bool = false
 

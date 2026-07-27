@@ -106,6 +106,43 @@ export function currentNodeAuthWindow(nowSec: number): number {
   return nodeAuthTimeWindow(nowSec);
 }
 
+/**
+ * 受理の通知（nodeHelloAck）。
+ *
+ * 規範: wire-format.md 2.8、state-machines.md 4 節（`HELLO_SENT` で受信すると `ATTACHED`）。
+ * 認証は接続元が自分を証明する片方向であり、この通知は受理した事実のみを伝える。
+ * 返さないと接続元が `HELLO_SENT` に留まり、転送を始められない。
+ */
+export function buildNodeHelloAck(nodeId: string): string {
+  return JSON.stringify({ t: "nodeHelloAck", nodeId });
+}
+
+export interface NodeHelloAck {
+  readonly nodeId: string;
+}
+
+/** 受理の通知を取り出す。形式違反は失敗として返す（例外を投げない）。 */
+export function parseNodeHelloAck(text: string): Result<NodeHelloAck, NodeAuthError> {
+  let value: unknown = null;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return err(authError("JSON として解析できない"));
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return err(authError("オブジェクトではない"));
+  }
+  const record: Record<string, unknown> = { ...value };
+  if (record["t"] !== "nodeHelloAck") {
+    return err(authError("nodeHelloAck ではない"));
+  }
+  const nodeId = record["nodeId"];
+  if (typeof nodeId !== "string" || nodeId.length === 0) {
+    return err(authError("nodeId が無い"));
+  }
+  return ok({ nodeId });
+}
+
 /** 接続ごとの認証状態。nodeHello を受けるまで media を受け付けない。 */
 export interface NodeGateState {
   /** 認証済みの接続 ID と役割。 */

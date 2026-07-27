@@ -37,13 +37,25 @@ export class SenderNode implements Party.Server {
   private sawNewEpochFrame = false;
 
   constructor(readonly room: Party.Room) {
-    this.state = createSenderHandlerState(1);
+    this.state = createSenderHandlerState(1, Date.now());
     this.transport = {
       sendToShard: (peer, bytes) => {
         this.eachShard(peer, (connection) => connection.send(bytes));
       },
       sendTextToShard: (peer, text) => {
         this.eachShard(peer, (connection) => connection.send(text));
+      },
+      sendTextToClient: (text) => {
+        // キーフレーム要求とエンコーダ指令の宛先は送信側クライアントである。
+        for (const [id, role] of this.roles) {
+          if (role.kind !== "client") {
+            continue;
+          }
+          const connection = this.room.getConnection(id);
+          if (connection !== undefined && connection !== null) {
+            connection.send(text);
+          }
+        }
       },
       connectShard: (peer) => {
         // 新しい epoch のシャードへの接続は入口が張る。実際の接続確立は

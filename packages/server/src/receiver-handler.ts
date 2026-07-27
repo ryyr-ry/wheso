@@ -19,7 +19,21 @@ import {
   type SubscribeEntry,
 } from "@wheso/core/src/receiver-core.ts";
 import { decodeMediaMessage, wireErrorCloseCode } from "@wheso/core/src/wire.ts";
-import { DELAY_TREND_WINDOW } from "@wheso/core/src/generated/constants.ts";
+import {
+  admit,
+  admitKeyframeRequest,
+  initialRateWindow,
+  type KeyframeMark,
+  type RateWindow,
+} from "@wheso/core/src/rate-limit.ts";
+import {
+  DELAY_TREND_WINDOW,
+  MAX_INBOUND_MESSAGES_PER_SEC_PER_CLIENT,
+} from "@wheso/core/src/generated/constants.ts";
+import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
+
+/** 受信メッセージレートの窓の長さ。1 秒あたりの件数で規定されている（auth.md 5 節）。 */
+const INBOUND_WINDOW_MS = 1000;
 
 /** 送信の口。実装は Durable Object 側が与える。試験では偽物を渡す。 */
 export interface ReceiverTransport {
@@ -35,10 +49,18 @@ export interface ReceiverTransport {
 
 export interface ReceiverHandlerState {
   readonly core: ReceiverState;
+  /**
+   * キーフレーム要求を通した時刻の記録。
+   * 同一 (senderId, channel, spatialId) への要求を規定間隔内に 2 回送らない（wire-format.md 2.5）。
+   * 時刻を扱うためコアではなくこの層に置く（lint-policy.md 9.2）。
+   */
+  readonly keyframeMarks: readonly KeyframeMark[];
+  /** クライアント接続からの受信メッセージ数の窓（auth.md 5 節）。 */
+  readonly inbound: RateWindow;
 }
 
-export function createReceiverHandlerState(targetBytesPerSec: number): ReceiverHandlerState {
-  return { core: initialReceiverState(targetBytesPerSec) };
+export function createReceiverHandlerState(targetBytesPerSec: number, nowMs: number): ReceiverHandlerState {
+  return { core: initialReceiverState(targetBytesPerSec), keyframeMarks: [], inbound: initialRateWindow(nowMs) };
 }
 
 /**
@@ -50,6 +72,7 @@ export function createReceiverHandlerState(targetBytesPerSec: number): ReceiverH
 export function handleUpstreamBinary(
   state: ReceiverHandlerState,
   bytes: Uint8Array,
+  nowMs: number,
   transport: ReceiverTransport,
 ): ReceiverHandlerState {
   const decoded = decodeMediaMessage(bytes);
@@ -59,7 +82,7 @@ export function handleUpstreamBinary(
     return state;
   }
 
-  let core = state.core;
+  let next = state;
   let forwarded = false;
   for (const unit of decoded.value.units) {
     const event: ReceiverEvent = {
@@ -73,8 +96,8 @@ export function handleUpstreamBinary(
       flags: unit.flags,
       seq: unit.sequenceNumber,
     };
-    const result = receiverStep(core, event);
-    core = result.state;
+    const result = receiverStep(next.core, event);
+    const rest: ReceiverCommand[] = [];
     for (const command of result.commands) {
       if (command.kind === "forward") {
         if (!forwarded && command.to.includes(RECEIVER_SELF_ID)) {
@@ -83,10 +106,11 @@ export function handleUpstreamBinary(
         }
         continue;
       }
-      applyCommand(command, transport);
+      rest.push(command);
     }
+    next = applyCommands({ ...next, core: result.state }, rest, nowMs, transport);
   }
-  return { core };
+  return next;
 }
 
 /**
@@ -97,21 +121,23 @@ export function handleUpstreamBinary(
 export function handleClientText(
   state: ReceiverHandlerState,
   text: string,
+  nowMs: number,
   transport: ReceiverTransport,
 ): ReceiverHandlerState {
+  const limited = countInbound(state, nowMs, transport);
+  if (limited.exceeded) {
+    return limited.state;
+  }
   const parsed = parseObject(text);
   if (parsed === null) {
-    return state;
+    return limited.state;
   }
-  let core = state.core;
+  let next = limited.state;
   for (const event of toReceiverEvents(parsed)) {
-    const result = receiverStep(core, event);
-    core = result.state;
-    for (const command of result.commands) {
-      applyCommand(command, transport);
-    }
+    const result = receiverStep(next.core, event);
+    next = applyCommands({ ...next, core: result.state }, result.commands, nowMs, transport);
   }
-  return { core };
+  return next;
 }
 
 /**
@@ -120,40 +146,97 @@ export function handleClientText(
  */
 export function handleAckTimer(
   state: ReceiverHandlerState,
+  nowMs: number,
   transport: ReceiverTransport,
 ): ReceiverHandlerState {
   const result = receiverStep(state.core, { kind: "timer" });
-  for (const command of result.commands) {
-    applyCommand(command, transport);
-  }
-  return { core: result.state };
+  return applyCommands({ ...state, core: result.state }, result.commands, nowMs, transport);
 }
 
 /** 送信者の退出を入力イベントへ翻訳する。 */
 export function handleSenderLeave(
   state: ReceiverHandlerState,
   senderId: number,
+  nowMs: number,
   transport: ReceiverTransport,
 ): ReceiverHandlerState {
   const result = receiverStep(state.core, { kind: "leave", id: senderId });
-  for (const command of result.commands) {
-    applyCommand(command, transport);
-  }
-  return { core: result.state };
+  return applyCommands({ ...state, core: result.state }, result.commands, nowMs, transport);
 }
 
 /** 形式違反のメディアをクライアントから受けた場合は接続を閉じる。 */
 export function handleClientBinary(
   state: ReceiverHandlerState,
   bytes: Uint8Array,
+  nowMs: number,
   transport: ReceiverTransport,
 ): ReceiverHandlerState {
+  const limited = countInbound(state, nowMs, transport);
+  if (limited.exceeded) {
+    return limited.state;
+  }
   const decoded = decodeMediaMessage(bytes);
   if (!decoded.ok) {
     transport.closeClient(wireErrorCloseCode(decoded.error.code), decoded.error.code);
   }
   // 受信ノードはクライアントからのメディアを扱わない。送信は送信ノードの責務である。
-  return state;
+  return limited.state;
+}
+
+/**
+ * クライアント接続からの受信を 1 件計上する。
+ * 上限を超えた接続は閉じる（auth.md 5 節、E_RATE_LIMIT_MESSAGES）。
+ * 上流（ノード間）からの受信は数えない。濫用対策は利用者の接続に対する防御である。
+ */
+function countInbound(
+  state: ReceiverHandlerState,
+  nowMs: number,
+  transport: ReceiverTransport,
+): { readonly state: ReceiverHandlerState; readonly exceeded: boolean } {
+  const decision = admit(state.inbound, nowMs, INBOUND_WINDOW_MS, MAX_INBOUND_MESSAGES_PER_SEC_PER_CLIENT);
+  const next: ReceiverHandlerState = { ...state, inbound: decision.window };
+  if (decision.allowed) {
+    return { state: next, exceeded: false };
+  }
+  transport.closeClient(ERROR_DEFINITIONS.E_RATE_LIMIT_MESSAGES.closeCode, "E_RATE_LIMIT_MESSAGES");
+  return { state: next, exceeded: true };
+}
+
+/**
+ * 出力コマンドを実行する。keyframeRequest のみ間隔制限を通す（wire-format.md 2.5）。
+ * 抑制した要求は送らず、記録も更新しない（次の要求は前回の通過時刻から計る）。
+ */
+function applyCommands(
+  state: ReceiverHandlerState,
+  commands: readonly ReceiverCommand[],
+  nowMs: number,
+  transport: ReceiverTransport,
+): ReceiverHandlerState {
+  let marks = state.keyframeMarks;
+  for (const command of commands) {
+    if (command.kind === "keyframeRequest") {
+      const decision = admitKeyframeRequest(
+        marks,
+        { senderId: command.for, channel: command.channel, spatialId: command.spatialId },
+        nowMs,
+      );
+      marks = decision.marks;
+      if (!decision.allowed) {
+        continue;
+      }
+      transport.sendUpstream(
+        JSON.stringify({
+          t: "keyframeRequest",
+          senderId: command.for,
+          channel: command.channel,
+          spatialId: command.spatialId,
+        }),
+      );
+      continue;
+    }
+    applyCommand(command, transport);
+  }
+  return { ...state, keyframeMarks: marks };
 }
 
 /** 出力コマンドを実際の送信へ写す。 */
@@ -178,9 +261,7 @@ function applyCommand(command: ReceiverCommand, transport: ReceiverTransport): v
       );
       return;
     case "keyframeRequest":
-      transport.sendUpstream(
-        JSON.stringify({ t: "keyframeRequest", senderId: command.for, channel: command.channel, spatialId: 0 }),
-      );
+      // 間隔制限を通す必要があるため applyCommands が扱う。ここへは到達しない。
       return;
     case "setTier":
       // tier の変更は上流への購読更新として伝える。クライアントへは通知しない。

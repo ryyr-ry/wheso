@@ -50,6 +50,9 @@ function receive(state: ReceiverState, seq: number, sid = 0): ReceiverState {
   }).state;
 }
 
+/** 試験で使う論理時刻。伝送層は時刻を引数で受け取る（lint-policy.md 9 節）。 */
+const T0 = 1_000_000;
+
 test("受信した最大 sequenceNumber がタイマーで ack として出る", () => {
   let state = subscribed();
   state = receive(state, 10);
@@ -112,13 +115,14 @@ test("伝送層は ack を上流へ制御メッセージとして送る", () => 
     },
   };
 
-  let state = createReceiverHandlerState(BUDGET);
+  let state = createReceiverHandlerState(BUDGET, T0);
   state = handleClientText(
     state,
     JSON.stringify({
       t: "subscribe",
       entries: [{ senderId: 7, channel: CHANNEL_VIDEO, maxSpatialId: 0, maxTemporalId: 7 }],
     }),
+    T0,
     transport,
   );
 
@@ -140,10 +144,10 @@ test("伝送層は ack を上流へ制御メッセージとして送る", () => 
   if (!encoded.ok) {
     return;
   }
-  state = handleUpstreamBinary(state, encoded.value, transport);
+  state = handleUpstreamBinary(state, encoded.value, T0, transport);
 
   const before = upstream.length;
-  handleAckTimer(state, transport);
+  handleAckTimer(state, T0, transport);
   const added = upstream.slice(before);
   assert.ok(
     added.some((text) => text.includes('"t":"ack"') && text.includes('"highestSeq":4821')),
