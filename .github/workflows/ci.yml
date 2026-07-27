@@ -79,3 +79,6 @@ jobs:
 
       - name: Rust の適合試験（凍結ベクタとの一致）
         run: npm run test:rust
+
+      - name: C++ の適合試験（凍結ベクタとの一致）
+        run: npm run test:cpp

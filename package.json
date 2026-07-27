@@ -21,7 +21,8 @@
     "trace:receiver:check": "node tools/traces-receiver.ts check",
     "test:integration": "node --test \"tests/integration/**/*.test.ts\"",
     "test:e2e": "node --test \"tests/e2e/*.test.ts\"",
-    "test:rust": "cargo test --manifest-path sdks/rust/Cargo.toml"
+    "test:rust": "cargo test --manifest-path sdks/rust/Cargo.toml",
+    "test:cpp": "bash sdks/cpp/run-tests.sh"
   },
   "devDependencies": {
     "@types/node": "24.3.0",

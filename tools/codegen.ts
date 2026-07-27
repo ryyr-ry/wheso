@@ -16,6 +16,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const schemaDir = join(root, "spec", "schema");
 const tsOutDir = join(root, "packages", "core", "src", "generated");
 const rustOutDir = join(root, "sdks", "rust", "src", "generated");
+const cppOutDir = join(root, "sdks", "cpp", "include", "wheso", "generated");
 
 const BANNER = `/**
  * このファイルは自動生成されている。手で編集してはならない。
@@ -414,6 +415,115 @@ function generateWireRs(schema: Record<string, unknown>): string {
   return `${lines.join("\n")}\n`;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* C++ 向けの生成                                                            */
+/* ------------------------------------------------------------------------- */
+
+const CPP_BANNER = `// このファイルは自動生成されている。手で編集してはならない。
+//
+// 生成元: プロトコルのスキーマ定義
+// 再生成: 内部検証スクリプトを実行する
+#pragma once
+#include <cstdint>
+#include <string_view>
+`;
+
+/** C++ の値表現。整数は int64_t、小数は double、真偽は bool、文字列は string_view。 */
+function formatCppValue(value: unknown): { readonly type: string; readonly literal: string } | null {
+  if (typeof value === "number") {
+    return Number.isInteger(value)
+      ? { type: "std::int64_t", literal: `${value}` }
+      : { type: "double", literal: String(value) };
+  }
+  if (typeof value === "boolean") {
+    return { type: "bool", literal: String(value) };
+  }
+  if (typeof value === "string") {
+    return { type: "std::string_view", literal: JSON.stringify(value) };
+  }
+  return null;
+}
+
+function generateConstantsHpp(schema: Record<string, unknown>): string {
+  const lines: string[] = [CPP_BANNER, "namespace wheso::constants {", ""];
+  for (const [groupName, group] of Object.entries(schema)) {
+    if (groupName.startsWith("$") || !isRecord(group)) {
+      continue;
+    }
+    lines.push(`// ${groupName}`);
+    for (const [constantName, definition] of Object.entries(group)) {
+      if (constantName.startsWith("$") || !isRecord(definition)) {
+        continue;
+      }
+      if (!("value" in definition)) {
+        for (const [key, raw] of Object.entries(definition)) {
+          if (key.startsWith("$") || key === "derivation" || key === "fact" || key === "question" || key === "adr") {
+            continue;
+          }
+          const formatted = formatCppValue(raw);
+          if (formatted === null) {
+            continue;
+          }
+          const suffix = key.replace(/([A-Z])/g, "_$1").toUpperCase();
+          lines.push(`inline constexpr ${formatted.type} ${constantName}_${suffix} = ${formatted.literal};`);
+        }
+        continue;
+      }
+      const formatted = formatCppValue(definition["value"]);
+      if (formatted === null) {
+        continue;
+      }
+      lines.push(`inline constexpr ${formatted.type} ${constantName} = ${formatted.literal};`);
+    }
+    lines.push("");
+  }
+  lines.push("}  // namespace wheso::constants");
+  return `${lines.join("\n")}\n`;
+}
+
+function generateWireHpp(schema: Record<string, unknown>): string {
+  const messageHeader = readObject(schema, "messageHeader");
+  const unitHeader = readObject(schema, "unitHeader");
+  const limits = readObject(schema, "limits");
+  const lines: string[] = [CPP_BANNER, "namespace wheso::wire_layout {", ""];
+  lines.push(`inline constexpr std::uint8_t PROTOCOL_VERSION = ${readNumber(schema, "protocolVersion")};`);
+  lines.push(`inline constexpr std::uint8_t WIRE_MAGIC = ${readNumber(schema, "magic")};`);
+  lines.push(`inline constexpr std::size_t MESSAGE_HEADER_BYTES = ${readNumber(messageHeader, "bytes")};`);
+  lines.push(`inline constexpr std::size_t UNIT_HEADER_BYTES = ${readNumber(unitHeader, "bytes")};`);
+  lines.push(`inline constexpr std::size_t MAX_UNITS_PER_MESSAGE = ${readNumber(limits, "maxUnitsPerMessage")};`);
+  lines.push(`inline constexpr std::size_t MAX_MESSAGE_BYTES = ${readNumber(limits, "maxMessageBytes")};`);
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "enums"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(
+          `inline constexpr std::uint8_t CHANNEL_${readString(entry, "name")} = ${readNumber(entry, "value")};`,
+        );
+      }
+    }
+  }
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "bitsets"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(
+          `inline constexpr std::uint8_t FLAG_${readString(entry, "name")} = ${1 << readNumber(entry, "bit")};`,
+        );
+      }
+    }
+  }
+  lines.push("");
+  lines.push("}  // namespace wheso::wire_layout");
+  return `${lines.join("\n")}\n`;
+}
+
 /* ------------------------------------------------------------------------- */
 /* 実行                                                                      */
 /* ------------------------------------------------------------------------- */
@@ -433,12 +543,15 @@ async function buildArtifacts(): Promise<readonly Artifact[]> {
     { path: join(tsOutDir, "constants.ts"), content: generateConstantsTs(constants) },
     { path: join(rustOutDir, "constants.rs"), content: generateConstantsRs(constants) },
     { path: join(rustOutDir, "wire_layout.rs"), content: generateWireRs(wire) },
+    { path: join(cppOutDir, "constants.hpp"), content: generateConstantsHpp(constants) },
+    { path: join(cppOutDir, "wire_layout.hpp"), content: generateWireHpp(wire) },
   ];
 }
 
 async function generate(): Promise<void> {
   await mkdir(tsOutDir, { recursive: true });
   await mkdir(rustOutDir, { recursive: true });
+  await mkdir(cppOutDir, { recursive: true });
   const artifacts = await buildArtifacts();
   for (const artifact of artifacts) {
     await writeFile(artifact.path, artifact.content, "utf8");
