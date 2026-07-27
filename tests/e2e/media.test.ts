@@ -42,10 +42,10 @@ async function findFreePort(): Promise<number> {
   });
 }
 
-/** E2E の本体を束ねる。型は esbuild が落とす。 */
-async function bundlePage(): Promise<string> {
+/** E2E の本体を束ねる。型は esbuild が落とす。入口ごとに 1 回呼ぶ。 */
+async function bundleEntry(entry: string): Promise<string> {
   const result = await build({
-    entryPoints: [`${root}/tests/e2e/page/main.ts`],
+    entryPoints: [`${root}/tests/e2e/page/${entry}`],
     bundle: true,
     format: "esm",
     target: "es2022",
@@ -84,18 +84,29 @@ before(async () => {
     detached: true,
   });
 
-  const script = await bundlePage();
-  assert.notEqual(script, "", "E2E の本体を束ねられる");
+  const videoScript = await bundleEntry("main.ts");
+  const audioScript = await bundleEntry("audio.ts");
+  assert.notEqual(videoScript, "", "映像の本体を束ねられる");
+  assert.notEqual(audioScript, "", "音声の本体を束ねられる");
 
   // WebCodecs は secure context を要求する。127.0.0.1 は secure context として扱われる。
   pageServer = createServer((request, response) => {
     if (request.url === "/main.js") {
       response.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
-      response.end(script);
+      response.end(videoScript);
+      return;
+    }
+    if (request.url === "/audio.js") {
+      response.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+      response.end(audioScript);
       return;
     }
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    response.end('<!doctype html><meta charset="utf-8"><title>wheso e2e</title><script type="module" src="/main.js"></script>');
+    response.end(
+      '<!doctype html><meta charset="utf-8"><title>wheso e2e</title>' +
+        '<script type="module" src="/main.js"></script>' +
+        '<script type="module" src="/audio.js"></script>',
+    );
   });
   await new Promise<void>((resolve) => {
     pageServer?.listen(pagePort, "127.0.0.1", () => resolve());
@@ -198,5 +209,36 @@ test("否定対照: 購読していない送信者の映像は届かず、検査
   assert.equal(result.ok, false, "届かない構成では失敗する");
   const record: Record<string, unknown> = { ...result };
   assert.equal(record["framesDecoded"], 0, "復号できるフレームは 0 である");
+  await page.close();
+});
+
+test("実音声が Opus で符号化・束ね・転送・復号され、波形が戻る", { timeout: 180_000 }, async () => {
+  assert.ok(browser !== null);
+  const page = await browser.newPage();
+  const logs: string[] = [];
+  page.on("console", (message) => logs.push(message.text()));
+  page.on("pageerror", (error) => logs.push(`pageerror: ${error.message}`));
+
+  await page.goto(`http://127.0.0.1:${pagePort}/`);
+  await page.waitForFunction("typeof window.__whesoAudioRun === 'function'", undefined, { timeout: 30_000 });
+
+  const result = await page.evaluate(
+    async ([wsBase, room]) => {
+      const run = window.__whesoAudioRun;
+      if (run === undefined) {
+        return { ok: false, detail: "本体が読み込まれていない" };
+      }
+      return await run(String(wsBase), String(room));
+    },
+    [`ws://127.0.0.1:${devPort}`, "ash-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0"],
+  );
+
+  process.stdout.write(`音声 E2E 結果: ${JSON.stringify(result)}\n`);
+  assert.equal(result.ok, true, `音声 E2E が成功する（詳細: ${JSON.stringify(result)} / ログ: ${logs.join(" | ")}）`);
+  const record: Record<string, unknown> = { ...result };
+  assert.ok(
+    typeof record["packetsDecoded"] === "number" && record["packetsDecoded"] >= 10,
+    `復号できたパケットが 10 個以上（実際 ${String(record["packetsDecoded"])}）`,
+  );
   await page.close();
 });
