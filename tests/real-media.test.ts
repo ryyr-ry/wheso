@@ -184,9 +184,9 @@ test("実 Opus の束ねが資産のバイト列と一致し、音声は破棄�
 
   let checked = 0;
   for (let index = 0; index < bundles.length; index += 1) {
-    const bundle = bundles[index];
+    const bundle: unknown = bundles[index];
     assert.ok(isRecord(bundle));
-    const payloads = bundle["payloadsHex"];
+    const payloads: unknown = bundle["payloadsHex"];
     assert.ok(Array.isArray(payloads));
     assert.equal(payloads.length, unitsPerMessage, "束ねる数が規範どおりである");
     const first = numberOf(bundle, "firstSequenceNumber");
