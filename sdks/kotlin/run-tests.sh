@@ -27,7 +27,7 @@ for file in "$RESULT_DIR"/*.xml; do
 done
 
 echo "Kotlin 試験 ${TOTAL} 件、失敗 ${FAILED} 件"
-MIN_TESTS=8
+MIN_TESTS=11
 if [ "$TOTAL" -lt "$MIN_TESTS" ]; then
   echo "FAIL 試験が ${MIN_TESTS} 件以上実行されていない（実際 ${TOTAL} 件）"
   exit 1

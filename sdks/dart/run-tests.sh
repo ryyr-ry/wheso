@@ -21,7 +21,7 @@ fi
 
 # 「+N: All tests passed!」の N を読む。
 PASSED=$(echo "$OUTPUT" | grep -o '+[0-9]*: All tests passed!' | grep -o '[0-9]*' | tail -1)
-MIN_TESTS=8
+MIN_TESTS=11
 if [ -z "$PASSED" ] || [ "$PASSED" -lt "$MIN_TESTS" ]; then
   echo "FAIL 試験が ${MIN_TESTS} 件以上成功していない（実際 ${PASSED:-0} 件）"
   exit 1
