@@ -5,11 +5,15 @@
  *   1. 空きポートで局所実行環境（partykit dev）を起動する
  *   2. 中継部屋へ実際に WebSocket が開くまで待つ
  *   3. 指定された言語の疎通試験へ、接続先と鍵を環境変数で渡して実行する
- *   4. 終了後に実行環境をプロセス群ごと落とす
+ *   4. 続けて**否定対照**（誤った鍵）を同じ試験で回し、必ず失敗することを確かめる
+ *   5. 終了後に実行環境をプロセス群ごと落とす
  *
  * なぜ実行器を分けるか: 疎通試験は言語ごとに実行系が違う（gradle / swift / dart / cargo / g++）。
- * 一方で「実行環境を 1 つ立てて、そこへ実データを流す」手順は共通である。共通部分をここに集め、
+ * 一方で「実行環境を 1 つ立てて実データを流す」手順は共通である。共通部分をここへ集め、
  * 各言語は「環境変数で与えられた場所へ繋いで送受信する」だけにする。
+ *
+ * なぜ否定対照を仕組みに入れるか: 疎通が「通った」ことは認証が働いていることを示さない。
+ * 認証を外しても通るなら、その試験は疎通を確かめていても防御を確かめていない。
  *
  * 実行:
  *   node tools/transport-suite.ts kotlin | swift | dart | all
@@ -32,7 +36,13 @@ const ROOM = "vsh-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0";
 /** 試験専用の鍵。秘密ではない。本番の鍵は環境の秘密として与える（Q-019）。 */
 const DEV_NODE_KEY = "wheso-dev-node-key-not-a-secret";
 
-/** 接続 ID。中継ノードは `_pk` を参加者 ID として扱う（数値で渡す）。 */
+/**
+ * 否定対照に使う誤った鍵。
+ * 実測では、誤った鍵で nodeHello を送るとクローズコード 4023（E_NODE_AUTH）で切られる。
+ */
+const WRONG_NODE_KEY = "wrong-key-for-negative-control";
+
+/** 接続 ID。中継ノードは `_pk` を参加者 ID として扱う。 */
 const SENDER_PK = "4242";
 const SUBSCRIBER_PK = "7001";
 
@@ -115,7 +125,10 @@ const TARGETS: readonly Target[] = [
     name: "kotlin",
     tool: "gradle",
     image: "gradle:8-jdk17",
-    command: "cd sdks/kotlin && gradle test --no-daemon --tests 'dev.wheso.TransportTest'",
+    // cleanTest を付ける理由: Gradle は入力が変わらないと試験を再実行しない（UP-TO-DATE）。
+    // 環境変数だけを変える否定対照では前回の成功結果が再利用され、誤った鍵でも
+    // 「通った」ように見える。実測でこの誤りが起きた。
+    command: "cd sdks/kotlin && gradle cleanTest test --no-daemon --tests dev.wheso.TransportTest",
   },
   {
     name: "swift",
@@ -127,7 +140,7 @@ const TARGETS: readonly Target[] = [
     name: "dart",
     tool: "dart",
     image: "dart:stable",
-    command: "cd sdks/dart && dart pub get > /dev/null 2>&1 && dart test test/transport_test.dart --reporter=expanded",
+    command: "cd sdks/dart && dart pub get > /dev/null 2>&1 && dart test test/transport_test.dart",
   },
 ];
 
@@ -139,18 +152,17 @@ async function hasTool(tool: string): Promise<boolean> {
   });
 }
 
-async function runOne(target: Target, port: number): Promise<boolean> {
+async function runOne(target: Target, port: number, negative: boolean): Promise<boolean> {
   const env: Record<string, string> = {
     WHESO_WS_BASE: `ws://127.0.0.1:${port}`,
     WHESO_ROOM: ROOM,
-    WHESO_NODE_KEY: DEV_NODE_KEY,
+    WHESO_NODE_KEY: negative ? WRONG_NODE_KEY : DEV_NODE_KEY,
     WHESO_SENDER_PK: SENDER_PK,
     WHESO_SUB_PK: SUBSCRIBER_PK,
   };
 
   const native = await hasTool(target.tool);
   if (!native && process.env["WHESO_SDK_DOCKER"] !== "1") {
-    process.stdout.write(`  ${target.name}: SKIP（${target.tool} が無い。WHESO_SDK_DOCKER=1 で docker 実行）\n`);
     return true;
   }
 
@@ -162,11 +174,10 @@ async function runOne(target: Target, port: number): Promise<boolean> {
     ? target.command
     : `docker run --rm --network host ${dockerEnv} -v "${root}":/w -w /w ${target.image} bash -c '${target.command}'`;
 
-  process.stdout.write(`  ${target.name}: 実行する（${native ? "局所" : "docker"}）\n`);
   return await new Promise<boolean>((resolve) => {
     const child = spawn("bash", ["-c", command], {
       cwd: root,
-      stdio: "inherit",
+      stdio: negative ? "ignore" : "inherit",
       env: { ...process.env, ...env },
     });
     child.on("exit", (code) => resolve(code === 0));
@@ -205,10 +216,27 @@ async function main(): Promise<void> {
     process.stdout.write(`局所実行環境が起動した（ポート ${port}、部屋 ${ROOM}）\n`);
 
     for (const target of targets) {
-      const ok = await runOne(target, port);
-      process.stdout.write(`  ${target.name}: ${ok ? "OK" : "FAIL"}\n`);
+      const native = await hasTool(target.tool);
+      if (!native && process.env["WHESO_SDK_DOCKER"] !== "1") {
+        process.stdout.write(
+          `  ${target.name}: SKIP（${target.tool} が無い。WHESO_SDK_DOCKER=1 で docker 実行）\n`,
+        );
+        continue;
+      }
+
+      const ok = await runOne(target, port, false);
+      process.stdout.write(`  ${target.name}: 疎通 ${ok ? "OK" : "FAIL"}\n`);
       if (!ok) {
         failed = true;
+      }
+
+      // 否定対照。誤った鍵では失敗しなければならない。通ったら認証が働いていない。
+      const rejected = await runOne(target, port, true);
+      if (rejected) {
+        process.stdout.write(`  ${target.name}: 否定対照 FAIL（誤った鍵でも通った）\n`);
+        failed = true;
+      } else {
+        process.stdout.write(`  ${target.name}: 否定対照 OK（誤った鍵では通らない）\n`);
       }
     }
   } finally {

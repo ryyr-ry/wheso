@@ -82,7 +82,7 @@ class TransportTest {
     private fun readAsset(): JsonObject =
         Json.parseToJsonElement(File("../../spec/vectors/real-media.json").readText()).jsonObject
 
-    /** 受信したバイナリを溜める購読者。断片が来る場合があるため last まで繋ぐ。 */
+    /** 受信したバイナリを溜める購読者。断片で来る場合があるため last まで繋ぐ。 */
     private class Collector(private val expected: Int) : WebSocket.Listener {
         val received = ConcurrentLinkedQueue<ByteArray>()
         val done = CountDownLatch(1)
@@ -108,6 +108,7 @@ class TransportTest {
         }
 
         override fun onClose(webSocket: WebSocket, statusCode: Int, reason: String): CompletionStage<*>? {
+            // 認証に失敗すると 4023（E_NODE_AUTH）で切られる。原因を残す。
             println("購読側が閉じられた: $statusCode $reason")
             done.countDown()
             return null
@@ -134,7 +135,7 @@ class TransportTest {
         val senderPk = environment["WHESO_SENDER_PK"]
         val subPk = environment["WHESO_SUB_PK"]
         if (base == null || room == null || key == null || senderPk == null || subPk == null) {
-            // 局所実行環境が無い場所では飛ばす。CI では実行器が環境変数を与える。
+            // 局所実行環境が無い場所では飛ばす。実行器が環境変数を与える。
             println("SKIP 疎通試験（環境変数が無い）")
             return
         }
