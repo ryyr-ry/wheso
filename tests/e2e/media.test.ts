@@ -137,8 +137,8 @@ after(async () => {
 });
 
 test("実映像が符号化・転送・復号され、画素が一致する", { timeout: 180_000 }, async () => {
-  assert.notEqual(browser, null, "ブラウザが起動している");
-  const page = await (browser as Browser).newPage();
+  assert.ok(browser !== null, "ブラウザが起動している");
+  const page = await browser.newPage();
   const logs: string[] = [];
   page.on("console", (message) => logs.push(message.text()));
   page.on("pageerror", (error) => logs.push(`pageerror: ${error.message}`));
@@ -178,8 +178,8 @@ test("実映像が符号化・転送・復号され、画素が一致する", { 
 test("否定対照: 購読していない送信者の映像は届かず、検査が失敗する", { timeout: 180_000 }, async () => {
   // 目的: 上の試験が「常に成功する空の検査」でないことを示す。
   // 転送されない構成では復号できるフレームが 0 になり、検査が失敗しなければならない。
-  assert.notEqual(browser, null);
-  const page = await (browser as Browser).newPage();
+  assert.ok(browser !== null);
+  const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${pagePort}/`);
   await page.waitForFunction("typeof window.__whesoRunNegative === 'function'", undefined, {
     timeout: 30_000,
