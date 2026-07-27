@@ -17,13 +17,22 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCAN_DIRS: readonly string[] =
   process.argv.length > 2 ? process.argv.slice(2) : ["packages", "tools"];
 const SKIP_DIR_NAMES = new Set(["node_modules", ".git", "dist", "build", "generated", ".partykit"]);
-const SCAN_EXTENSIONS = [".ts", ".tsx"];
+const SCAN_EXTENSIONS = [".ts", ".tsx", ".rs"];
 
 interface Rule {
   readonly name: string;
   readonly pattern: RegExp;
   readonly note: string;
 }
+
+/** 言語ごとに適用する規則を分ける。拡張子で判定する。 */
+const RUST_RULES: readonly Rule[] = [
+  { name: "rust-unwrap", pattern: /\.unwrap\(/g, note: "unwrap（パニックする）" },
+  { name: "rust-expect", pattern: /\.expect\(/g, note: "expect（パニックする）" },
+  { name: "rust-panic", pattern: /\bpanic!\(/g, note: "panic!" },
+  { name: "rust-unsafe", pattern: /\bunsafe\b/g, note: "未検査メモリ" },
+  { name: "rust-allow", pattern: /#\[allow\(/g, note: "検査の抑制" },
+];
 
 const RULES: readonly Rule[] = [
   { name: "explicit-any", pattern: /(:|<)\s*any\b/g, note: "型注釈での any" },
@@ -101,7 +110,13 @@ async function main(): Promise<void> {
       if (file.endsWith("forbidden.ts")) {
         continue;
       }
-      for (const rule of RULES) {
+      // 拡張子で規則を切り替える。TypeScript の規則を Rust に当てても意味がない。
+      // 試験ファイルは対象外とする。試験の失敗は停止として表すのが自然であり、
+      // 規範（lint-policy.md 9 節）はコアと製品コードを対象とする。
+      const isRust = file.endsWith(".rs");
+      const isTest = file.includes("/tests/") || file.endsWith(".test.ts");
+      const activeRules = isRust ? (isTest ? [] : RUST_RULES) : RULES;
+      for (const rule of activeRules) {
         rule.pattern.lastIndex = 0;
         const match = rule.pattern.exec(line);
         if (match !== null) {

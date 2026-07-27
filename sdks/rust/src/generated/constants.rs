@@ -1,0 +1,193 @@
+//! このファイルは自動生成されている。手で編集してはならない。
+//!
+//! 生成元: プロトコルのスキーマ定義
+//! 再生成: 内部検証スクリプトを実行する
+#![allow(dead_code)]
+
+// nodeCapacity
+pub const NODE_MAX_OUT_MESSAGES_PER_SEC: i64 = 20000;
+pub const NODE_MAX_OUT_BYTES_PER_SEC: i64 = 280000000;
+pub const NODE_MAX_IN_MESSAGES_PER_SEC: i64 = 20000;
+
+// videoProfiles
+pub const V_4K60_SPATIAL_ID: i64 = 3;
+pub const V_4K60_WIDTH: i64 = 3840;
+pub const V_4K60_HEIGHT: i64 = 2160;
+pub const V_4K60_FRAMERATE: i64 = 60;
+pub const V_4K60_TARGET_BITRATE: i64 = 25000000;
+pub const V_4K60_SCALABILITY_MODE: &str = "L1T3";
+pub const V_4K60_REQUIRES_HARDWARE_ENCODER: bool = true;
+pub const V_1080P60_SPATIAL_ID: i64 = 2;
+pub const V_1080P60_WIDTH: i64 = 1920;
+pub const V_1080P60_HEIGHT: i64 = 1080;
+pub const V_1080P60_FRAMERATE: i64 = 60;
+pub const V_1080P60_TARGET_BITRATE: i64 = 6000000;
+pub const V_1080P60_SCALABILITY_MODE: &str = "L1T3";
+pub const V_1080P60_REQUIRES_HARDWARE_ENCODER: bool = false;
+pub const V_1080P30_SPATIAL_ID: i64 = 1;
+pub const V_1080P30_WIDTH: i64 = 1920;
+pub const V_1080P30_HEIGHT: i64 = 1080;
+pub const V_1080P30_FRAMERATE: i64 = 30;
+pub const V_1080P30_TARGET_BITRATE: i64 = 3000000;
+pub const V_1080P30_SCALABILITY_MODE: &str = "L1T3";
+pub const V_1080P30_REQUIRES_HARDWARE_ENCODER: bool = false;
+pub const V_360P15_SPATIAL_ID: i64 = 0;
+pub const V_360P15_WIDTH: i64 = 640;
+pub const V_360P15_HEIGHT: i64 = 360;
+pub const V_360P15_FRAMERATE: i64 = 15;
+pub const V_360P15_TARGET_BITRATE: i64 = 200000;
+pub const V_360P15_SCALABILITY_MODE: &str = "L1T2";
+pub const V_360P15_REQUIRES_HARDWARE_ENCODER: bool = false;
+pub const V_SCREEN_4K30_SPATIAL_ID: i64 = 3;
+pub const V_SCREEN_4K30_WIDTH: i64 = 3840;
+pub const V_SCREEN_4K30_HEIGHT: i64 = 2160;
+pub const V_SCREEN_4K30_FRAMERATE: i64 = 30;
+pub const V_SCREEN_4K30_TARGET_BITRATE: i64 = 8000000;
+pub const V_SCREEN_4K30_SCALABILITY_MODE: &str = "L1T2";
+pub const V_SCREEN_4K30_CONTENT_HINT: &str = "text";
+pub const V_SCREEN_4K30_REQUIRES_HARDWARE_ENCODER: bool = false;
+pub const V_SCREEN_1080P30_SPATIAL_ID: i64 = 1;
+pub const V_SCREEN_1080P30_WIDTH: i64 = 1920;
+pub const V_SCREEN_1080P30_HEIGHT: i64 = 1080;
+pub const V_SCREEN_1080P30_FRAMERATE: i64 = 30;
+pub const V_SCREEN_1080P30_TARGET_BITRATE: i64 = 2000000;
+pub const V_SCREEN_1080P30_SCALABILITY_MODE: &str = "L1T2";
+pub const V_SCREEN_1080P30_CONTENT_HINT: &str = "text";
+pub const V_SCREEN_1080P30_REQUIRES_HARDWARE_ENCODER: bool = false;
+
+// audioProfiles
+pub const A_VOICE_BITRATE: i64 = 32000;
+pub const A_VOICE_CHANNELS: i64 = 1;
+pub const A_VOICE_BYTES_PER_PACKET: i64 = 80;
+pub const A_MUSIC_BITRATE: i64 = 128000;
+pub const A_MUSIC_CHANNELS: i64 = 2;
+pub const A_MUSIC_BYTES_PER_PACKET: i64 = 320;
+
+// audio
+pub const OPUS_FRAME_MS: i64 = 20;
+pub const AUDIO_BUNDLE_MS: i64 = 40;
+pub const AUDIO_UNITS_PER_MESSAGE: i64 = 2;
+pub const AUDIO_SELECTIVE_FORWARD_COUNT: i64 = 5;
+pub const AUDIO_SPEAKER_HOLD_MS: i64 = 800;
+pub const AUDIO_DTX_ENABLED: bool = true;
+pub const AUDIO_FEC_ENABLED: bool = true;
+
+// shardCapacity
+pub const V_SHARD_MAX_PARTICIPANTS: i64 = 35;
+pub const A_SHARD_MAX_PARTICIPANTS: i64 = 160;
+pub const V_FULL_MESH_MAX_4K60: i64 = 9;
+pub const V_FULL_MESH_MAX_1080P60: i64 = 18;
+pub const V_FULL_MESH_MAX_1080P30: i64 = 26;
+pub const V_FULL_MESH_MAX_360P15: i64 = 37;
+
+// congestion
+pub const REPORT_INTERVAL_MS: i64 = 200;
+pub const DELAY_TREND_WINDOW: i64 = 20;
+pub const DELAY_TREND_DEGRADE: f64 = 0.01;
+pub const DELAY_TREND_RECOVER: f64 = -0.005;
+pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: i64 = 500;
+pub const AUDIO_STALL_RESET_MS: i64 = 500;
+pub const VIDEO_STALL_RESET_MS: i64 = 1500;
+pub const STANDBY_CONNECTION_ENABLED: bool = true;
+pub const SHEDDING_HYSTERESIS_MS: i64 = 500;
+pub const SEND_WINDOW_MS: i64 = 200;
+pub const ACK_INTERVAL_MS: i64 = 50;
+pub const ACK_TIMEOUT_MS: i64 = 5000;
+pub const UPLINK_BACKLOG_BYTES: i64 = 100000;
+pub const RATE_HOLD_MS: i64 = 1000;
+pub const RATE_PROBE_BPS: i64 = 200000;
+pub const RATE_DECREASE_FACTOR: f64 = 0.85;
+pub const LATE_FRAME_TOLERANCE_MS: i64 = 33;
+pub const MIN_VIABLE_BPS: i64 = 232000;
+pub const DELAY_TREND_DEGRADE_NUM: i64 = 1;
+pub const DELAY_TREND_DEGRADE_DEN: i64 = 100;
+pub const DELAY_TREND_RECOVER_NUM: i64 = -1;
+pub const DELAY_TREND_RECOVER_DEN: i64 = 200;
+
+// jitterBuffer
+pub const VIDEO_JITTER_MIN_FRAMES: i64 = 2;
+pub const VIDEO_JITTER_MAX_FRAMES: i64 = 10;
+pub const AUDIO_JITTER_MIN_PACKETS: i64 = 2;
+pub const AUDIO_JITTER_MAX_PACKETS: i64 = 8;
+pub const AV_SKEW_TOLERANCE_MS: i64 = 20;
+pub const AV_SKEW_RESYNC_MS: i64 = 200;
+
+// timeouts
+pub const NODE_CONNECT_TIMEOUT_MS: i64 = 5000;
+pub const RECONNECT_BACKOFF_MS: [i64; 4] = [500, 1000, 2000, 5000];
+pub const HEARTBEAT_INTERVAL_MS: i64 = 3000;
+pub const HEARTBEAT_TIMEOUT_MS: i64 = 9000;
+pub const DUAL_SUBSCRIBE_TIMEOUT_MS: i64 = 2000;
+pub const STANDBY_SWAP_TIMEOUT_MS: i64 = 3000;
+pub const EPOCH_DUAL_SUBSCRIBE_TIMEOUT_MS: i64 = 2000;
+
+// auth
+pub const TOKEN_MAX_AGE_SEC: i64 = 60;
+pub const TOKEN_CLOCK_SKEW_SEC: i64 = 5;
+pub const NODE_AUTH_TIME_WINDOW_SEC: i64 = 300;
+pub const MAX_CONNECT_ATTEMPTS_PER_MIN: i64 = 20;
+pub const MAX_INBOUND_MESSAGES_PER_SEC_PER_CLIENT: i64 = 400;
+
+// naming
+pub const MAX_ROOM_NAME_LENGTH: i64 = 96;
+pub const FNV1A_OFFSET_BASIS: i64 = 2166136261;
+pub const FNV1A_PRIME: i64 = 16777619;
+pub const FMIX32_C1: i64 = 2246822507;
+pub const FMIX32_C2: i64 = 3266489909;
+
+// slo
+pub const STALL_RATIO_P95: f64 = 0.005;
+pub const AUDIO_GAP_RATIO_P95: f64 = 0.001;
+pub const AV_SKEW_MS_P99: i64 = 80;
+pub const KEYFRAME_REQUEST_RATE_P95: i64 = 1;
+pub const GLASS_TO_GLASS_MS_P50: i64 = 150;
+pub const NODE_UTILIZATION_P95: f64 = 0.8;
+
+// conformance
+pub const TRACE_FORMAT_VERSION: i64 = 1;
+pub const FUZZ_STEPS_PER_RUN: i64 = 2000;
+pub const FUZZ_RUNS_PER_PULL_REQUEST: i64 = 20;
+pub const FUZZ_RUNS_NIGHTLY: i64 = 5000;
+pub const PRNG_MULTIPLIER_SHIFTS: &str = "13,7,17";
+
+// display
+pub const DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID: i64 = 0;
+pub const DISPLAY_SIZE_REPORT_MIN_INTERVAL_MS: i64 = 200;
+
+// lineBudget
+pub const LINE_BUDGET_TYPESCRIPT: i64 = 6;
+pub const LINE_BUDGET_FRAMEWORK: i64 = 6;
+pub const LINE_BUDGET_MOBILE: i64 = 10;
+pub const LINE_BUDGET_NATIVE: i64 = 10;
+
+// shardCongestion
+pub const SHARD_UTIL_WINDOW_MS: i64 = 1000;
+pub const SHARD_UTIL_ENTER_T2_NUM: i64 = 9;
+pub const SHARD_UTIL_ENTER_T2_DEN: i64 = 10;
+pub const SHARD_UTIL_ENTER_T1_NUM: i64 = 1;
+pub const SHARD_UTIL_ENTER_T1_DEN: i64 = 1;
+pub const SHARD_UTIL_ENTER_SPATIAL_NUM: i64 = 11;
+pub const SHARD_UTIL_ENTER_SPATIAL_DEN: i64 = 10;
+pub const SHARD_UTIL_ENTER_KEY_ONLY_NUM: i64 = 6;
+pub const SHARD_UTIL_ENTER_KEY_ONLY_DEN: i64 = 5;
+pub const SHARD_UTIL_EXIT_T2_NUM: i64 = 4;
+pub const SHARD_UTIL_EXIT_T2_DEN: i64 = 5;
+pub const SHARD_UTIL_EXIT_T1_NUM: i64 = 17;
+pub const SHARD_UTIL_EXIT_T1_DEN: i64 = 20;
+pub const SHARD_UTIL_EXIT_SPATIAL_NUM: i64 = 9;
+pub const SHARD_UTIL_EXIT_SPATIAL_DEN: i64 = 10;
+pub const SHARD_UTIL_EXIT_KEY_ONLY_NUM: i64 = 1;
+pub const SHARD_UTIL_EXIT_KEY_ONLY_DEN: i64 = 1;
+pub const SHARD_TREND_ENTER_T2_NUM: i64 = 1;
+pub const SHARD_TREND_ENTER_T2_DEN: i64 = 100;
+pub const SHARD_TREND_ENTER_T1_NUM: i64 = 3;
+pub const SHARD_TREND_ENTER_T1_DEN: i64 = 100;
+pub const SHARD_TREND_ENTER_SPATIAL_NUM: i64 = 3;
+pub const SHARD_TREND_ENTER_SPATIAL_DEN: i64 = 50;
+pub const SHARD_TREND_ENTER_KEY_ONLY_NUM: i64 = 1;
+pub const SHARD_TREND_ENTER_KEY_ONLY_DEN: i64 = 10;
+pub const SHARD_TREND_EXIT_NUM: i64 = -1;
+pub const SHARD_TREND_EXIT_DEN: i64 = 200;
+pub const SHARD_TREND_EXIT_KEY_ONLY_NUM: i64 = 0;
+pub const SHARD_TREND_EXIT_KEY_ONLY_DEN: i64 = 1;
+

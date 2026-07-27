@@ -6,3 +6,7 @@ license = "Apache-2.0"
 description = "Free, open-source video calling client."
 
 [dependencies]
+
+[dev-dependencies]
+# 試験でのみ使う。SDK 本体は依存を持たない（licensing.md）。
+serde_json = "1"

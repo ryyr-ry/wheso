@@ -82,3 +82,6 @@ jobs:
 
       - name: E2E（実映像の符号化・転送・復号と画素の一致）
         run: npm run test:e2e
+
+      - name: Rust の適合試験（凍結ベクタとの一致）
+        run: npm run test:rust

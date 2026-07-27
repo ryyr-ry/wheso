@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const schemaDir = join(root, "spec", "schema");
 const tsOutDir = join(root, "packages", "core", "src", "generated");
+const rustOutDir = join(root, "sdks", "rust", "src", "generated");
 
 const BANNER = `/**
  * このファイルは自動生成されている。手で編集してはならない。
@@ -302,6 +303,117 @@ function generateConstantsTs(schema: Record<string, unknown>): string {
   return `${lines.join("\n")}\n`;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* Rust 向けの生成                                                           */
+/* ------------------------------------------------------------------------- */
+
+const RUST_BANNER = `//! このファイルは自動生成されている。手で編集してはならない。
+//!
+//! 生成元: プロトコルのスキーマ定義
+//! 再生成: 内部検証スクリプトを実行する
+#![allow(dead_code)]
+`;
+
+/** Rust の値表現。整数は i64、小数は f64、真偽は bool、文字列は &str とする。 */
+function formatRustValue(value: unknown): { readonly type: string; readonly literal: string } | null {
+  if (typeof value === "number") {
+    return Number.isInteger(value)
+      ? { type: "i64", literal: String(value) }
+      : { type: "f64", literal: String(value) };
+  }
+  if (typeof value === "boolean") {
+    return { type: "bool", literal: String(value) };
+  }
+  if (typeof value === "string") {
+    return { type: "&str", literal: JSON.stringify(value) };
+  }
+  if (Array.isArray(value)) {
+    const parts: string[] = [];
+    for (const item of value) {
+      const formatted = formatRustValue(item);
+      if (formatted === null || formatted.type !== "i64") {
+        return null;
+      }
+      parts.push(formatted.literal);
+    }
+    return { type: `[i64; ${parts.length}]`, literal: `[${parts.join(", ")}]` };
+  }
+  return null;
+}
+
+function generateConstantsRs(schema: Record<string, unknown>): string {
+  const lines: string[] = [RUST_BANNER];
+  for (const [groupName, group] of Object.entries(schema)) {
+    if (groupName.startsWith("$") || !isRecord(group)) {
+      continue;
+    }
+    lines.push(`// ${groupName}`);
+    for (const [constantName, definition] of Object.entries(group)) {
+      if (constantName.startsWith("$") || !isRecord(definition)) {
+        continue;
+      }
+      if (!("value" in definition)) {
+        for (const [key, raw] of Object.entries(definition)) {
+          if (key.startsWith("$") || key === "derivation" || key === "fact" || key === "question" || key === "adr") {
+            continue;
+          }
+          const formatted = formatRustValue(raw);
+          if (formatted === null) {
+            continue;
+          }
+          const suffix = key.replace(/([A-Z])/g, "_$1").toUpperCase();
+          lines.push(`pub const ${constantName}_${suffix}: ${formatted.type} = ${formatted.literal};`);
+        }
+        continue;
+      }
+      const formatted = formatRustValue(definition["value"]);
+      if (formatted === null) {
+        continue;
+      }
+      lines.push(`pub const ${constantName}: ${formatted.type} = ${formatted.literal};`);
+    }
+    lines.push("");
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function generateWireRs(schema: Record<string, unknown>): string {
+  const lines: string[] = [RUST_BANNER];
+  const messageHeader = readObject(schema, "messageHeader");
+  const unitHeader = readObject(schema, "unitHeader");
+  const limits = readObject(schema, "limits");
+  lines.push(`pub const PROTOCOL_VERSION: u8 = ${readNumber(schema, "protocolVersion")};`);
+  lines.push(`pub const WIRE_MAGIC: u8 = ${readNumber(schema, "magic")};`);
+  lines.push(`pub const MESSAGE_HEADER_BYTES: usize = ${readNumber(messageHeader, "bytes")};`);
+  lines.push(`pub const UNIT_HEADER_BYTES: usize = ${readNumber(unitHeader, "bytes")};`);
+  lines.push(`pub const MAX_UNITS_PER_MESSAGE: u32 = ${readNumber(limits, "maxUnitsPerMessage")};`);
+  lines.push(`pub const MAX_MESSAGE_BYTES: usize = ${readNumber(limits, "maxMessageBytes")};`);
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "enums"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(`pub const CHANNEL_${readString(entry, "name")}: u8 = ${readNumber(entry, "value")};`);
+      }
+    }
+  }
+  lines.push("");
+  for (const entries of Object.values(readObject(schema, "bitsets"))) {
+    if (!Array.isArray(entries)) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (isRecord(entry)) {
+        lines.push(`pub const FLAG_${readString(entry, "name")}: u8 = ${1 << readNumber(entry, "bit")};`);
+      }
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 /* ------------------------------------------------------------------------- */
 /* 実行                                                                      */
 /* ------------------------------------------------------------------------- */
@@ -319,11 +431,14 @@ async function buildArtifacts(): Promise<readonly Artifact[]> {
     { path: join(tsOutDir, "wire-layout.ts"), content: generateWireTs(wire) },
     { path: join(tsOutDir, "errors.ts"), content: generateErrorsTs(errors) },
     { path: join(tsOutDir, "constants.ts"), content: generateConstantsTs(constants) },
+    { path: join(rustOutDir, "constants.rs"), content: generateConstantsRs(constants) },
+    { path: join(rustOutDir, "wire_layout.rs"), content: generateWireRs(wire) },
   ];
 }
 
 async function generate(): Promise<void> {
   await mkdir(tsOutDir, { recursive: true });
+  await mkdir(rustOutDir, { recursive: true });
   const artifacts = await buildArtifacts();
   for (const artifact of artifacts) {
     await writeFile(artifact.path, artifact.content, "utf8");
