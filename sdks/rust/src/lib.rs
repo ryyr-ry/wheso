@@ -13,6 +13,7 @@
 
 pub mod fixed;
 pub mod generated;
+pub mod shard_core;
 pub mod wire;
 
 pub use fixed::{create_prng, delay_slope, is_degrading, is_recovering, next, trunc_div, CoreError, PrngState, Slope};
