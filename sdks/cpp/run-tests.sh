@@ -16,3 +16,7 @@ g++ -std=c++20 -Wall -Wextra -Werror -O1 -Iinclude -o build/conformance tests/co
 # 段 A（凍結トレース: 中継ノードと受信ノードの判断コアの完全一致）
 g++ -std=c++20 -Wall -Wextra -Werror -O1 -Iinclude -o build/trace tests/trace.cpp
 ./build/trace "../../spec/vectors"
+
+# 段 A（実データ: 実際に符号化された AV1 と Opus に対する往復と判断）
+g++ -std=c++20 -Wall -Wextra -Werror -O1 -Iinclude -o build/real_media tests/real_media.cpp
+./build/real_media "../../spec/vectors"
