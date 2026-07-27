@@ -217,6 +217,143 @@ function generateErrorsTs(schema: Record<string, unknown>): string {
 }
 
 /* ------------------------------------------------------------------------- */
+/* エラー定義の生成（TypeScript 以外）                                       */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * エラーとクローズコードを他言語へ生成する。
+ *
+ * なぜ必要か: クローズコードを各言語のコードに書き写した実装があった（Rust と Dart の
+ * 判断コアが 4032 を直書きしていた）。数値は単一情報源から生成する（AGENTS 5.3）。
+ */
+function errorEntries(schema: Record<string, unknown>): readonly { readonly name: string; readonly closeCode: number }[] {
+  const out: { readonly name: string; readonly closeCode: number }[] = [];
+  for (const entry of readArray(schema, "closeCodes")) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    out.push({ name: readString(entry, "name"), closeCode: readNumber(entry, "closeCode") });
+  }
+  return out;
+}
+
+function warningNames(schema: Record<string, unknown>): readonly string[] {
+  const out: string[] = [];
+  for (const entry of readArray(schema, "warnings")) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    out.push(readString(entry, "name"));
+  }
+  return out;
+}
+
+/** Rust の生成物集約。手編集を避けるためこれも生成する。 */
+function generateModRs(): string {
+  return [
+    "//! 生成物の集約。手で編集してはならない。",
+    "pub mod constants;",
+    "pub mod errors;",
+    "pub mod wire_layout;",
+    "",
+  ].join("\n");
+}
+
+function generateErrorsRs(schema: Record<string, unknown>): string {
+  const lines: string[] = [BANNER.split("\n").map((line) => line.replace(/^\/\*\*?|^ \*\/?| \*$/g, "//")).join("\n")];
+  lines.length = 0;
+  lines.push("//! このファイルは自動生成されている。手で編集してはならない。");
+  lines.push("//!");
+  lines.push("//! 生成元: エラーの機械可読定義");
+  lines.push("");
+  lines.push("/// クローズコード。名前は規範のエラー名と一致する。");
+  for (const entry of errorEntries(schema)) {
+    lines.push(`pub const ${entry.name}_CLOSE_CODE: i64 = ${entry.closeCode};`);
+  }
+  lines.push("");
+  lines.push("/// 警告の名前。利用側が国際化キーへ写す。");
+  for (const name of warningNames(schema)) {
+    lines.push(`pub const ${name}: &str = "${name}";`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function generateErrorsHpp(schema: Record<string, unknown>): string {
+  const lines: string[] = [];
+  lines.push("// このファイルは自動生成されている。手で編集してはならない。");
+  lines.push("//");
+  lines.push("// 生成元: エラーの機械可読定義");
+  lines.push("#pragma once");
+  lines.push("");
+  lines.push("#include <cstdint>");
+  lines.push("");
+  lines.push("namespace wheso::errors {");
+  for (const entry of errorEntries(schema)) {
+    lines.push(`inline constexpr std::int64_t ${entry.name}_CLOSE_CODE = ${entry.closeCode};`);
+  }
+  lines.push("");
+  for (const name of warningNames(schema)) {
+    lines.push(`inline constexpr const char* ${name} = "${name}";`);
+  }
+  lines.push("}  // namespace wheso::errors");
+  return `${lines.join("\n")}\n`;
+}
+
+function generateErrorsDart(schema: Record<string, unknown>): string {
+  const lines: string[] = [];
+  lines.push("// このファイルは自動生成されている。手で編集してはならない。");
+  lines.push("//");
+  lines.push("// 生成元: エラーの機械可読定義");
+  lines.push("// ignore_for_file: constant_identifier_names");
+  lines.push("");
+  for (const entry of errorEntries(schema)) {
+    lines.push(`const int ${entry.name}_CLOSE_CODE = ${entry.closeCode};`);
+  }
+  lines.push("");
+  for (const name of warningNames(schema)) {
+    lines.push(`const String ${name} = '${name}';`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function generateErrorsKt(schema: Record<string, unknown>): string {
+  const lines: string[] = [];
+  lines.push("// このファイルは自動生成されている。手で編集してはならない。");
+  lines.push("//");
+  lines.push("// 生成元: エラーの機械可読定義");
+  lines.push("package dev.wheso.generated");
+  lines.push("");
+  lines.push("public object Errors {");
+  for (const entry of errorEntries(schema)) {
+    lines.push(`    public const val ${entry.name}_CLOSE_CODE: Long = ${entry.closeCode}L`);
+  }
+  lines.push("");
+  for (const name of warningNames(schema)) {
+    lines.push(`    public const val ${name}: String = "${name}"`);
+  }
+  lines.push("}");
+  return `${lines.join("\n")}\n`;
+}
+
+function generateErrorsSwift(schema: Record<string, unknown>): string {
+  const lines: string[] = [];
+  lines.push("// このファイルは自動生成されている。手で編集してはならない。");
+  lines.push("//");
+  lines.push("// 生成元: エラーの機械可読定義");
+  lines.push("");
+  lines.push("public enum WhesoErrors {");
+  for (const entry of errorEntries(schema)) {
+    lines.push(`    public static let ${entry.name}_CLOSE_CODE: Int64 = ${entry.closeCode}`);
+  }
+  lines.push("");
+  for (const name of warningNames(schema)) {
+    lines.push(`    public static let ${name}: String = "${name}"`);
+  }
+  lines.push("}");
+  return `${lines.join("\n")}\n`;
+}
+
+/* ------------------------------------------------------------------------- */
 /* 定数定義の生成                                                            */
 /* ------------------------------------------------------------------------- */
 
@@ -883,14 +1020,20 @@ async function buildArtifacts(): Promise<readonly Artifact[]> {
     { path: join(tsOutDir, "constants.ts"), content: generateConstantsTs(constants) },
     { path: join(rustOutDir, "constants.rs"), content: generateConstantsRs(constants) },
     { path: join(rustOutDir, "wire_layout.rs"), content: generateWireRs(wire) },
+    { path: join(rustOutDir, "errors.rs"), content: generateErrorsRs(errors) },
+    { path: join(rustOutDir, "mod.rs"), content: generateModRs() },
     { path: join(cppOutDir, "constants.hpp"), content: generateConstantsHpp(constants) },
     { path: join(cppOutDir, "wire_layout.hpp"), content: generateWireHpp(wire) },
+    { path: join(cppOutDir, "errors.hpp"), content: generateErrorsHpp(errors) },
     { path: join(dartOutDir, "constants.dart"), content: generateConstantsDart(constants) },
     { path: join(dartOutDir, "wire_layout.dart"), content: generateWireDart(wire) },
+    { path: join(dartOutDir, "errors.dart"), content: generateErrorsDart(errors) },
     { path: join(kotlinOutDir, "Constants.kt"), content: generateConstantsKt(constants) },
     { path: join(kotlinOutDir, "WireLayout.kt"), content: generateWireKt(wire) },
+    { path: join(kotlinOutDir, "Errors.kt"), content: generateErrorsKt(errors) },
     { path: join(swiftOutDir, "Constants.swift"), content: generateConstantsSwift(constants) },
     { path: join(swiftOutDir, "WireLayout.swift"), content: generateWireSwift(wire) },
+    { path: join(swiftOutDir, "Errors.swift"), content: generateErrorsSwift(errors) },
   ];
 }
 

@@ -157,8 +157,8 @@ pub fn initial_state(t: i64) -> ShardState {
     }
 }
 
-/// 過負荷を通知するクローズコード。errors.json の E_NODE_OVERLOADED と一致させる。
-const NODE_OVERLOADED_CLOSE_CODE: i64 = 4032;
+/// 過負荷を通知するクローズコード。生成物から参照する（数値をコードに書かない）。
+use crate::generated::errors::E_NODE_OVERLOADED_CLOSE_CODE as NODE_OVERLOADED_CLOSE_CODE;
 
 pub fn step(state: &ShardState, event: &ShardEvent, t: i64) -> StepResult {
     match event {

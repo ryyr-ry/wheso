@@ -23,7 +23,7 @@
     "test:e2e": "node --test \"tests/e2e/*.test.ts\"",
     "test:rust": "cargo test --manifest-path sdks/rust/Cargo.toml",
     "test:cpp": "bash sdks/cpp/run-tests.sh",
-    "test:dart": "cd sdks/dart && dart pub get && dart test --reporter=expanded",
+    "test:dart": "bash sdks/dart/run-tests.sh",
     "test:kotlin": "bash sdks/kotlin/run-tests.sh",
     "test:swift": "bash sdks/swift/run-tests.sh"
   },
