@@ -76,3 +76,9 @@ jobs:
 
       - name: 結合試験（局所実行環境の Durable Object に対する実接続）
         run: npm run test:integration
+
+      - name: Chromium を導入する（E2E 用）
+        run: npx playwright install --with-deps chromium
+
+      - name: E2E（実映像の符号化・転送・復号と画素の一致）
+        run: npm run test:e2e

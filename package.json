@@ -19,11 +19,14 @@
     "test": "node --test \"tests/*.test.ts\"",
     "ci": "npm run typecheck && npm run codegen:check && npm run vectors:check && npm run naming:check && npm run auth:check && npm run capacity:check && npm run forbidden:check && npm run trace:receiver:check && npm run trace:check && npm run fuzz:check && npm test",
     "trace:receiver:check": "node tools/traces-receiver.ts check",
-    "test:integration": "node --test \"tests/integration/**/*.test.ts\""
+    "test:integration": "node --test \"tests/integration/**/*.test.ts\"",
+    "test:e2e": "node --test \"tests/e2e/*.test.ts\""
   },
   "devDependencies": {
     "@types/node": "24.3.0",
+    "esbuild": "^0.25.10",
     "partykit": "^0.0.115",
+    "playwright": "^1.56.0",
     "typescript": "5.9.2"
   }
 }

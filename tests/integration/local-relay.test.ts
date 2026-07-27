@@ -46,7 +46,12 @@ async function findFreePort(): Promise<number> {
 let PORT = 0;
 let BASE = "";
 let WS_BASE = "";
-const ROOM = "vsh-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0";
+/** 部屋名は試験ごとに変える。同じ部屋を使い回すと前の試験の状態が残る。 */
+const ROOM_BASE = "vsh-01jxy8kq2r3mz5v7h9abcderfa-auto-1";
+function roomFor(index: number): string {
+  return `${ROOM_BASE}-${index}`;
+}
+const ROOM = roomFor(0);
 
 let server: ChildProcess | null = null;
 
@@ -62,9 +67,7 @@ async function waitForReady(timeoutMs: number): Promise<boolean> {
     } catch {
       // 起動前は接続できない。待って再試行する。
     }
-    await new Promise((resolve) => {
-      setTimeout(resolve, 500).unref();
-    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
   return false;
 }
@@ -82,7 +85,40 @@ before(async () => {
   });
   const ready = await waitForReady(90_000);
   assert.equal(ready, true, "partykit dev が起動する");
+
+  // 主入口が応えても、役割ごとの部屋は初回接続時に組み立てられる。
+  // 実際に WebSocket が開くまで待つ。待たないと最初の試験が組み立てを待って時限に達する。
+  const socketReady = await waitForSocket(60_000);
+  assert.equal(socketReady, true, "中継部屋へ WebSocket が開く");
 });
+
+/** 中継部屋へ実際に接続できるまで待つ。 */
+async function waitForSocket(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const opened = await new Promise<boolean>((resolve) => {
+      const probe = new globalThis.WebSocket(`${WS_BASE}/parties/shard/${ROOM}?_pk=99`);
+      const timer = setTimeout(() => {
+        probe.close();
+        resolve(false);
+      }, 5000);
+      probe.addEventListener("open", () => {
+        clearTimeout(timer);
+        probe.close();
+        resolve(true);
+      });
+      probe.addEventListener("error", () => {
+        clearTimeout(timer);
+        resolve(false);
+      });
+    });
+    if (opened) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
 
 after(() => {
   for (const socket of openSockets) {
@@ -107,27 +143,49 @@ after(() => {
 /** 接続 ID を指定して中継部屋へ繋ぐ。中継ノードは接続 ID を参加者 ID として読む。 */
 const openSockets: globalThis.WebSocket[] = [];
 
-function connect(participantId: number): globalThis.WebSocket {
-  const socket = new globalThis.WebSocket(`${WS_BASE}/parties/shard/${ROOM}?_pk=${participantId}`);
+function connect(participantId: number, room: string = ROOM): globalThis.WebSocket {
+  const socket = new globalThis.WebSocket(`${WS_BASE}/parties/shard/${room}?_pk=${participantId}`);
   // 開いた接続を記録し、試験の終わりに必ず閉じる。
   // 閉じ忘れると実行ループが終わらず、試験プロセスが終了しない。
   openSockets.push(socket);
   return socket;
 }
 
-function waitOpen(socket: globalThis.WebSocket): Promise<void> {
-  return new Promise((resolve, reject) => {
-    socket.addEventListener("open", () => resolve(), { once: true });
-    socket.addEventListener("error", () => reject(new Error("接続に失敗した")), { once: true });
-  });
+/**
+ * 接続が開くまで再試行する。
+ * 局所実行環境は部屋（Durable Object）を初回接続時に組み立てるため、
+ * 最初の 1 回が停滞することがある。停滞したら作り直す方が確実である。
+ */
+async function connectReady(participantId: number, room: string = ROOM): Promise<globalThis.WebSocket> {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const socket = connect(participantId, room);
+    socket.binaryType = "arraybuffer";
+    const opened = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 8000);
+      socket.addEventListener("open", () => {
+        clearTimeout(timer);
+        resolve(true);
+      }, { once: true });
+      socket.addEventListener("error", () => {
+        clearTimeout(timer);
+        resolve(false);
+      }, { once: true });
+    });
+    if (opened) {
+      return socket;
+    }
+    socket.close();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`接続が開かない: room=${room} id=${participantId}`);
 }
 
 /** 次のメッセージを待つ。時限内に来なければ null を返す。 */
 function nextMessage(socket: globalThis.WebSocket, timeoutMs: number): Promise<ArrayBuffer | string | null> {
   return new Promise((resolve) => {
-    // タイマーが実行ループを掴み続けないようにする。試験の終了を妨げないためである。
+    // このタイマーは「届かないこと」の判定に必要であるため unref してはならない。
+    // unref すると実行ループが空になった時点で発火せず、Promise が解決しないまま時限に達する。
     const timer = setTimeout(() => resolve(null), timeoutMs);
-    timer.unref();
     socket.addEventListener(
       "message",
       (event: MessageEvent<unknown>) => {
@@ -152,7 +210,7 @@ function nextMessage(socket: globalThis.WebSocket, timeoutMs: number): Promise<A
   });
 }
 
-function mediaBytes(senderId: number, spatialId: number): Uint8Array {
+function mediaBytes(senderId: number, spatialId: number, payloadBytes = 64): Uint8Array {
   const encoded = encodeMediaMessage({
     channel: CHANNEL_VIDEO,
     senderId,
@@ -163,7 +221,7 @@ function mediaBytes(senderId: number, spatialId: number): Uint8Array {
         flags: FLAG_END_OF_FRAME | FLAG_KEY,
         spatialId,
         temporalId: 0,
-        payload: new Uint8Array(64),
+        payload: new Uint8Array(payloadBytes),
       },
     ],
   });
@@ -171,12 +229,9 @@ function mediaBytes(senderId: number, spatialId: number): Uint8Array {
   return encoded.ok ? encoded.value : new Uint8Array(0);
 }
 
-test("実行環境で購読者へメディアが転送される", { timeout: 30_000 }, async () => {
-  const subscriber = connect(2);
-  const sender = connect(1);
-  subscriber.binaryType = "arraybuffer";
-  await waitOpen(subscriber);
-  await waitOpen(sender);
+test("実行環境で購読者へメディアが転送される", { timeout: 60_000 }, async () => {
+  const subscriber = await connectReady(2);
+  const sender = await connectReady(1);
 
   subscriber.send(
     JSON.stringify({
@@ -201,12 +256,13 @@ test("実行環境で購読者へメディアが転送される", { timeout: 30_
   sender.close();
 });
 
-test("実行環境で tier を超える spatialId は転送されない", { timeout: 30_000 }, async () => {
-  const subscriber = connect(4);
-  const sender = connect(3);
-  subscriber.binaryType = "arraybuffer";
-  await waitOpen(subscriber);
-  await waitOpen(sender);
+test("実行環境で tier を超える spatialId は転送されない", { timeout: 60_000 }, async () => {
+  // 「届かないこと」を待ち時間で判定すると不確実になる。
+  // 代わりに標識を使う: tier 超過のフレームの直後に tier 内のフレームを送り、
+  // 最初に届くメッセージが後者であることを確かめる。前者が転送されていれば先に届く。
+  const room = roomFor(1);
+  const subscriber = await connectReady(4, room);
+  const sender = await connectReady(3, room);
 
   subscriber.send(
     JSON.stringify({
@@ -216,19 +272,30 @@ test("実行環境で tier を超える spatialId は転送されない", { time
   );
   await new Promise((resolve) => setTimeout(resolve, 300));
 
-  sender.send(mediaBytes(3, 3));
-  const received = await nextMessage(subscriber, 2000);
-  assert.equal(received, null, "tier 超過は届かない");
+  // tier 超過（spatialId 3、ペイロード 64 バイト）
+  const over = mediaBytes(3, 3, 64);
+  // tier 内の標識（spatialId 0、ペイロード 128 バイト）
+  const marker = mediaBytes(3, 0, 128);
+  assert.notEqual(over.length, marker.length, "長さで区別できる");
+  sender.send(over);
+  sender.send(marker);
+
+  const received = await nextMessage(subscriber, 10_000);
+  assert.ok(received instanceof ArrayBuffer, "標識が届く");
+  assert.equal(
+    received instanceof ArrayBuffer ? received.byteLength : 0,
+    marker.length,
+    "最初に届くのは tier 内のフレームである（tier 超過は転送されない）",
+  );
   subscriber.close();
   sender.close();
 });
 
-test("実行環境で形式違反のメディアは接続が閉じられる", { timeout: 30_000 }, async () => {
-  const sender = connect(5);
-  await waitOpen(sender);
+test("実行環境で形式違反のメディアは接続が閉じられる", { timeout: 60_000 }, async () => {
+  const sender = await connectReady(5, roomFor(2));
   const closed = new Promise<number>((resolve) => {
     sender.addEventListener("close", (event: CloseEvent) => resolve(event.code), { once: true });
-    setTimeout(() => resolve(-1), 5000).unref();
+    setTimeout(() => resolve(-1), 5000);
   });
   sender.send(new Uint8Array([WIRE_MAGIC ^ 0xff, 1, CHANNEL_VIDEO, 1, 0, 0, 0, 1]));
   const code = await closed;
