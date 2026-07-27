@@ -171,6 +171,11 @@ export function generateShardEvents(seed: bigint, steps: number): Result<readonl
   // 1 標本あたり 1000 マイクロ秒ずつ増やせば勾配は約 1000 となり全閾値を超える。
   const reporter = participants[0];
   if (reporter !== undefined) {
+    // 予算を極端に大きくして、予算超過による破棄をこの区間から除く。
+    // 除かないと「輻輳状態ごとの破棄条件」の誤りが予算超過の破棄に隠れ、
+    // 実装を変えても出力が変わらない（実際に priority の閾値の変異が生き残った）。
+    events.push({ t, event: { kind: "budget", bytesPerSec: 10_000_000_000 } });
+    t += 10;
     const rising: number[] = [];
     for (let i = 0; i < 20; i += 1) {
       rising.push(10000 + i * 1000);
@@ -179,7 +184,10 @@ export function generateShardEvents(seed: bigint, steps: number): Result<readonl
     // 4 回報告して NORMAL → SHEDDING_T2 → SHEDDING_T1 → SHEDDING_SPATIAL → KEY_ONLY へ昇格する。
     for (let stage = 0; stage < 4; stage += 1) {
       events.push({ t, event: { kind: "report", from: reporter, delayUs: rising } });
-      t += 600;
+      // ヒステリシス（500 ms）の内側でメディアを流す。外側にすると、メディアの処理中に
+      // さらに昇格してしまい「その状態の破棄条件」を分離して検証できない
+      // （実際に SHEDDING_T2 の閾値の変異が生き残った）。
+      t += 100;
       // 各段で 1 個ずつメディアを流し、状態ごとの破棄の違いを記録する。
       events.push({
         t,
@@ -209,7 +217,59 @@ export function generateShardEvents(seed: bigint, steps: number): Result<readonl
         },
       });
       t += 10;
+      // 破棄優先順位 2（破棄可能かつ発話者）。輻輳中の判定に priority が使われるため、
+      // 優先順位 1 と 4 だけでは閾値（SHEDDING_T2 は priority <= 3 を破棄する）を検証できない。
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: participants[1] ?? reporter,
+          ch: CHANNEL_VIDEO,
+          sid: 2,
+          tid: 2,
+          key: false,
+          bytes: 30000,
+          flags: FLAG_END_OF_FRAME | FLAG_DISCARDABLE | FLAG_ACTIVE_SPEAKER,
+        },
+      });
+      t += 10;
+      // 破棄優先順位 3（破棄可能かつ画面共有）。画面共有は別チャネルであるため、
+      // (送信者, チャネル) ごとの最大 spatialId の記録も同時に覆う。
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: participants[1] ?? reporter,
+          ch: CHANNEL_SCREEN_VIDEO,
+          sid: 1,
+          tid: 2,
+          key: false,
+          bytes: 20000,
+          flags: FLAG_END_OF_FRAME | FLAG_DISCARDABLE | FLAG_SCREEN_CONTENT,
+        },
+      });
+      t += 10;
+      // 破棄優先順位 5（破棄不可だが発話者）。破棄禁止ではないため輻輳の深い段で破棄される。
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: participants[1] ?? reporter,
+          ch: CHANNEL_VIDEO,
+          sid: 1,
+          tid: 0,
+          key: false,
+          bytes: 15000,
+          flags: FLAG_END_OF_FRAME | FLAG_ACTIVE_SPEAKER,
+        },
+      });
+      // 次の段へ進むためヒステリシスを跨ぐ。
+      t += 600;
     }
+
+    // 予算を通常値へ戻す。以降の無作為な区間では予算超過の破棄も検証したいためである。
+    events.push({ t, event: { kind: "budget", bytesPerSec: NODE_MAX_OUT_BYTES_PER_SEC } });
+    t += 10;
 
     // 回復: 勾配を負にし、送信を止めて util を下げる。
     // timer で窓をリセットし、report で回復条件（maxTrend < -0.005、KEY_ONLY は < 0）を満たす。

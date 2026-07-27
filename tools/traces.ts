@@ -63,10 +63,10 @@ function runTrace(seed: bigint, steps: number): readonly string[] {
   return lines;
 }
 
-/** 生成: 種 42 で 300 ステップのトレースを生成し保存する。 */
+/** 生成: 種 42 で 900 ステップのトレースを生成し保存する。 */
 async function generate(): Promise<void> {
   const seed = 42n;
-  const steps = 300;
+  const steps = 900;
   const lines = runTrace(seed, steps);
   if (lines.length === 0) {
     process.exitCode = 2;
@@ -112,7 +112,7 @@ async function check(): Promise<void> {
 
   // 凍結ベクタの in 行数から steps を推定する（ただし generate と同じ種なので同じ結果になる）
   // 再生成して行単位で比較する
-  const regenerated = runTrace(BigInt(seed), 300);
+  const regenerated = runTrace(BigInt(seed), 900);
 
   let mismatches = 0;
   const maxLines = Math.max(frozenLines.length, regenerated.length);
