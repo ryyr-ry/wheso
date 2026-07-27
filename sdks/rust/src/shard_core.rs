@@ -150,9 +150,18 @@ const NODE_OVERLOADED_CLOSE_CODE: i64 = 4032;
 
 pub fn step(state: &ShardState, event: &ShardEvent, t: i64) -> StepResult {
     match event {
-        ShardEvent::Media { from, ch, sid, tid, key, bytes, flags } => {
-            handle_media(state, *from, *ch, *sid, *tid, *key, *bytes, *flags, t)
-        }
+        ShardEvent::Media { from, ch, sid, tid, key: _, bytes, flags } => handle_media(
+            state,
+            &MediaUnit {
+                from: *from,
+                ch: *ch,
+                sid: *sid,
+                tid: *tid,
+                bytes: *bytes,
+                flags: *flags,
+            },
+            t,
+        ),
         ShardEvent::Subscribe { from, to, want, max_spatial_id } => {
             handle_subscribe(state, *from, *to, *want, *max_spatial_id)
         }
@@ -177,18 +186,18 @@ pub fn step(state: &ShardState, event: &ShardEvent, t: i64) -> StepResult {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_media(
-    state: &ShardState,
+/// メディアの 1 ユニット。引数を並べずに束ねる（検査の抑制を使わないため）。
+struct MediaUnit {
     from: i64,
     ch: i64,
     sid: i64,
     tid: i64,
-    _key: bool,
     bytes: i64,
     flags: i64,
-    t: i64,
-) -> StepResult {
+}
+
+fn handle_media(state: &ShardState, unit: &MediaUnit, t: i64) -> StepResult {
+    let MediaUnit { from, ch, sid, tid, bytes, flags } = *unit;
     let mut next = update_max_spatial(&maybe_reset_window(state, t), from, ch, sid);
     let priority = drop_priority(ch as u8, flags as u8).map(i64::from);
 
