@@ -432,12 +432,15 @@ final class TraceTests: XCTestCase {
 
         var state = whesoInitialReceiverState(initialReceiverBudget)
         var pending: JsonValue?
+        var pendingT: Int64 = 0
         var checked = 0
 
         for line in lines.dropFirst() {
             let row = try parse(line)
             if let input = row.field("in") {
                 pending = input
+                // 入力行の時刻。AIMD の待ち（RATE_HOLD_MS）の判定に使う。
+                pendingT = row.field("t")?.asInteger ?? 0
                 continue
             }
             guard let expected = row.field("out")?.asArray else {
@@ -452,7 +455,7 @@ final class TraceTests: XCTestCase {
                 XCTFail("入力を解釈できない: \(input)")
                 return
             }
-            let result = whesoReceiverStep(state, event)
+            let result = whesoReceiverStep(state, event, pendingT)
             state = result.state
             let actual = result.commands.map(toJson)
             XCTAssertEqual(actual, expected, "入力 \(input) に対する出力が一致する")

@@ -158,6 +158,8 @@ void main() {
 
     var state = initialReceiverState(initialBudgetBytesPerSec);
     Map<String, Object?>? pending;
+    // 入力行の時刻。AIMD の待ち（RATE_HOLD_MS）の判定に使う。
+    int pendingT = 0;
     var checked = 0;
 
     for (final line in lines.skip(1)) {
@@ -165,6 +167,8 @@ void main() {
       final input = row['in'];
       if (input != null) {
         pending = readMap(input, 'in');
+        final rawT = row['t'];
+        pendingT = rawT is int ? rawT : 0;
         continue;
       }
       final out = row['out'];
@@ -177,7 +181,7 @@ void main() {
         throw StateError('出力に対応する入力が無い');
       }
       pending = null;
-      final result = receiverStep(state, toEvent(event));
+      final result = receiverStep(state, toEvent(event), pendingT);
       state = result.state;
       final actual = result.commands.map(toJson).toList();
       expect(jsonEncode(actual), equals(jsonEncode(expected)),

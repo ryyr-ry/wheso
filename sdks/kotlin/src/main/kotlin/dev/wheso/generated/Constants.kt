@@ -102,6 +102,7 @@ public val ACK_TIMEOUT_MS: Long = 5000L
 public val UPLINK_BACKLOG_BYTES: Long = 100000L
 public val RATE_HOLD_MS: Long = 1000L
 public val RATE_PROBE_BPS: Long = 200000L
+public val RATE_RECOVER_STREAK: Long = 3L
 public val RATE_DECREASE_FACTOR: Double = 0.85
 public val LATE_FRAME_TOLERANCE_MS: Long = 33L
 public val MIN_VIABLE_BPS: Long = 232000L

@@ -102,6 +102,7 @@ public enum WhesoConstants {
     public static let UPLINK_BACKLOG_BYTES: Int64 = 100000
     public static let RATE_HOLD_MS: Int64 = 1000
     public static let RATE_PROBE_BPS: Int64 = 200000
+    public static let RATE_RECOVER_STREAK: Int64 = 3
     public static let RATE_DECREASE_FACTOR: Double = 0.85
     public static let LATE_FRAME_TOLERANCE_MS: Int64 = 33
     public static let MIN_VIABLE_BPS: Int64 = 232000

@@ -138,6 +138,8 @@ fn frozen_receiver_trace_matches_typescript_reference() {
 
     let mut state = initial_receiver_state(INITIAL_BUDGET_BYTES_PER_SEC);
     let mut pending: Option<ReceiverEvent> = None;
+    // 入力行の時刻。AIMD の待ち（RATE_HOLD_MS）の判定に使う。
+    let mut pending_t: i64 = 0;
     let mut checked = 0_usize;
 
     for (index, line) in lines.enumerate() {
@@ -150,6 +152,7 @@ fn frozen_receiver_trace_matches_typescript_reference() {
         };
         if let Some(input) = row.get("in") {
             pending = to_event(input);
+            pending_t = row.get("t").and_then(Value::as_i64).unwrap_or(0);
             assert!(pending.is_some(), "{}行目の入力を解釈できる: {input}", index + 2);
             continue;
         }
@@ -161,7 +164,7 @@ fn frozen_receiver_trace_matches_typescript_reference() {
             Some(value) => value,
             None => panic!("{}行目に対応する入力が無い", index + 2),
         };
-        let result = receiver_step(&state, &event);
+        let result = receiver_step(&state, &event, pending_t);
         state = result.state;
         let actual: Vec<Value> = result.commands.iter().map(to_json).collect();
         assert_eq!(

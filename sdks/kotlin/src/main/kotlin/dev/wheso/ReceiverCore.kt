@@ -9,6 +9,9 @@
 package dev.wheso
 
 import dev.wheso.generated.DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID
+import dev.wheso.generated.RATE_HOLD_MS
+import dev.wheso.generated.RATE_PROBE_BPS
+import dev.wheso.generated.RATE_RECOVER_STREAK
 import dev.wheso.generated.SHARD_TREND_ENTER_T2_DEN
 import dev.wheso.generated.SHARD_TREND_ENTER_T2_NUM
 import dev.wheso.generated.SHARD_TREND_EXIT_DEN
@@ -59,6 +62,12 @@ public data class ReceiverState(
     val unexpectedEvents: List<String>,
     /** senderId, channel, spatialId の昇順で保持する。 */
     val received: List<ReceivedMark>,
+    /** 次に減少の判定を行える時刻（AIMD。congestion 4.2）。 */
+    val rateHoldUntilMs: Long,
+    /** 回復判定が連続した回数。規範は 3 回連続で加算的増加を許す。 */
+    val recoverStreak: Long,
+    /** 目標ビットレートの上限（bytes/sec）。加算的増加はこれを超えない。 */
+    val targetCeilingBytesPerSec: Long,
 )
 
 public data class SubscribeEntry(
@@ -136,17 +145,21 @@ public fun initialReceiverState(targetBytesPerSec: Long): ReceiverState = Receiv
     degraded = false,
     unexpectedEvents = emptyList(),
     received = emptyList(),
+    rateHoldUntilMs = 0L,
+    recoverStreak = 0L,
+    // 初めに与えられた値が上限である。回復してもこれを超えて要求しない。
+    targetCeilingBytesPerSec = targetBytesPerSec,
 )
 
-/** 純関数の状態遷移。 */
-public fun receiverStep(state: ReceiverState, event: ReceiverEvent): ReceiverStepResult = when (event) {
+/** 純関数の状態遷移。時刻は AIMD の待ち（RATE_HOLD_MS）に使う。 */
+public fun receiverStep(state: ReceiverState, event: ReceiverEvent, t: Long = 0L): ReceiverStepResult = when (event) {
     is ReceiverEvent.SubscribeList -> handleSubscribeList(state, event.entries)
     is ReceiverEvent.Leave -> handleLeave(state, event.id)
     is ReceiverEvent.Visibility -> handleVisibility(state, event.visible)
     is ReceiverEvent.Budget -> reallocate(state.copy(targetBytesPerSec = event.bytesPerSec))
     is ReceiverEvent.ActiveSpeaker -> reallocate(state.copy(activeSpeakerId = event.id))
     is ReceiverEvent.DisplaySize -> handleDisplaySize(state, event.senderId, event.channel, event.width)
-    is ReceiverEvent.Report -> handleReport(state, event.delayUs)
+    is ReceiverEvent.Report -> handleReport(state, event.delayUs, t)
     is ReceiverEvent.Media -> handleMedia(state, event)
     // ACK_INTERVAL_MS ごとに、受信済みの位置を ack として返す。
     // 呼び出し側が周期を管理する（コアは時刻を持たない）。
@@ -291,13 +304,57 @@ private fun handleDisplaySize(
 }
 
 /** 測定報告。勾配が劣化閾値を超えたら tier を 1 段下げ、回復閾値を下回ったら 1 段上げる。 */
-private fun handleReport(state: ReceiverState, delayUs: List<Long>): ReceiverStepResult {
+/**
+ * 測定報告。規範は 2 つの層を定めている。
+ *
+ * 1. 状態機械（state-machines 3 節）: 勾配が閾値を超えたら tier を 1 段下げる
+ * 2. 輻輳制御（congestion 4.2 の AIMD）: target を劣化時に 0.85 倍し、回復が 3 回
+ *    連続したら RATE_PROBE_BPS を加える（上限を超えない）
+ *
+ * 0.85 は浮動小数点で計算しない。target * 17 / 20 の整数演算とし切り捨てる。
+ */
+private fun handleReport(state: ReceiverState, delayUs: List<Long>, t: Long): ReceiverStepResult {
     val trend = delaySlope(delayUs)
     val degrading = trend.numerator * SHARD_TREND_ENTER_T2_DEN >
         SHARD_TREND_ENTER_T2_NUM * trend.denominator
     val recovering = trend.numerator * SHARD_TREND_EXIT_DEN < SHARD_TREND_EXIT_NUM * trend.denominator
+
+    // --- AIMD。target を更新する ---
+    var target = state.targetBytesPerSec
+    var holdUntil = state.rateHoldUntilMs
+    var streak = state.recoverStreak
+    if (degrading) {
+        streak = 0L
+        // 待ちの間は減らさない。1 回の揺れで連続して落とさないためである。
+        if (t >= state.rateHoldUntilMs) {
+            val reduced = truncDiv(target * 17L, 20L)
+            if (reduced is Outcome.Ok) {
+                target = reduced.value
+            }
+            holdUntil = t + RATE_HOLD_MS
+        }
+    } else if (recovering) {
+        streak = state.recoverStreak + 1L
+        if (streak >= RATE_RECOVER_STREAK) {
+            val increment = truncDiv(RATE_PROBE_BPS, 8L)
+            val raised = target + if (increment is Outcome.Ok) increment.value else 0L
+            target = if (raised > state.targetCeilingBytesPerSec) state.targetCeilingBytesPerSec else raised
+            streak = 0L
+        }
+    } else {
+        streak = 0L
+    }
+
     if (!degrading && !recovering) {
-        return ReceiverStepResult(state.copy(trend = trend), emptyList())
+        return ReceiverStepResult(
+            state.copy(
+                trend = trend,
+                targetBytesPerSec = target,
+                rateHoldUntilMs = holdUntil,
+                recoverStreak = streak,
+            ),
+            emptyList(),
+        )
     }
     val delta = if (degrading) -1L else 1L
     val commands = mutableListOf<ReceiverCommand>()
@@ -319,7 +376,16 @@ private fun handleReport(state: ReceiverState, delayUs: List<Long>): ReceiverSte
             commands.add(ReceiverCommand.KeyframeRequest(stream.senderId, stream.channel, nextSpatial))
         }
     }
-    return ReceiverStepResult(state.copy(trend = trend, streams = streams), commands)
+    return ReceiverStepResult(
+        state.copy(
+            trend = trend,
+            streams = streams,
+            targetBytesPerSec = target,
+            rateHoldUntilMs = holdUntil,
+            recoverStreak = streak,
+        ),
+        commands,
+    )
 }
 
 /** メディアの転送。要求 tier を超えるユニットは転送しない。 */

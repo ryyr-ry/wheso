@@ -101,6 +101,7 @@ const int ACK_TIMEOUT_MS = 5000;
 const int UPLINK_BACKLOG_BYTES = 100000;
 const int RATE_HOLD_MS = 1000;
 const int RATE_PROBE_BPS = 200000;
+const int RATE_RECOVER_STREAK = 3;
 const double RATE_DECREASE_FACTOR = 0.85;
 const int LATE_FRAME_TOLERANCE_MS = 33;
 const int MIN_VIABLE_BPS = 232000;

@@ -52,6 +52,12 @@ public struct WhesoReceiverState: Equatable {
     public var unexpectedEvents: [String]
     /// senderId, channel, spatialId の昇順で保持する。
     public var received: [WhesoReceivedMark]
+    /// 次に減少の判定を行える時刻（AIMD。congestion 4.2）。
+    public var rateHoldUntilMs: Int64
+    /// 回復判定が連続した回数。規範は 3 回連続で加算的増加を許す。
+    public var recoverStreak: Int64
+    /// 目標ビットレートの上限（bytes/sec）。加算的増加はこれを超えない。
+    public var targetCeilingBytesPerSec: Int64
 }
 
 public struct WhesoSubscribeEntry: Equatable {
@@ -106,14 +112,20 @@ public func whesoInitialReceiverState(_ targetBytesPerSec: Int64) -> WhesoReceiv
         trend: WhesoSlope(numerator: 0, denominator: 1),
         degraded: false,
         unexpectedEvents: [],
-        received: []
+        received: [],
+        rateHoldUntilMs: 0,
+        recoverStreak: 0,
+        // 初めに与えられた値が上限である。回復してもこれを超えて要求しない。
+        targetCeilingBytesPerSec: targetBytesPerSec
     )
 }
 
 /// 純関数の状態遷移。
+/// 純関数の状態遷移。時刻は AIMD の待ち（RATE_HOLD_MS）に使う。
 public func whesoReceiverStep(
     _ state: WhesoReceiverState,
-    _ event: WhesoReceiverEvent
+    _ event: WhesoReceiverEvent,
+    _ t: Int64 = 0
 ) -> WhesoReceiverStepResult {
     switch event {
     case .subscribeList(let entries):
@@ -133,7 +145,7 @@ public func whesoReceiverStep(
     case .displaySize(let senderId, let channel, let width):
         return handleDisplaySize(state, senderId: senderId, channel: channel, width: width)
     case .report(let delayUs):
-        return handleReport(state, delayUs)
+        return handleReport(state, delayUs, t)
     case .media(let from, let ch, let sid, let tid, let seq):
         return handleMedia(state, from: from, ch: ch, sid: sid, tid: tid, seq: seq)
     case .timer:
@@ -315,15 +327,58 @@ private func handleDisplaySize(
 }
 
 /// 測定報告。勾配が劣化閾値を超えたら tier を 1 段下げ、回復閾値を下回ったら 1 段上げる。
-private func handleReport(_ state: WhesoReceiverState, _ delayUs: [Int64]) -> WhesoReceiverStepResult {
+/// 測定報告。規範は 2 つの層を定めている。
+///
+/// 1. 状態機械（state-machines 3 節）: 勾配が閾値を超えたら tier を 1 段下げる
+/// 2. 輻輳制御（congestion 4.2 の AIMD）: target を劣化時に 0.85 倍し、回復が 3 回
+///    連続したら RATE_PROBE_BPS を加える（上限を超えない）
+///
+/// 0.85 は浮動小数点で計算しない。target * 17 / 20 の整数演算とし切り捨てる。
+private func handleReport(
+    _ state: WhesoReceiverState,
+    _ delayUs: [Int64],
+    _ t: Int64
+) -> WhesoReceiverStepResult {
     let trend = whesoDelaySlope(delayUs)
     let degrading = trend.numerator * WhesoConstants.SHARD_TREND_ENTER_T2_DEN
         > WhesoConstants.SHARD_TREND_ENTER_T2_NUM * trend.denominator
     let recovering = trend.numerator * WhesoConstants.SHARD_TREND_EXIT_DEN
         < WhesoConstants.SHARD_TREND_EXIT_NUM * trend.denominator
+
+    // --- AIMD。target を更新する ---
+    var target = state.targetBytesPerSec
+    var holdUntil = state.rateHoldUntilMs
+    var streak = state.recoverStreak
+    if degrading {
+        streak = 0
+        // 待ちの間は減らさない。1 回の揺れで連続して落とさないためである。
+        if t >= state.rateHoldUntilMs {
+            if case .success(let value) = whesoTruncDiv(target * 17, 20) {
+                target = value
+            }
+            holdUntil = t + WhesoConstants.RATE_HOLD_MS
+        }
+    } else if recovering {
+        streak = state.recoverStreak + 1
+        if streak >= WhesoConstants.RATE_RECOVER_STREAK {
+            var increment: Int64 = 0
+            if case .success(let value) = whesoTruncDiv(WhesoConstants.RATE_PROBE_BPS, 8) {
+                increment = value
+            }
+            let raised = target + increment
+            target = raised > state.targetCeilingBytesPerSec ? state.targetCeilingBytesPerSec : raised
+            streak = 0
+        }
+    } else {
+        streak = 0
+    }
+
     if !degrading && !recovering {
         var next = state
         next.trend = trend
+        next.targetBytesPerSec = target
+        next.rateHoldUntilMs = holdUntil
+        next.recoverStreak = streak
         return WhesoReceiverStepResult(state: next, commands: [])
     }
     let delta: Int64 = degrading ? -1 : 1
@@ -355,6 +410,9 @@ private func handleReport(_ state: WhesoReceiverState, _ delayUs: [Int64]) -> Wh
     var next = state
     next.trend = trend
     next.streams = streams
+    next.targetBytesPerSec = target
+    next.rateHoldUntilMs = holdUntil
+    next.recoverStreak = streak
     return WhesoReceiverStepResult(state: next, commands: commands)
 }
 

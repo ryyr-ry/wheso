@@ -106,6 +106,7 @@ inline constexpr std::int64_t ACK_TIMEOUT_MS = 5000;
 inline constexpr std::int64_t UPLINK_BACKLOG_BYTES = 100000;
 inline constexpr std::int64_t RATE_HOLD_MS = 1000;
 inline constexpr std::int64_t RATE_PROBE_BPS = 200000;
+inline constexpr std::int64_t RATE_RECOVER_STREAK = 3;
 inline constexpr double RATE_DECREASE_FACTOR = 0.85;
 inline constexpr std::int64_t LATE_FRAME_TOLERANCE_MS = 33;
 inline constexpr std::int64_t MIN_VIABLE_BPS = 232000;

@@ -102,6 +102,7 @@ pub const ACK_TIMEOUT_MS: i64 = 5000;
 pub const UPLINK_BACKLOG_BYTES: i64 = 100000;
 pub const RATE_HOLD_MS: i64 = 1000;
 pub const RATE_PROBE_BPS: i64 = 200000;
+pub const RATE_RECOVER_STREAK: i64 = 3;
 pub const RATE_DECREASE_FACTOR: f64 = 0.85;
 pub const LATE_FRAME_TOLERANCE_MS: i64 = 33;
 pub const MIN_VIABLE_BPS: i64 = 232000;

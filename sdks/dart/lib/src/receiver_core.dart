@@ -80,6 +80,9 @@ class ReceiverState {
     required this.degraded,
     required this.unexpectedEvents,
     required this.received,
+    required this.rateHoldUntilMs,
+    required this.recoverStreak,
+    required this.targetCeilingBytesPerSec,
   });
 
   /// senderId, channel の昇順で保持する。反復順序が判断に影響するため決定的にする。
@@ -94,6 +97,15 @@ class ReceiverState {
   /// senderId, channel, spatialId の昇順で保持する。
   final List<ReceivedMark> received;
 
+  /// 次に減少の判定を行える時刻（AIMD。congestion 4.2）。
+  final int rateHoldUntilMs;
+
+  /// 回復判定が連続した回数。規範は 3 回連続で加算的増加を許す。
+  final int recoverStreak;
+
+  /// 目標ビットレートの上限（bytes/sec）。加算的増加はこれを超えない。
+  final int targetCeilingBytesPerSec;
+
   ReceiverState copyWith({
     List<StreamState>? streams,
     bool? visible,
@@ -104,6 +116,9 @@ class ReceiverState {
     bool? degraded,
     List<String>? unexpectedEvents,
     List<ReceivedMark>? received,
+    int? rateHoldUntilMs,
+    int? recoverStreak,
+    int? targetCeilingBytesPerSec,
   }) {
     return ReceiverState(
       streams: streams ?? List.of(this.streams),
@@ -115,6 +130,9 @@ class ReceiverState {
       degraded: degraded ?? this.degraded,
       unexpectedEvents: unexpectedEvents ?? List.of(this.unexpectedEvents),
       received: received ?? List.of(this.received),
+      rateHoldUntilMs: rateHoldUntilMs ?? this.rateHoldUntilMs,
+      recoverStreak: recoverStreak ?? this.recoverStreak,
+      targetCeilingBytesPerSec: targetCeilingBytesPerSec ?? this.targetCeilingBytesPerSec,
     );
   }
 }
@@ -274,11 +292,16 @@ ReceiverState initialReceiverState(int targetBytesPerSec) {
     degraded: false,
     unexpectedEvents: <String>[],
     received: <ReceivedMark>[],
+    rateHoldUntilMs: 0,
+    recoverStreak: 0,
+    // 初めに与えられた値が上限である。回復してもこれを超えて要求しない。
+    targetCeilingBytesPerSec: targetBytesPerSec,
   );
 }
 
 /// 純関数の状態遷移。
-ReceiverStepResult receiverStep(ReceiverState state, ReceiverEvent event) {
+/// 純関数の状態遷移。時刻は AIMD の待ち（RATE_HOLD_MS）に使う。
+ReceiverStepResult receiverStep(ReceiverState state, ReceiverEvent event, [int t = 0]) {
   switch (event) {
     case SubscribeListEvent():
       return _handleSubscribe(state, event.entries);
@@ -296,7 +319,7 @@ ReceiverStepResult receiverStep(ReceiverState state, ReceiverEvent event) {
     case DisplaySizeEvent():
       return _handleDisplaySize(state, event.senderId, event.channel, event.width);
     case ReportEvent():
-      return _handleReport(state, event.delayUs);
+      return _handleReport(state, event.delayUs, t);
     case MediaEvent():
       return _handleMedia(state, event);
     case TimerEvent():
@@ -484,15 +507,59 @@ ReceiverStepResult _handleDisplaySize(ReceiverState state, int senderId, int cha
   return _reallocate(state.copyWith(streams: streams));
 }
 
-/// 測定報告。勾配が劣化閾値を超えたら tier を 1 段下げ、回復閾値を下回ったら 1 段上げる。
-ReceiverStepResult _handleReport(ReceiverState state, List<int> delayUs) {
+/// 測定報告。規範は 2 つの層を定めている。
+///
+/// 1. 状態機械（state-machines 3 節）: 勾配が劣化閾値を超えたら tier を 1 段下げ、
+///    回復閾値を下回ったら 1 段上げる
+/// 2. 輻輳制御（congestion 4.2 の AIMD）: target を劣化時に 0.85 倍し、回復が 3 回
+///    連続したら RATE_PROBE_BPS を加える（上限を超えない）
+///
+/// 0.85 は浮動小数点で計算しない。target * 17 / 20 の整数演算とし切り捨てる。
+ReceiverStepResult _handleReport(ReceiverState state, List<int> delayUs, int t) {
   final trend = delaySlope(delayUs);
   final degrading = trend.numerator * constants.SHARD_TREND_ENTER_T2_DEN >
       constants.SHARD_TREND_ENTER_T2_NUM * trend.denominator;
   final recovering = trend.numerator * constants.SHARD_TREND_EXIT_DEN <
       constants.SHARD_TREND_EXIT_NUM * trend.denominator;
+
+  // --- AIMD。target を更新する ---
+  int target = state.targetBytesPerSec;
+  int holdUntil = state.rateHoldUntilMs;
+  int streak = state.recoverStreak;
+  if (degrading) {
+    streak = 0;
+    // 待ちの間は減らさない。1 回の揺れで連続して落とさないためである。
+    if (t >= state.rateHoldUntilMs) {
+      final reduced = truncDiv(target * 17, 20);
+      final reducedValue = reduced.value;
+      if (reduced.isOk && reducedValue != null) {
+        target = reducedValue;
+      }
+      holdUntil = t + constants.RATE_HOLD_MS;
+    }
+  } else if (recovering) {
+    streak = state.recoverStreak + 1;
+    if (streak >= constants.RATE_RECOVER_STREAK) {
+      final increment = truncDiv(constants.RATE_PROBE_BPS, 8);
+      final incrementValue = increment.value;
+      final raised = target + (increment.isOk && incrementValue != null ? incrementValue : 0);
+      target = raised > state.targetCeilingBytesPerSec ? state.targetCeilingBytesPerSec : raised;
+      streak = 0;
+    }
+  } else {
+    streak = 0;
+  }
+
   if (!degrading && !recovering) {
-    return ReceiverStepResult(state: state.copyWith(trend: trend), commands: <ReceiverCommand>[]);
+    return ReceiverStepResult(
+      state: state.copyWith(
+        trend: trend,
+        targetBytesPerSec: target,
+        rateHoldUntilMs: holdUntil,
+        recoverStreak: streak,
+      ),
+      commands: <ReceiverCommand>[],
+    );
   }
   final delta = degrading ? -1 : 1;
   final commands = <ReceiverCommand>[];
@@ -519,7 +586,13 @@ ReceiverStepResult _handleReport(ReceiverState state, List<int> delayUs) {
     }
   }
   return ReceiverStepResult(
-    state: state.copyWith(trend: trend, streams: streams),
+    state: state.copyWith(
+      trend: trend,
+      streams: streams,
+      targetBytesPerSec: target,
+      rateHoldUntilMs: holdUntil,
+      recoverStreak: streak,
+    ),
     commands: commands,
   );
 }

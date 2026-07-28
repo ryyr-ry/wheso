@@ -9,6 +9,9 @@
  */
 
 import {
+  RATE_HOLD_MS,
+  RATE_PROBE_BPS,
+  RATE_RECOVER_STREAK,
   V_360P15,
   V_4K60,
   DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID,
@@ -52,6 +55,21 @@ export interface ReceiverState {
   readonly trend: Slope;
   /** 品質が最低保証を下回っているか。W_DEGRADED の通知に使う。 */
   readonly degraded: boolean;
+  /**
+   * 次に減少の判定を行える時刻（AIMD。congestion.md 4.2）。
+   * 劣化で減らした直後は RATE_HOLD_MS 待つ。待たないと 1 回の揺れで連続して落ちる。
+   */
+  readonly rateHoldUntilMs: number;
+  /**
+   * 回復判定が連続した回数。規範は「3 回連続」で加算的増加を許す。
+   * 1 回の回復で増やすと、利用可能帯域の境界で振動する。
+   */
+  readonly recoverStreak: number;
+  /**
+   * 目標ビットレートの上限（bytes/sec）。加算的増加はこれを超えない
+   * （規範: 現在のプロファイルの目標ビットレートを超えない）。
+   */
+  readonly targetCeilingBytesPerSec: number;
   /** 表に無いイベントの記録。 */
   readonly unexpectedEvents: readonly string[];
   /**
@@ -130,13 +148,23 @@ export function initialReceiverState(targetBytesPerSec: number): ReceiverState {
     activeSpeakerId: null,
     trend: { numerator: 0, denominator: 1 },
     degraded: false,
+    rateHoldUntilMs: 0,
+    recoverStreak: 0,
+    // 初めに与えられた値が上限である。回復してもこれを超えて要求しない。
+    targetCeilingBytesPerSec: targetBytesPerSec,
     unexpectedEvents: [],
     received: [],
   };
 }
 
 /** 純関数の状態遷移。 */
-export function receiverStep(state: ReceiverState, event: ReceiverEvent): ReceiverStepResult {
+/**
+ * 純関数の状態遷移。
+ *
+ * 時刻を引数で受ける理由: AIMD の減少には RATE_HOLD_MS の待ちがある（congestion.md 4.2）。
+ * コアは時計を持たないため、呼び出し側が観測した時刻を渡す（中継ノードの step と同じ形）。
+ */
+export function receiverStep(state: ReceiverState, event: ReceiverEvent, t = 0): ReceiverStepResult {
   switch (event.kind) {
     case "subscribe":
       return handleSubscribe(state, event.entries);
@@ -151,7 +179,7 @@ export function receiverStep(state: ReceiverState, event: ReceiverEvent): Receiv
     case "displaySize":
       return handleDisplaySize(state, event.senderId, event.channel, event.width);
     case "report":
-      return handleReport(state, event.delayUs);
+      return handleReport(state, event.delayUs, t);
     case "media":
       return handleMedia(state, event);
     case "timer":
@@ -306,22 +334,79 @@ function handleDisplaySize(
  * 測定報告。勾配が劣化閾値を超えたら tier を 1 段下げ、回復閾値を下回ったら 1 段上げる
  * （constants.md 6 節）。比較は整数の交差乗算で行う。
  */
-function handleReport(state: ReceiverState, delayUs: readonly number[]): ReceiverStepResult {
+/**
+ * 遅延の報告に対する応答。**規範は 2 つの層を定めている。**
+ *
+ * 1. 状態機械（state-machines.md 3 節）: 遅延勾配が閾値を超えたら **tier を 1 段下げる**。
+ *    回復したら 1 段上げる。これは即応の制御である。
+ * 2. 輻輳制御（congestion.md 4.2 の AIMD）: **target（帯域目標）**を劣化時に 0.85 倍し、
+ *    回復が 3 回連続したら RATE_PROBE_BPS を加える。これは目標値の収束である。
+ *
+ * 両方を行う。tier は即応、target は収束であり、役割が違う。
+ * target から tier を配分し直すのは budget イベント（外から目標が与えられたとき）に限る。
+ * report で両方が tier を動かすと、どちらが効いたのか説明できなくなる。
+ *
+ * 0.85 は浮動小数点で計算しない。`target × 17 / 20` の整数演算とし、除算は切り捨てる
+ * （congestion.md 4.1.1、ADR-0017）。9 言語で同じ値を出す必要がある。
+ */
+function handleReport(
+  state: ReceiverState,
+  delayUs: readonly number[],
+  t: number,
+): ReceiverStepResult {
   const trend = delaySlope(delayUs);
   const degrading = trend.numerator * SHARD_TREND_ENTER_T2_DEN > SHARD_TREND_ENTER_T2_NUM * trend.denominator;
   const recovering = trend.numerator * SHARD_TREND_EXIT_DEN < SHARD_TREND_EXIT_NUM * trend.denominator;
-  if (!degrading && !recovering) {
-    return { state: { ...state, trend }, commands: [] };
+
+  // --- AIMD（congestion.md 4.2）。target を更新する ---
+  let target = state.targetBytesPerSec;
+  let holdUntil = state.rateHoldUntilMs;
+  let streak = state.recoverStreak;
+  if (degrading) {
+    streak = 0;
+    // 待ちの間は減らさない。1 回の揺れで連続して落とさないためである。
+    if (t >= state.rateHoldUntilMs) {
+      const reduced = truncDiv(target * 17, 20);
+      target = reduced.ok ? reduced.value : target;
+      holdUntil = t + RATE_HOLD_MS;
+    }
+  } else if (recovering) {
+    streak = state.recoverStreak + 1;
+    if (streak >= RATE_RECOVER_STREAK) {
+      const probeBytes = truncDiv(RATE_PROBE_BPS, 8);
+      const raised = target + (probeBytes.ok ? probeBytes.value : 0);
+      // 上限（初めに与えられた目標）を超えない。
+      target = raised > state.targetCeilingBytesPerSec ? state.targetCeilingBytesPerSec : raised;
+      streak = 0;
+    }
+  } else {
+    // 増減の条件を満たさない。連続回数を切る（間に非回復が入れば数え直す）。
+    streak = 0;
   }
+
+  const afterRate: ReceiverState = {
+    ...state,
+    trend,
+    targetBytesPerSec: target,
+    rateHoldUntilMs: holdUntil,
+    recoverStreak: streak,
+  };
+
+  if (!degrading && !recovering) {
+    return { state: afterRate, commands: [] };
+  }
+
+  // --- 状態機械（state-machines.md 3 節）。tier を 1 段動かす ---
   const delta = degrading ? -1 : 1;
   const commands: ReceiverCommand[] = [];
   const streams: StreamState[] = [];
-  for (const stream of state.streams) {
+  for (const stream of afterRate.streams) {
     if (stream.phase !== "SUBSCRIBED") {
       streams.push(stream);
       continue;
     }
-    const nextSpatial = clampSpatial(stream.spatialId + delta);
+    const raw = stream.spatialId + delta;
+    const nextSpatial = raw < 0 ? 0 : raw > V_4K60.spatialId ? V_4K60.spatialId : raw;
     if (nextSpatial === stream.spatialId) {
       streams.push(stream);
       continue;
@@ -338,7 +423,7 @@ function handleReport(state: ReceiverState, delayUs: readonly number[]): Receive
       });
     }
   }
-  return { state: { ...state, trend, streams }, commands };
+  return { state: { ...afterRate, streams }, commands };
 }
 
 /** メディアの転送。要求 tier を超えるユニットは転送しない。 */
@@ -488,14 +573,4 @@ function findStream(state: ReceiverState, senderId: number, channel: number): St
   return state.streams.find((stream) => stream.senderId === senderId && stream.channel === channel);
 }
 
-/** spatialId の範囲は最低品質から最高品質までである。 */
-function clampSpatial(value: number): number {
-  if (value < V_360P15.spatialId) {
-    return V_360P15.spatialId;
-  }
-  if (value > V_4K60.spatialId) {
-    return V_4K60.spatialId;
-  }
-  return value;
-}
 

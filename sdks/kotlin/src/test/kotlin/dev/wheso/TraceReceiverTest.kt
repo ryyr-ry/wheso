@@ -146,6 +146,8 @@ class TraceReceiverTest {
 
         var state = initialReceiverState(initialBudgetBytesPerSec)
         var pending: JsonObject? = null
+        // 入力行の時刻。AIMD の待ち（RATE_HOLD_MS）の判定に使う。
+        var pendingT = 0L
         var checked = 0
 
         for (line in lines.drop(1)) {
@@ -153,12 +155,13 @@ class TraceReceiverTest {
             val input = row["in"]
             if (input != null) {
                 pending = input.jsonObject
+                pendingT = row["t"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
                 continue
             }
             val out = row["out"] ?: continue
             val event = pending ?: error("出力に対応する入力が無い")
             pending = null
-            val result = receiverStep(state, toEvent(event))
+            val result = receiverStep(state, toEvent(event), pendingT)
             state = result.state
             val actual = buildJsonArray { result.commands.forEach { add(toJson(it)) } }
             assertEquals(

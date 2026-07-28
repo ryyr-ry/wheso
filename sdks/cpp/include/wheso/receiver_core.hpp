@@ -56,6 +56,12 @@ struct State {
   std::optional<std::int64_t> active_speaker_id;
   Slope trend{0, 1};
   bool degraded = false;
+  /// 次に減少の判定を行える時刻（AIMD。congestion 4.2）。
+  std::int64_t rate_hold_until_ms = 0;
+  /// 回復判定が連続した回数。規範は 3 回連続で加算的増加を許す。
+  std::int64_t recover_streak = 0;
+  /// 目標ビットレートの上限（bytes/sec）。加算的増加はこれを超えない。
+  std::int64_t target_ceiling_bytes_per_sec = 0;
   std::vector<std::string> unexpected_events;
   /// sender_id, channel, spatial_id の昇順で保持する。
   std::vector<ReceivedMark> received;
@@ -128,6 +134,8 @@ inline State initial_state(std::int64_t target_bytes_per_sec) {
   State state;
   state.visible = true;
   state.target_bytes_per_sec = target_bytes_per_sec;
+  // 初めに与えられた値が上限である。回復してもこれを超えて要求しない。
+  state.target_ceiling_bytes_per_sec = target_bytes_per_sec;
   state.trend = Slope{0, 1};
   return state;
 }
@@ -422,16 +430,54 @@ inline StepResult handle_display_size(const State& state, std::int64_t sender_id
 }
 
 /// 測定報告。勾配が劣化閾値を超えたら tier を 1 段下げ、回復閾値を下回ったら 1 段上げる。
-inline StepResult handle_report(const State& state, const std::vector<std::int64_t>& delay_us) {
+/// 遅延の報告に対する応答。規範は 2 つの層を定めている。
+///
+/// 1. 状態機械（state-machines 3 節）: 遅延勾配が閾値を超えたら tier を 1 段下げる
+/// 2. 輻輳制御（congestion 4.2 の AIMD）: target を劣化時に 0.85 倍し、回復が 3 回
+///    連続したら RATE_PROBE_BPS を加える（上限を超えない）
+///
+/// 0.85 は浮動小数点で計算しない。target * 17 / 20 の整数演算とし切り捨てる。
+inline StepResult handle_report(const State& state, const std::vector<std::int64_t>& delay_us,
+                               std::int64_t t) {
   const Slope trend = delay_slope(delay_us);
   const bool degrading =
       trend.numerator * constants::SHARD_TREND_ENTER_T2_DEN >
       constants::SHARD_TREND_ENTER_T2_NUM * trend.denominator;
   const bool recovering =
       trend.numerator * constants::SHARD_TREND_EXIT_DEN < constants::SHARD_TREND_EXIT_NUM * trend.denominator;
+
+  // --- AIMD。target を更新する ---
+  std::int64_t target = state.target_bytes_per_sec;
+  std::int64_t hold_until = state.rate_hold_until_ms;
+  std::int64_t streak = state.recover_streak;
+  if (degrading) {
+    streak = 0;
+    // 待ちの間は減らさない。1 回の揺れで連続して落とさないためである。
+    if (t >= state.rate_hold_until_ms) {
+      const Result<std::int64_t> reduced = trunc_div(target * 17, 20);
+      if (reduced.ok) {
+        target = reduced.value;
+      }
+      hold_until = t + constants::RATE_HOLD_MS;
+    }
+  } else if (recovering) {
+    streak = state.recover_streak + 1;
+    if (streak >= constants::RATE_RECOVER_STREAK) {
+      const Result<std::int64_t> increment = trunc_div(constants::RATE_PROBE_BPS, 8);
+      const std::int64_t raised = target + (increment.ok ? increment.value : 0);
+      target = raised > state.target_ceiling_bytes_per_sec ? state.target_ceiling_bytes_per_sec : raised;
+      streak = 0;
+    }
+  } else {
+    streak = 0;
+  }
+
   if (!degrading && !recovering) {
     State next = state;
     next.trend = trend;
+    next.target_bytes_per_sec = target;
+    next.rate_hold_until_ms = hold_until;
+    next.recover_streak = streak;
     return StepResult{next, {}};
   }
   const std::int64_t delta = degrading ? -1 : 1;
@@ -518,7 +564,8 @@ inline StepResult handle_media(const State& state, const Event& event) {
 }  // namespace detail
 
 /// 純関数の状態遷移。
-inline StepResult step(const State& state, const Event& event) {
+/// 純関数の状態遷移。時刻は AIMD の待ち（RATE_HOLD_MS）に使う。
+inline StepResult step(const State& state, const Event& event, std::int64_t t = 0) {
   switch (event.kind) {
     case EventKind::SubscribeList:
       return detail::handle_subscribe_list(state, event.entries);
@@ -539,7 +586,7 @@ inline StepResult step(const State& state, const Event& event) {
     case EventKind::DisplaySize:
       return detail::handle_display_size(state, event.sender_id, event.channel, event.width);
     case EventKind::Report:
-      return detail::handle_report(state, event.delay_us);
+      return detail::handle_report(state, event.delay_us, t);
     case EventKind::Media:
       return detail::handle_media(state, event);
     case EventKind::Timer: {

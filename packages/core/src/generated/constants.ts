@@ -146,6 +146,8 @@ export const UPLINK_BACKLOG_BYTES = 100000;
 export const RATE_HOLD_MS = 1000;
 /** 加算的増加の刻み。360p15 の 1 本分 */
 export const RATE_PROBE_BPS = 200000;
+/** 回復判定が 3 回連続したときのみ加算的増加を許す（congestion 4.2）。1 回で増やすと利用可能帯域の境界で振動する */
+export const RATE_RECOVER_STREAK = 3;
 /** 3 回で約 0.61 に収束する */
 export const RATE_DECREASE_FACTOR = 0.85;
 /** 60 fps の 2 フレーム分 */

@@ -82,6 +82,8 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
 
   const rising: number[] = [];
   const falling: number[] = [];
+  // 増減どちらの条件も満たさない標本列。連続回数が切れることを記録するために使う。
+  const flat: number[] = new Array<number>(20).fill(20_000);
   for (let i = 0; i < 20; i += 1) {
     rising.push(10_000 + i * 1_000);
     falling.push(30_000 - i * 1_000);
@@ -166,6 +168,29 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
     events.push({ kind: "leave", id: senders[senderIndex] ?? 11 });
   }
 
+  // --- AIMD（congestion.md 4.2）を確実に通す段 ---
+  //
+  // なぜ専用の段が必要か: 混合イベント列では「劣化の報告が待ち（RATE_HOLD_MS）を跨いで
+  // 続く」場面と「回復の報告が 3 回連続する」場面が偶然にしか起きない。
+  // トレースに現れない入力は検証されない（X-024 と同じ誤り）。
+  //
+  // 減少を 3 回（待ちを跨いで）、次に回復を 4 回続ける。1 イベント 50 ms であるため、
+  // 待ち（1000 ms）を跨ぐには 20 イベントぶんの間隔が要る。間に timer を挟んで進める。
+  for (let round = 0; round < 3; round += 1) {
+    events.push({ kind: "report", delayUs: rising });
+    for (let filler = 0; filler < 21; filler += 1) {
+      events.push({ kind: "timer" });
+    }
+  }
+  for (let round = 0; round < 4; round += 1) {
+    events.push({ kind: "report", delayUs: falling });
+  }
+  // 増減どちらでもない報告を挟み、連続回数が切れることも記録する。
+  events.push({ kind: "report", delayUs: flat });
+  for (let round = 0; round < 4; round += 1) {
+    events.push({ kind: "report", delayUs: falling });
+  }
+
   return events;
 }
 
@@ -179,10 +204,12 @@ function runTrace(seed: bigint, steps: number): readonly string[] {
   let t = 0;
   for (const event of events) {
     lines.push(JSON.stringify({ t, in: event }));
-    const result = receiverStep(state, event);
+    const result = receiverStep(state, event, t);
     state = result.state;
     lines.push(JSON.stringify({ t, out: result.commands }));
-    t += 1;
+    // 刻みを実時間らしくする。1 刻みでは AIMD の待ち（RATE_HOLD_MS = 1000）を跨げず、
+    // 減少が 1 回しか現れない。トレースに現れない入力は検証されない。
+    t += 50;
   }
   return lines;
 }

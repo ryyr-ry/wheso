@@ -219,6 +219,10 @@
       "value": 200000,
       "derivation": "加算的増加の刻み。360p15 の 1 本分"
     },
+    "RATE_RECOVER_STREAK": {
+      "value": 3,
+      "derivation": "回復判定が 3 回連続したときのみ加算的増加を許す（congestion 4.2）。1 回で増やすと利用可能帯域の境界で振動する"
+    },
     "RATE_DECREASE_FACTOR": {
       "value": 0.85,
       "derivation": "3 回で約 0.61 に収束する"

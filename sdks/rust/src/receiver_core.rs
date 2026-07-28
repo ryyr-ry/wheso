@@ -11,6 +11,9 @@
 
 use crate::fixed::{delay_slope, trunc_div, Slope};
 use crate::generated::constants::{
+    RATE_HOLD_MS,
+    RATE_PROBE_BPS,
+    RATE_RECOVER_STREAK,
     DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID, SHARD_TREND_ENTER_T2_DEN, SHARD_TREND_ENTER_T2_NUM,
     SHARD_TREND_EXIT_DEN, SHARD_TREND_EXIT_NUM, V_360P15_SPATIAL_ID, V_360P15_TARGET_BITRATE,
     V_4K60_SPATIAL_ID, V_4K60_TARGET_BITRATE,
@@ -62,6 +65,12 @@ pub struct ReceiverState {
     pub active_speaker_id: Option<i64>,
     pub trend: Slope,
     pub degraded: bool,
+    /// 次に減少の判定を行える時刻（AIMD。congestion 4.2）。
+    pub rate_hold_until_ms: i64,
+    /// 回復判定が連続した回数。規範は 3 回連続で加算的増加を許す。
+    pub recover_streak: i64,
+    /// 目標ビットレートの上限（bytes/sec）。加算的増加はこれを超えない。
+    pub target_ceiling_bytes_per_sec: i64,
     pub unexpected_events: Vec<String>,
     /// sender_id, channel, spatial_id の昇順で保持する。
     pub received: Vec<ReceivedMark>,
@@ -165,13 +174,17 @@ pub fn initial_receiver_state(target_bytes_per_sec: i64) -> ReceiverState {
         active_speaker_id: None,
         trend: Slope { numerator: 0, denominator: 1 },
         degraded: false,
+        rate_hold_until_ms: 0,
+        recover_streak: 0,
+        target_ceiling_bytes_per_sec: target_bytes_per_sec,
         unexpected_events: Vec::new(),
         received: Vec::new(),
     }
 }
 
 /// 純関数の状態遷移。
-pub fn receiver_step(state: &ReceiverState, event: &ReceiverEvent) -> ReceiverStepResult {
+/// 純関数の状態遷移。時刻は AIMD の待ち（RATE_HOLD_MS）に使う。
+pub fn receiver_step(state: &ReceiverState, event: &ReceiverEvent, t: i64) -> ReceiverStepResult {
     match event {
         ReceiverEvent::Subscribe { entries } => handle_subscribe(state, entries),
         ReceiverEvent::Leave { id } => handle_leave(state, *id),
@@ -189,7 +202,7 @@ pub fn receiver_step(state: &ReceiverState, event: &ReceiverEvent) -> ReceiverSt
         ReceiverEvent::DisplaySize { sender_id, channel, width } => {
             handle_display_size(state, *sender_id, *channel, *width)
         }
-        ReceiverEvent::Report { delay_us } => handle_report(state, delay_us),
+        ReceiverEvent::Report { delay_us } => handle_report(state, delay_us, t),
         ReceiverEvent::Media { from, ch, sid, tid, seq, .. } => handle_media(
             state,
             MediaInput { from: *from, ch: *ch, sid: *sid, tid: *tid, seq: *seq },
@@ -418,15 +431,61 @@ fn handle_display_size(
 }
 
 /// 測定報告。勾配が劣化閾値を超えたら tier を 1 段下げ、回復閾値を下回ったら 1 段上げる。
-fn handle_report(state: &ReceiverState, delay_us: &[i64]) -> ReceiverStepResult {
+/// 遅延の報告に対する応答。規範は 2 つの層を定めている。
+///
+/// 1. 状態機械（state-machines 3 節）: 遅延勾配が閾値を超えたら tier を 1 段下げる
+/// 2. 輻輳制御（congestion 4.2 の AIMD）: target を劣化時に 0.85 倍し、回復が 3 回
+///    連続したら RATE_PROBE_BPS を加える（上限を超えない）
+///
+/// 0.85 は浮動小数点で計算しない。target * 17 / 20 の整数演算とし切り捨てる（ADR-0017）。
+fn handle_report(state: &ReceiverState, delay_us: &[i64], t: i64) -> ReceiverStepResult {
     let trend = delay_slope(delay_us);
     let degrading =
         trend.numerator * SHARD_TREND_ENTER_T2_DEN > SHARD_TREND_ENTER_T2_NUM * trend.denominator;
     let recovering =
         trend.numerator * SHARD_TREND_EXIT_DEN < SHARD_TREND_EXIT_NUM * trend.denominator;
+
+    // --- AIMD。target を更新する ---
+    let mut target = state.target_bytes_per_sec;
+    let mut hold_until = state.rate_hold_until_ms;
+    let mut streak = state.recover_streak;
+    if degrading {
+        streak = 0;
+        // 待ちの間は減らさない。1 回の揺れで連続して落とさないためである。
+        if t >= state.rate_hold_until_ms {
+            // 除算の失敗（分母 0）は起こらないが、結果を無視せず明示的に扱う。
+            target = match trunc_div(target * 17, 20) {
+                Ok(value) => value,
+                Err(_) => target,
+            };
+            hold_until = t + RATE_HOLD_MS;
+        }
+    } else if recovering {
+        streak = state.recover_streak + 1;
+        if streak >= RATE_RECOVER_STREAK {
+            let increment = match trunc_div(RATE_PROBE_BPS, 8) {
+                Ok(value) => value,
+                Err(_) => 0,
+            };
+            let raised = target + increment;
+            target = if raised > state.target_ceiling_bytes_per_sec {
+                state.target_ceiling_bytes_per_sec
+            } else {
+                raised
+            };
+            streak = 0;
+        }
+    } else {
+        // 増減の条件を満たさない。連続回数を切る。
+        streak = 0;
+    }
+
     if !degrading && !recovering {
         let mut next = state.clone();
         next.trend = trend;
+        next.target_bytes_per_sec = target;
+        next.rate_hold_until_ms = hold_until;
+        next.recover_streak = streak;
         return ReceiverStepResult { state: next, commands: Vec::new() };
     }
     let delta: i64 = if degrading { -1 } else { 1 };
@@ -460,6 +519,9 @@ fn handle_report(state: &ReceiverState, delay_us: &[i64]) -> ReceiverStepResult 
     let mut next = state.clone();
     next.trend = trend;
     next.streams = streams;
+    next.target_bytes_per_sec = target;
+    next.rate_hold_until_ms = hold_until;
+    next.recover_streak = streak;
     ReceiverStepResult { state: next, commands }
 }
 
