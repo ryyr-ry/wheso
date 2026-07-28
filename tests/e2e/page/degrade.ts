@@ -54,6 +54,8 @@ interface DegradeResult {
   readonly codec: string;
   readonly sent: readonly SentRecord[];
   readonly received: readonly ReceivedRecord[];
+  /** 最後に送った時刻。これ以降の受信間隔は「固まった」の判定に含めない。 */
+  readonly lastSentAtMs: number;
   /** キーフレーム要求の受信回数。判定 E-1 は全プロファイルで 0 を要求する。 */
   readonly keyframeRequests: number;
   readonly durationMs: number;
@@ -182,6 +184,7 @@ async function run(
     codec,
     sent: [],
     received: [],
+    lastSentAtMs: 0,
     keyframeRequests: 0,
     durationMs: 0,
   });
@@ -218,14 +221,23 @@ async function run(
   const decoder = new VideoDecoder({
     output: (frame) => {
       const head = pendingIndexes.shift();
+      // 時刻は**復号できた瞬間**に取る。ハッシュの計算完了を待って記録すると、
+      // 計算がまとまって遅れたときに「固まった」と誤判定する（実測で 2 秒の見かけの
+      // 間隔が出た）。ハッシュは後から差し込む。
+      const atMs = performance.now();
+      const slot = received.length;
+      received.push({
+        frameIndex: head?.frameIndex ?? 0,
+        temporalId: head?.temporalId ?? 0,
+        isKey: head?.isKey ?? false,
+        sha256: "",
+        atMs,
+      });
       void hashFrame(frame).then((sha256) => {
-        received.push({
-          frameIndex: head?.frameIndex ?? 0,
-          temporalId: head?.temporalId ?? 0,
-          isKey: head?.isKey ?? false,
-          sha256,
-          atMs: performance.now(),
-        });
+        const entry = received[slot];
+        if (entry !== undefined) {
+          received[slot] = { ...entry, sha256 };
+        }
         frame.close();
       });
     },
@@ -344,10 +356,11 @@ async function run(
     await sleep(frameIntervalMs);
   }
   await encoder.flush();
-  // 転送と復号が追いつくのを待つ。
-  await sleep(2000);
+  const lastSentAtMs = sent[sent.length - 1]?.atMs ?? 0;
+  // 転送と復号が追いつくのを待つ。実環境の往復（片道 12.5 ms）と復号の待ちを見込む。
+  await sleep(3000);
   await decoder.flush();
-  await sleep(500);
+  await sleep(1000);
 
   const durationActual = performance.now() - startedAt;
   receiver.close();
@@ -366,6 +379,7 @@ async function run(
     codec,
     sent,
     received,
+    lastSentAtMs,
     keyframeRequests,
     durationMs: Math.trunc(durationActual),
   };
@@ -406,6 +420,7 @@ window.__whesoDegrade = async (wsBase, room, nodeKey, durationMs) => {
       codec: "",
       sent: [],
       received: [],
+      lastSentAtMs: 0,
       keyframeRequests: 0,
       durationMs: 0,
     };

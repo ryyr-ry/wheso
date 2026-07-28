@@ -59,6 +59,7 @@ interface DegradeResult {
   readonly codec: string;
   readonly sent: readonly SentRecord[];
   readonly received: readonly ReceivedRecord[];
+  readonly lastSentAtMs: number;
   readonly keyframeRequests: number;
   readonly durationMs: number;
 }
@@ -264,6 +265,7 @@ function asResult(value: unknown): DegradeResult {
     codec: typeof record["codec"] === "string" ? record["codec"] : "",
     sent: readSent,
     received: readReceived,
+    lastSentAtMs: typeof record["lastSentAtMs"] === "number" ? record["lastSentAtMs"] : 0,
     keyframeRequests: typeof record["keyframeRequests"] === "number" ? record["keyframeRequests"] : 0,
     durationMs: typeof record["durationMs"] === "number" ? record["durationMs"] : 0,
   };
@@ -327,17 +329,30 @@ function assertMonotonic(result: DegradeResult): void {
   }
 }
 
-/** 判定 C-1: 連続する描画の間隔が 1000 ms を超えない。 */
+/**
+ * 判定 C-1: 連続する描画の間隔が 1000 ms を超えない。
+ *
+ * 送信が終わった後の受信は評価に入れない。送信を止めれば描画も止まるのは当然であり、
+ * それを「固まった」と数えると、実際の固まりと区別できない。
+ */
 function assertNoFreeze(result: DegradeResult): void {
   let previous: number | undefined;
   let worst = 0;
+  let worstAt = 0;
   for (const entry of result.received) {
-    if (previous !== undefined) {
-      worst = Math.max(worst, entry.atMs - previous);
+    if (entry.atMs > result.lastSentAtMs) {
+      break;
+    }
+    if (previous !== undefined && entry.atMs - previous > worst) {
+      worst = entry.atMs - previous;
+      worstAt = entry.atMs;
     }
     previous = entry.atMs;
   }
-  assert.ok(worst <= MAX_GAP_MS, `描画の間隔が ${String(MAX_GAP_MS)} ms を超えない（最悪 ${worst.toFixed(0)} ms）`);
+  assert.ok(
+    worst <= MAX_GAP_MS,
+    `描画の間隔が ${String(MAX_GAP_MS)} ms を超えない（最悪 ${worst.toFixed(0)} ms、${worstAt.toFixed(0)} ms 時点）`,
+  );
 }
 
 /** 判定 B-2: 落ちたフレームは破棄可能（時間層が最上位）である。 */
