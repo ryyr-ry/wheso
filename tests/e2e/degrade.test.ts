@@ -48,6 +48,7 @@ interface SentRecord {
 
 interface ReceivedRecord {
   readonly frameIndex: number;
+  readonly spatialId: number;
   readonly temporalId: number;
   readonly isKey: boolean;
   readonly sha256: string;
@@ -265,6 +266,7 @@ function asResult(value: unknown): DegradeResult {
     const item: Record<string, unknown> = { ...entry };
     readReceived.push({
       frameIndex: typeof item["frameIndex"] === "number" ? item["frameIndex"] : 0,
+      spatialId: typeof item["spatialId"] === "number" ? item["spatialId"] : 0,
       temporalId: typeof item["temporalId"] === "number" ? item["temporalId"] : 0,
       isKey: item["isKey"] === true,
       sha256: typeof item["sha256"] === "string" ? item["sha256"] : "",

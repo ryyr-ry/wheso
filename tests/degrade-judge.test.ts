@@ -177,3 +177,29 @@ test("接続が切れていなければ通常の判定を行う", () => {
   const clean = { ...base, closures: [] };
   assert.deepEqual(judgeAll(clean, { maxGapMs: 1000, requireComplete: true }), []);
 });
+
+test("A-3: 空間層をまたぐ交錯は逆行にしない", () => {
+  // simulcast では層ごとに復号器が別であり、出力の順序は層の間で交錯する。
+  // 層をまとめて見ると正常な交錯を逆行と誤判定する（実測で 2 件出た）。
+  const base = healthyRecord(4);
+  const interleaved = [
+    { frameIndex: 1, spatialId: 0, temporalId: 0, isKey: true, sha256: HASH, atMs: 10 },
+    { frameIndex: 2, spatialId: 1, temporalId: 0, isKey: true, sha256: HASH, atMs: 12 },
+    { frameIndex: 3, spatialId: 0, temporalId: 1, isKey: false, sha256: HASH, atMs: 20 },
+    { frameIndex: 4, spatialId: 1, temporalId: 1, isKey: false, sha256: HASH, atMs: 22 },
+    // 層 0 の次のフレームは層 1 の 4 より小さい番号ではないが、層 1 より後に出ることがある。
+    { frameIndex: 5, spatialId: 0, temporalId: 2, isKey: false, sha256: HASH, atMs: 30 },
+  ];
+  assert.deepEqual(judgeMonotonic({ ...base, received: interleaved }), []);
+});
+
+test("A-3: 同じ層の中の逆行は検出する", () => {
+  const base = healthyRecord(4);
+  const broken = [
+    { frameIndex: 3, spatialId: 0, temporalId: 0, isKey: true, sha256: HASH, atMs: 10 },
+    { frameIndex: 2, spatialId: 0, temporalId: 1, isKey: false, sha256: HASH, atMs: 20 },
+  ];
+  const violations = judgeMonotonic({ ...base, received: broken });
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0]?.judgement, "A-3");
+});

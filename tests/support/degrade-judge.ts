@@ -21,6 +21,8 @@ export interface DegradeSent {
 
 export interface DegradeReceived {
   readonly frameIndex: number;
+  /** 空間層。与えられない場合は 0 として扱う（合成した記録で判定を試験するときに使う）。 */
+  readonly spatialId?: number;
   readonly temporalId: number;
   readonly isKey: boolean;
   readonly sha256: string;
@@ -49,18 +51,25 @@ export interface Violation {
   readonly detail: string;
 }
 
-/** 判定 A-3: frameIndex が同一の送信者・空間層の中で単調増加である。 */
+/**
+ * 判定 A-3: frameIndex が**同一の送信者・空間層の中で**単調増加である（受入条件 4.1）。
+ *
+ * 層をまとめて見てはならない。simulcast では層ごとに復号器が別であり、出力の順序は
+ * 層の間で交錯する。まとめて見ると正常な交錯を逆行と誤判定する（実測で 2 件出た）。
+ */
 export function judgeMonotonic(record: DegradeRecord): readonly Violation[] {
   const violations: Violation[] = [];
-  let previous = 0;
+  const lastByLayer = new Map<number, number>();
   for (const entry of record.received) {
+    const spatialId = entry.spatialId ?? 0;
+    const previous = lastByLayer.get(spatialId) ?? 0;
     if (entry.frameIndex <= previous) {
       violations.push({
         judgement: "A-3",
-        detail: `frameIndex が逆行または重複した（${String(previous)} の次に ${String(entry.frameIndex)}）`,
+        detail: `空間層 ${String(spatialId)} の frameIndex が逆行または重複した（${String(previous)} の次に ${String(entry.frameIndex)}）`,
       });
     }
-    previous = entry.frameIndex;
+    lastByLayer.set(spatialId, entry.frameIndex);
   }
   return violations;
 }

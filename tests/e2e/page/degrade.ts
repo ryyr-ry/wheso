@@ -46,6 +46,8 @@ interface SentRecord {
 
 interface ReceivedRecord {
   readonly frameIndex: number;
+  /** 空間層。判定 A-3（単調増加）は同一の層の中で見る（受入条件 4.1）。 */
+  readonly spatialId: number;
   readonly temporalId: number;
   readonly isKey: boolean;
   readonly sha256: string;
@@ -354,6 +356,7 @@ async function run(
         const slot = received.length;
         received.push({
           frameIndex: head?.frameIndex ?? 0,
+          spatialId: layer.spatialId,
           temporalId: head?.temporalId ?? 0,
           isKey: head?.isKey ?? false,
           sha256: "",
