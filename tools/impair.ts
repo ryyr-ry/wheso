@@ -34,6 +34,7 @@ import { createServer, connect, type Socket } from "node:net";
 import { performance } from "node:perf_hooks";
 
 import {
+  IMPAIRMENT_BURST_DIVISOR,
   IMPAIRMENT_BURST_KBIT,
   IMPAIRMENT_DEVICE_MTU,
   IMPAIRMENT_LATENCY_MS,
@@ -153,6 +154,12 @@ export function applyStep(step: ImpairmentStep): boolean {
   }
 
   if (step.rateKbit > 0) {
+    // burst は帯域に比例させる（規範の目安は rate の 1/250 秒）。固定値にすると
+    // 高い帯域で小さすぎ、TCP のバーストが常に落ちて接続が壊れる（実測）。
+    const burstKbit = Math.max(
+      Math.trunc(step.rateKbit / IMPAIRMENT_BURST_DIVISOR),
+      IMPAIRMENT_BURST_KBIT,
+    );
     const added = runTc([
       "qdisc",
       "add",
@@ -165,7 +172,7 @@ export function applyStep(step: ImpairmentStep): boolean {
       "rate",
       `${String(step.rateKbit)}kbit`,
       "burst",
-      `${String(IMPAIRMENT_BURST_KBIT)}kbit`,
+      `${String(burstKbit)}kbit`,
       "latency",
       `${String(IMPAIRMENT_LATENCY_MS)}ms`,
     ]);

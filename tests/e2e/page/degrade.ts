@@ -58,6 +58,11 @@ interface DegradeResult {
   readonly lastSentAtMs: number;
   /** キーフレーム要求の受信回数。判定 E-1 は全プロファイルで 0 を要求する。 */
   readonly keyframeRequests: number;
+  /**
+   * 接続が閉じた記録。劣化下で欠落が出たとき、SFU が層を捨てたのか経路が切れたのかを
+   * 区別するために要る（区別できないと、原因を取り違えたまま実装を直そうとする）。
+   */
+  readonly closures: readonly string[];
   readonly durationMs: number;
 }
 
@@ -186,6 +191,7 @@ async function run(
     received: [],
     lastSentAtMs: 0,
     keyframeRequests: 0,
+    closures: [],
     durationMs: 0,
   });
 
@@ -214,6 +220,13 @@ async function run(
   const received: ReceivedRecord[] = [];
   let keyframeRequests = 0;
   let decodeError = "";
+  const closures: string[] = [];
+  receiver.addEventListener("close", (event: CloseEvent) => {
+    closures.push(`購読側 code=${String(event.code)} at=${performance.now().toFixed(0)}ms`);
+  });
+  sender.addEventListener("close", (event: CloseEvent) => {
+    closures.push(`送信側 code=${String(event.code)} at=${performance.now().toFixed(0)}ms`);
+  });
 
   // 受信したフレームと frameIndex を結び付けるため、復号の順に待ち行列から引く。
   // 復号器は入力順に出力するため、この対応は崩れない。
@@ -381,6 +394,7 @@ async function run(
     received,
     lastSentAtMs,
     keyframeRequests,
+    closures,
     durationMs: Math.trunc(durationActual),
   };
 }
@@ -422,6 +436,7 @@ window.__whesoDegrade = async (wsBase, room, nodeKey, durationMs) => {
       received: [],
       lastSentAtMs: 0,
       keyframeRequests: 0,
+      closures: [],
       durationMs: 0,
     };
     window.__whesoDegradeResult = failed;

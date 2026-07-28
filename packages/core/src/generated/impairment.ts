@@ -220,6 +220,7 @@ export const IMPAIRMENT_PROFILES: readonly ImpairmentProfile[] =
   ];
 
 export const IMPAIRMENT_BURST_KBIT = 32;
+export const IMPAIRMENT_BURST_DIVISOR = 250;
 export const IMPAIRMENT_LATENCY_MS = 50;
 export const IMPAIRMENT_DEVICE_MTU = 1500;
 

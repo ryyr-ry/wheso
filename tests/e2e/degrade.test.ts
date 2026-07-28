@@ -61,6 +61,7 @@ interface DegradeResult {
   readonly received: readonly ReceivedRecord[];
   readonly lastSentAtMs: number;
   readonly keyframeRequests: number;
+  readonly closures: readonly string[];
   readonly durationMs: number;
 }
 
@@ -267,6 +268,9 @@ function asResult(value: unknown): DegradeResult {
     received: readReceived,
     lastSentAtMs: typeof record["lastSentAtMs"] === "number" ? record["lastSentAtMs"] : 0,
     keyframeRequests: typeof record["keyframeRequests"] === "number" ? record["keyframeRequests"] : 0,
+    closures: Array.isArray(record["closures"])
+      ? record["closures"].filter((entry): entry is string => typeof entry === "string")
+      : [],
     durationMs: typeof record["durationMs"] === "number" ? record["durationMs"] : 0,
   };
 }
@@ -389,7 +393,8 @@ for (const profile of IMPAIRMENT_PROFILES) {
     assert.deepEqual(
       violations.map((entry) => `${entry.judgement}: ${entry.detail}`),
       [],
-      `受入条件の違反が無い（送 ${String(result.sent.length)} / 受 ${String(result.received.length)}）`,
+      `受入条件の違反が無い（送 ${String(result.sent.length)} / 受 ${String(result.received.length)}` +
+        ` / 接続断 ${result.closures.length === 0 ? "なし" : result.closures.join(", ")}）`,
     );
   });
 }

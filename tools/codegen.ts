@@ -1055,6 +1055,7 @@ function generateImpairmentTs(schema: Record<string, unknown>): string {
   lines.push("");
   const bucketRecord = asRecord(schema["tokenBucket"]);
   lines.push(`export const IMPAIRMENT_BURST_KBIT = ${JSON.stringify(bucketRecord["burstKbit"])};`);
+  lines.push(`export const IMPAIRMENT_BURST_DIVISOR = ${JSON.stringify(bucketRecord["burstDivisor"])};`);
   lines.push(`export const IMPAIRMENT_LATENCY_MS = ${JSON.stringify(bucketRecord["latencyMs"])};`);
   lines.push(`export const IMPAIRMENT_DEVICE_MTU = ${JSON.stringify(bucketRecord["deviceMtu"])};`);
   lines.push("");
