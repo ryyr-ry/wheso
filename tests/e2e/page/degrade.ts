@@ -25,13 +25,6 @@
 
 import { packEncoded } from "../../../packages/client/src/media/encoder-set.ts";
 import { decodeMediaMessage } from "../../../packages/core/src/wire.ts";
-import { delaySlope } from "../../../packages/core/src/fixed.ts";
-import {
-  SHARD_TREND_ENTER_T2_DEN,
-  SHARD_TREND_ENTER_T2_NUM,
-  SHARD_TREND_EXIT_DEN,
-  SHARD_TREND_EXIT_NUM,
-} from "../../../packages/core/src/generated/constants.ts";
 import { deriveMeetingSecret, nodeAuthTag, nodeAuthTimeWindow } from "../../../packages/core/src/auth.ts";
 import {
   CHANNEL_VIDEO,
@@ -311,8 +304,6 @@ async function run(
   let decodeError = "";
   const closures: string[] = [];
   const arrived: number[] = [];
-  /** 直近の遅延標本（マイクロ秒）。tier の上下判断に使う。 */
-  let delaySamplesUs: number[] = [];
   /**
    * 送った時刻。frameIndex から引く。
    *
@@ -416,11 +407,6 @@ async function run(
           continue;
         }
         waitingForKey.delete(unit.spatialId);
-      }
-      // 遅延の標本を集める。送信と受信が同じページであるため時計が共通である。
-      const sentAt = sentAtByIndex.get(unit.sequenceNumber);
-      if (sentAt !== undefined) {
-        delaySamplesUs.push(Math.trunc((performance.now() - sentAt) * 1000));
       }
       queue.push({
         frameIndex: unit.sequenceNumber,
@@ -536,40 +522,43 @@ async function run(
    * 無選別に落ち、破棄優先順位の検証ができない（実測: N-6 で破棄できない層まで欠落した）。
    */
   /**
-   * 遅延の趨勢に使う標本列。1 秒ごとの**中央値**を並べる。
+   * 購読の上限層を上下させる。
    *
-   * なぜ中央値か: 毎フレームの生の遅延は揺れが大きく、劣化が無くても勾配が閾値を超える
-   * （実測: N-0 で層が 10 回以上上下した）。1 秒ごとに代表値を 1 つ取れば、
-   * 趨勢だけが残る。規範の受信ノードも「集約した標本列」を受け取る形になっている。
+   * 指標は**送出待ちの量**（`bufferedAmount`）である。上りが足りないと送れずに溜まる。
+   *
+   * なぜ遅延勾配を使わないか: 規範の閾値（`DELAY_TREND_DEGRADE` = 1/100 マイクロ秒/標本）は
+   * 実質「わずかでも増加傾向なら劣化」であり、器が毎秒の中央値で判定すると劣化が無くても
+   * 上下し続けた（実測: N-0 で 10 回以上）。規範の閾値は受信ノードの判断コアが受け取る
+   * 標本列に対するものであり、器がそれを流用するのは誤用である。
+   *
+   * この制御は段 D の前提（層を下げられること）を成立させるための最小限であり、
+   * 受信ノードの判断コアの代用ではない。本来の姿は受信ノードを経由する構成である
+   * （PROGRESS 5.10.8 の「記録の器を SDK 経由にする」）。
    */
-  const trendSamplesUs: number[] = [];
+  let congestedSince: number | null = null;
+  let clearSince = performance.now();
 
   const adjustTier = (): void => {
-    if (delaySamplesUs.length < 4) {
-      return;
-    }
-    const sorted = [...delaySamplesUs].sort((a, b) => a - b);
-    const median = sorted[Math.trunc(sorted.length / 2)] ?? 0;
-    delaySamplesUs = [];
-    trendSamplesUs.push(median);
-    // 直近 6 秒ぶんだけを見る。長く持つと復帰に時間がかかり、判定 C-3（5 秒で戻る）に
-    // 間に合わない。
-    while (trendSamplesUs.length > 6) {
-      trendSamplesUs.shift();
-    }
-    if (trendSamplesUs.length < 3) {
-      return;
-    }
-    const trend = delaySlope(trendSamplesUs);
-    const degrading =
-      trend.numerator * SHARD_TREND_ENTER_T2_DEN > SHARD_TREND_ENTER_T2_NUM * trend.denominator;
-    const recovering =
-      trend.numerator * SHARD_TREND_EXIT_DEN < SHARD_TREND_EXIT_NUM * trend.denominator;
     const lowest = LAYERS[0]?.spatialId ?? 0;
     const highest = LAYERS[LAYERS.length - 1]?.spatialId ?? 0;
-    const next = degrading
+    const congested = sender.bufferedAmount > IMPAIRMENT_MAX_BUFFERED_BYTES / 2;
+    const now = performance.now();
+    if (congested) {
+      clearSince = now;
+      if (congestedSince === null) {
+        congestedSince = now;
+      }
+    } else {
+      congestedSince = null;
+    }
+
+    // 2 秒続けて詰まっていれば下げる。単発の詰まりで下げると上下を繰り返す。
+    const shouldLower = congestedSince !== null && now - congestedSince >= 2000;
+    // 5 秒続けて詰まりが無ければ上げる。判定 C-3（5 秒で元の層へ戻る）に合わせる。
+    const shouldRaise = !congested && now - clearSince >= 5000;
+    const next = shouldLower
       ? Math.max(lowest, currentTier - 1)
-      : recovering
+      : shouldRaise
         ? Math.min(highest, currentTier + 1)
         : currentTier;
     if (next === currentTier) {
@@ -577,7 +566,13 @@ async function run(
     }
     const raising = next > currentTier;
     currentTier = next;
-    tierChanges.push(`${raising ? "上げ" : "下げ"}→${String(next)} at=${performance.now().toFixed(0)}ms`);
+    if (shouldLower) {
+      congestedSince = null;
+    }
+    if (shouldRaise) {
+      clearSince = now;
+    }
+    tierChanges.push(`${raising ? "上げ" : "下げ"}→${String(next)} at=${now.toFixed(0)}ms`);
     receiver.send(
       JSON.stringify({
         t: "subscribe",
@@ -587,9 +582,7 @@ async function run(
     if (raising) {
       // 上げた層はキーフレームが来るまで復号しない。
       waitingForKey.add(next);
-      // 層を上げるときはキーフレームを要求する（wire-format.md 2.5）。要求しないと、
-      // 参照フレームを持たない層のフレームが届き、復号器が壊れる（実測:
-      // 「復号に失敗: Decoding error.」で全プロファイルが落ちた）。
+      // 層を上げるときはキーフレームを要求する（wire-format.md 2.5）。
       // 判定 E-1 は「tier の spatialId 変更時」の要求を許している（受入条件 4.5）。
       receiver.send(
         JSON.stringify({ t: "keyframeRequest", senderId, channel: CHANNEL_VIDEO, spatialId: next }),
