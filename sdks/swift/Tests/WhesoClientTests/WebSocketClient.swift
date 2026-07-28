@@ -23,11 +23,14 @@ import Foundation
 
     private let systemConnect = Glibc.connect
     private let systemSend = Glibc.send
+    // SOCK_STREAM の型もプラットフォームで違う（Linux は __socket_type、macOS は Int32）。
+    private let systemStreamType = Int32(SOCK_STREAM.rawValue)
 #elseif canImport(Darwin)
     import Darwin
 
     private let systemConnect = Darwin.connect
     private let systemSend = Darwin.send
+    private let systemStreamType = SOCK_STREAM
 #endif
 
 enum WebSocketError: Error, CustomStringConvertible {
@@ -96,7 +99,7 @@ final class WebSocketClient {
             port = 80
         }
 
-        let descriptor = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        let descriptor = socket(AF_INET, systemStreamType, 0)
         if descriptor < 0 {
             return .failure(.connectFailed("socket が失敗した"))
         }
