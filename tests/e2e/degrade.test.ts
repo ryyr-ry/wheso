@@ -482,6 +482,13 @@ test("N-8: 参加者ごとに別々の劣化を掛けても、健全な参加者
   const impaired = participants[1];
   assert.ok(healthy !== undefined && impaired !== undefined);
 
+  // 実測を必ず残す。緑のときも数値が見えないと「劣化が効いていたのか」を後から確かめられない。
+  process.stdout.write(
+    `N-8 の実測: 健全 送 ${String(healthy.sent.length)} / 受 ${String(healthy.received.length)}` +
+      `、劣化 送 ${String(impaired.sent.length)} / 受 ${String(impaired.received.length)}` +
+      `、劣化側の接続断 ${impaired.closures.length === 0 ? "なし" : impaired.closures.join(", ")}\n`,
+  );
+
   // 劣化した参加者も送受信は成立しているはずである（壊れていたら比較の意味が無い）。
   assert.ok(impaired.sent.length > 0, "劣化した参加者も送信できている");
 
