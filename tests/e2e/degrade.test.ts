@@ -40,6 +40,7 @@ const root = new URL("../..", import.meta.url).pathname;
 
 interface SentRecord {
   readonly frameIndex: number;
+  readonly spatialId: number;
   readonly temporalId: number;
   readonly isKey: boolean;
   readonly atMs: number;
@@ -63,6 +64,7 @@ interface DegradeResult {
   readonly keyframeRequests: number;
   readonly closures: readonly string[];
   readonly arrived: readonly number[];
+  readonly tierChanges: readonly string[];
   readonly durationMs: number;
 }
 
@@ -249,6 +251,7 @@ function asResult(value: unknown): DegradeResult {
     const item: Record<string, unknown> = { ...entry };
     readSent.push({
       frameIndex: typeof item["frameIndex"] === "number" ? item["frameIndex"] : 0,
+      spatialId: typeof item["spatialId"] === "number" ? item["spatialId"] : 0,
       temporalId: typeof item["temporalId"] === "number" ? item["temporalId"] : 0,
       isKey: item["isKey"] === true,
       atMs: typeof item["atMs"] === "number" ? item["atMs"] : 0,
@@ -281,6 +284,9 @@ function asResult(value: unknown): DegradeResult {
       : [],
     arrived: Array.isArray(record["arrived"])
       ? record["arrived"].filter((entry): entry is number => typeof entry === "number")
+      : [],
+    tierChanges: Array.isArray(record["tierChanges"])
+      ? record["tierChanges"].filter((entry): entry is string => typeof entry === "string")
       : [],
     durationMs: typeof record["durationMs"] === "number" ? record["durationMs"] : 0,
   };
@@ -403,7 +409,8 @@ for (const profile of IMPAIRMENT_PROFILES) {
     process.stdout.write(
       `${profile.id} の実測: 送 ${String(result.sent.length)} / 届 ${String(result.arrived.length)}` +
         ` / 復号 ${String(result.received.length)}` +
-        ` / 接続断 ${result.closures.length === 0 ? "なし" : result.closures.join(", ")}\n`,
+        ` / 接続断 ${result.closures.length === 0 ? "なし" : result.closures.join(", ")}` +
+        ` / 層の変更 ${result.tierChanges.length === 0 ? "なし" : result.tierChanges.join(", ")}\n`,
     );
 
     // 判定は共通の純関数で行う（tests/support/degrade-judge.ts）。

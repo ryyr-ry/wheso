@@ -15,6 +15,8 @@ export interface DegradeSent {
   readonly temporalId: number;
   readonly isKey: boolean;
   readonly atMs: number;
+  /** 空間層。simulcast の上位層は購読の上限が下がれば転送されない（破棄が許される）。 */
+  readonly spatialId?: number;
 }
 
 export interface DegradeReceived {
@@ -112,6 +114,14 @@ export function judgeContinuity(record: DegradeRecord, maxGapMs: number): readon
  * 破棄が許されるのは最上位の時間層に限る。キーフレームと基底層が落ちていれば、
  * 依存構造が壊れた状態で描画したか、単発の欠落が起きたことを意味する。
  */
+/**
+ * 判定 B-2: 落ちたフレームは破棄可能なものだけである。
+ *
+ * 破棄が許されるのは次の 2 つである。
+ *   1. 最上位の時間層（時間スケーラビリティの上の層）
+ *   2. 最上位の空間層（購読の上限が下がれば転送されない）
+ * キーフレームと基底層が落ちていれば、依存構造が壊れた状態で描画したことを意味する。
+ */
 export function judgeDrops(record: DegradeRecord): readonly Violation[] {
   // 転送の欠落を見る。復号できたかは別の問題であり、混ぜると原因の層を取り違える。
   const arrived = new Set(
@@ -121,22 +131,29 @@ export function judgeDrops(record: DegradeRecord): readonly Violation[] {
   );
   const temporalIds = record.sent.map((entry) => entry.temporalId);
   const highestTemporal = temporalIds.length === 0 ? 0 : Math.max(...temporalIds);
+  const spatialIds = record.sent.map((entry) => entry.spatialId ?? 0);
+  const highestSpatial = spatialIds.length === 0 ? 0 : Math.max(...spatialIds);
   const violations: Violation[] = [];
   for (const entry of record.sent) {
     if (arrived.has(entry.frameIndex)) {
       continue;
     }
+    const spatialId = entry.spatialId ?? 0;
+    // 最上位の空間層は購読の上限が下がれば転送されない。これは破棄として正しい。
+    if (spatialId >= highestSpatial && highestSpatial > 0) {
+      continue;
+    }
     if (entry.isKey) {
       violations.push({
         judgement: "B-2",
-        detail: `キーフレーム ${String(entry.frameIndex)} が落ちた`,
+        detail: `キーフレーム ${String(entry.frameIndex)} が落ちた（空間層 ${String(spatialId)}）`,
       });
       continue;
     }
     if (entry.temporalId < highestTemporal) {
       violations.push({
         judgement: "B-2",
-        detail: `破棄できない層のフレーム ${String(entry.frameIndex)} が落ちた（時間層 ${String(entry.temporalId)}）`,
+        detail: `破棄できない層のフレーム ${String(entry.frameIndex)} が落ちた（空間層 ${String(spatialId)} / 時間層 ${String(entry.temporalId)}）`,
       });
     }
   }

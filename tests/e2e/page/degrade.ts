@@ -25,6 +25,13 @@
 
 import { packEncoded } from "../../../packages/client/src/media/encoder-set.ts";
 import { decodeMediaMessage } from "../../../packages/core/src/wire.ts";
+import { delaySlope } from "../../../packages/core/src/fixed.ts";
+import {
+  SHARD_TREND_ENTER_T2_DEN,
+  SHARD_TREND_ENTER_T2_NUM,
+  SHARD_TREND_EXIT_DEN,
+  SHARD_TREND_EXIT_NUM,
+} from "../../../packages/core/src/generated/constants.ts";
 import { deriveMeetingSecret, nodeAuthTag, nodeAuthTimeWindow } from "../../../packages/core/src/auth.ts";
 import {
   CHANNEL_VIDEO,
@@ -73,6 +80,8 @@ interface DegradeResult {
    * 「届いたが復号器が出力しなかった」のかを区別できないと、原因の層を取り違える。
    */
   readonly arrived: readonly number[];
+  /** 購読上限層を変えた履歴。輻輳制御が働いたことの証拠になる。 */
+  readonly tierChanges: readonly string[];
   readonly durationMs: number;
 }
 
@@ -107,6 +116,21 @@ const HEIGHT = 240;
 const FRAMERATE = 15;
 
 /**
+ * 空間層の定義（simulcast の 2 段）。
+ *
+ * なぜ 2 段必要か: 帯域が足りないとき、受信側は購読の上限層を下げて量を減らす。層が
+ * 1 段しかないと下げる先が無く、下り帯域が詰まったまま無選別に落ちる（実測: N-6 で
+ * 送 892 / 届 853 と、破棄できない層まで欠落した）。
+ *
+ * 解像度は CI の軟体符号化器で回る大きさに留める。規範のプロファイル（1080p 以上）は
+ * CPU が足りず、符号化の遅れが判定を不安定にする。
+ */
+const LAYERS: readonly { readonly spatialId: number; readonly width: number; readonly height: number; readonly share: number }[] = [
+  { spatialId: 0, width: 160, height: 120, share: 4 },
+  { spatialId: 1, width: WIDTH, height: HEIGHT, share: 6 },
+];
+
+/**
  * 1 人の参加者の接続の指定。
  *
  * wsBase を参加者ごとに変えられるようにしてある。**別のポートの終端を指すことで、
@@ -126,14 +150,14 @@ function subscriberPk(senderId: number): number {
  * 既知の模様を描く。frameIndex が判る形にする理由: 復号後のハッシュだけでは
  * 「どのフレームか」が判らない。左上に index を階段状の輝度で埋め込む。
  */
-function drawPattern(index: number): OffscreenCanvas {
-  const canvas = new OffscreenCanvas(WIDTH, HEIGHT);
+function drawPattern(index: number, width: number, height: number): OffscreenCanvas {
+  const canvas = new OffscreenCanvas(width, height);
   const context = canvas.getContext("2d");
   if (context === null) {
     throw new Error("2d context を得られない");
   }
   context.fillStyle = "rgb(32, 160, 64)";
-  context.fillRect(0, 0, WIDTH, HEIGHT);
+  context.fillRect(0, 0, width, height);
 
   // **非圧縮性のノイズを敷く**（測定の 5 原則の 1）。
   //
@@ -145,8 +169,8 @@ function drawPattern(index: number): OffscreenCanvas {
   // 隣接画素の相関が消えるため、フレーム間予測もフレーム内予測も効かない。
   const blockSize = 8;
   let seed = (index + 1) * 2654435761;
-  for (let y = 0; y < HEIGHT; y += blockSize) {
-    for (let x = 0; x < WIDTH; x += blockSize) {
+  for (let y = 0; y < height; y += blockSize) {
+    for (let x = 0; x < width; x += blockSize) {
       // 決定的な擬似乱数（xorshift）。ブラウザの乱数に依らず再現できるようにする。
       seed ^= seed << 13;
       seed ^= seed >>> 17;
@@ -159,11 +183,11 @@ function drawPattern(index: number): OffscreenCanvas {
 
   // 動きを入れる。動きが無いとエンコーダが同じフレームを出さないことがある。
   context.fillStyle = "rgb(255, 255, 255)";
-  context.fillRect((index * 8) % WIDTH, 0, 8, HEIGHT);
+  context.fillRect((index * 8) % width, 0, 8, height);
   // index を輝度で埋め込む（8 段。復号後も残る大きさにする）。
   const level = (index % 8) * 32;
   context.fillStyle = `rgb(${level}, ${level}, ${level})`;
-  context.fillRect(0, 0, 32, 32);
+  context.fillRect(0, 0, Math.trunc(width / 10), Math.trunc(height / 8));
   return canvas;
 }
 
@@ -256,6 +280,7 @@ async function run(
     keyframeRequests: 0,
     closures: [],
     arrived: [],
+    tierChanges: [],
     durationMs: 0,
   });
 
@@ -286,6 +311,12 @@ async function run(
   let decodeError = "";
   const closures: string[] = [];
   const arrived: number[] = [];
+  /** 直近の遅延標本（マイクロ秒）。tier の上下判断に使う。 */
+  let delaySamplesUs: number[] = [];
+  /** 現在の購読上限層。最初は最上位を要求する。 */
+  let currentTier = LAYERS[LAYERS.length - 1]?.spatialId ?? 0;
+  /** tier を変えた回数と履歴。判定と診断に使う。 */
+  const tierChanges: string[] = [];
   receiver.addEventListener("close", (event: CloseEvent) => {
     closures.push(`購読側 code=${String(event.code)} at=${performance.now().toFixed(0)}ms`);
   });
@@ -344,6 +375,9 @@ async function run(
     for (const unit of decoded.value.units) {
       const isKey = (unit.flags & FLAG_KEY) !== 0;
       arrived.push(unit.sequenceNumber);
+      // 遅延の標本を集める。送信と受信が同じページであるため時計が共通であり、
+      // 撮影時刻との差がそのまま片道の遅延になる。
+      delaySamplesUs.push(Math.trunc(performance.now() * 1000) - Number(unit.captureTimestampUs));
       pendingIndexes.push({
         frameIndex: unit.sequenceNumber,
         temporalId: unit.temporalId,
@@ -368,75 +402,133 @@ async function run(
 
   let frameIndex = 0;
   let encodeError = "";
-  const encoder = new VideoEncoder({
-    output: (chunk, metadata) => {
-      const payload = new Uint8Array(chunk.byteLength);
-      chunk.copyTo(payload);
-      const index = frameIndex + 1;
-      const temporalId = temporalOf(metadata);
-      const packed = packEncoded({
-        channel: CHANNEL_VIDEO,
-        senderId,
-        sequenceNumber: index,
-        captureTimestampUs: BigInt(Math.trunc(chunk.timestamp)),
-        spatialId: 0,
-        temporalId,
-        temporalLayers: 3,
-        isKey: chunk.type === "key",
-        payload,
-      });
-      if (!packed.ok) {
-        encodeError = `詰め込みに失敗: ${packed.error.code}`;
-        return;
-      }
-      // 送信が詰まっている間は送らない。詰めて送ると劣化ではなく自分で輻輳を作る。
-      // 閾値が大きいと詰まりに気付かず送り続け、経路が壊れてから欠落として現れる
-      // （N-7 で両方向が 1006 で切れた。実測）。
-      if (sender.bufferedAmount > IMPAIRMENT_MAX_BUFFERED_BYTES) {
-        return;
-      }
-      sender.send(packed.value);
-      sent.push({
-        frameIndex: index,
-        spatialId: 0,
-        temporalId,
-        isKey: chunk.type === "key",
-        atMs: performance.now(),
-        bytes: packed.value.byteLength,
-      });
-      frameIndex = index;
-    },
-    error: (error) => {
-      encodeError = error.message;
-    },
-  });
-  // 時間層 3 段は AV1 のときだけ指定する。H.264 / VP8 の代替では層が無い。
-  const encoderConfig: VideoEncoderConfig = codec.startsWith("av01")
-    ? {
-        codec,
-        width: WIDTH,
-        height: HEIGHT,
-        framerate: FRAMERATE,
-        bitrate: IMPAIRMENT_VIDEO_BITRATE,
-        scalabilityMode: "L1T3",
-      }
-    : { codec, width: WIDTH, height: HEIGHT, framerate: FRAMERATE, bitrate: IMPAIRMENT_VIDEO_BITRATE };
-  encoder.configure(encoderConfig);
+
+  /**
+   * 層ごとの符号化器。同じ映像を 2 つの解像度で符号化し、spatialId を付けて送る
+   * （simulcast）。受信側が上限層を下げれば、中継ノードは上の層を転送しなくなる。
+   */
+  const encoders: { readonly spatialId: number; readonly width: number; readonly height: number; readonly encoder: VideoEncoder }[] = [];
+  const totalShare = LAYERS.reduce((sum, layer) => sum + layer.share, 0);
+  for (const layer of LAYERS) {
+    const encoder = new VideoEncoder({
+      output: (chunk, metadata) => {
+        const payload = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(payload);
+        // frameIndex は層をまたいで一意にする。層ごとに同じ番号を使うと、
+        // 受信側で「どの層のどのフレームか」を区別できない。
+        const index = frameIndex + 1;
+        frameIndex = index;
+        const temporalId = temporalOf(metadata);
+        const packed = packEncoded({
+          channel: CHANNEL_VIDEO,
+          senderId,
+          sequenceNumber: index,
+          captureTimestampUs: BigInt(Math.trunc(chunk.timestamp)),
+          spatialId: layer.spatialId,
+          temporalId,
+          temporalLayers: 3,
+          isKey: chunk.type === "key",
+          payload,
+        });
+        if (!packed.ok) {
+          encodeError = `詰め込みに失敗: ${packed.error.code}`;
+          return;
+        }
+        // 送信が詰まっている間は送らない。詰めて送ると劣化ではなく自分で輻輳を作る。
+        // 閾値が大きいと詰まりに気付かず送り続け、経路が壊れてから欠落として現れる。
+        if (sender.bufferedAmount > IMPAIRMENT_MAX_BUFFERED_BYTES) {
+          return;
+        }
+        sender.send(packed.value);
+        sent.push({
+          frameIndex: index,
+          spatialId: layer.spatialId,
+          temporalId,
+          isKey: chunk.type === "key",
+          atMs: performance.now(),
+          bytes: packed.value.byteLength,
+        });
+      },
+      error: (error) => {
+        encodeError = error.message;
+      },
+    });
+    const bitrate = Math.trunc((IMPAIRMENT_VIDEO_BITRATE * layer.share) / totalShare);
+    const config: VideoEncoderConfig = codec.startsWith("av01")
+      ? {
+          codec,
+          width: layer.width,
+          height: layer.height,
+          framerate: FRAMERATE,
+          bitrate,
+          scalabilityMode: "L1T3",
+        }
+      : { codec, width: layer.width, height: layer.height, framerate: FRAMERATE, bitrate };
+    encoder.configure(config);
+    encoders.push({ spatialId: layer.spatialId, width: layer.width, height: layer.height, encoder });
+  }
+
+  /**
+   * 購読の上限層を上下させる。
+   *
+   * 判断は受信ノードの判断コアと同じ規則を使う（遅延勾配が悪化したら下げ、回復したら
+   * 上げる。閾値は SHARD_TREND_* の定数）。器が判断を持たないと、下り帯域が詰まったまま
+   * 無選別に落ち、破棄優先順位の検証ができない（実測: N-6 で破棄できない層まで欠落した）。
+   */
+  const adjustTier = (): void => {
+    if (delaySamplesUs.length < 4) {
+      return;
+    }
+    const trend = delaySlope(delaySamplesUs);
+    delaySamplesUs = [];
+    const degrading =
+      trend.numerator * SHARD_TREND_ENTER_T2_DEN > SHARD_TREND_ENTER_T2_NUM * trend.denominator;
+    const recovering =
+      trend.numerator * SHARD_TREND_EXIT_DEN < SHARD_TREND_EXIT_NUM * trend.denominator;
+    const lowest = LAYERS[0]?.spatialId ?? 0;
+    const highest = LAYERS[LAYERS.length - 1]?.spatialId ?? 0;
+    const next = degrading
+      ? Math.max(lowest, currentTier - 1)
+      : recovering
+        ? Math.min(highest, currentTier + 1)
+        : currentTier;
+    if (next === currentTier) {
+      return;
+    }
+    currentTier = next;
+    tierChanges.push(`${degrading ? "下げ" : "上げ"}→${String(next)} at=${performance.now().toFixed(0)}ms`);
+    receiver.send(
+      JSON.stringify({
+        t: "subscribe",
+        entries: [{ senderId, channel: CHANNEL_VIDEO, maxSpatialId: next, maxTemporalId: 7 }],
+      }),
+    );
+  };
 
   const startedAt = performance.now();
   const frameIntervalMs = Math.trunc(1000 / FRAMERATE);
   let index = 0;
+  let lastAdjustMs = performance.now();
   while (performance.now() - startedAt < durationMs) {
-    const canvas = drawPattern(index);
-    const frame = new VideoFrame(canvas, { timestamp: index * frameIntervalMs * 1000 });
-    // キーフレームは最初の 1 枚だけにする。判定 E-1（要求 0 回）を確かめるため、
-    // 定期キーフレームで欠落が隠れないようにする。
-    encoder.encode(frame, { keyFrame: index === 0 });
-    frame.close();
+    for (const entry of encoders) {
+      const canvas = drawPattern(index, entry.width, entry.height);
+      const frame = new VideoFrame(canvas, { timestamp: index * frameIntervalMs * 1000 });
+      // キーフレームは最初の 1 枚だけにする。判定 E-1（要求 0 回）を確かめるため、
+      // 定期キーフレームで欠落が隠れないようにする。
+      entry.encoder.encode(frame, { keyFrame: index === 0 });
+      frame.close();
+    }
     index += 1;
+    // 1 秒ごとに層を見直す。頻繁に変えるとキーフレーム要求が増え、判定 E-1 に触れる。
+    if (performance.now() - lastAdjustMs >= 1000) {
+      lastAdjustMs = performance.now();
+      adjustTier();
+    }
     await sleep(frameIntervalMs);
   }
-  await encoder.flush();
+  for (const entry of encoders) {
+    await entry.encoder.flush();
+  }
   const lastSentAtMs = sent[sent.length - 1]?.atMs ?? 0;
   // 転送と復号が追いつくのを待つ。実環境の往復（片道 12.5 ms）と復号の待ちを見込む。
   await sleep(3000);
@@ -464,6 +556,7 @@ async function run(
     keyframeRequests,
     closures,
     arrived,
+    tierChanges,
     durationMs: Math.trunc(durationActual),
   };
 }
@@ -507,6 +600,7 @@ window.__whesoDegrade = async (wsBase, room, nodeKey, durationMs) => {
       keyframeRequests: 0,
       closures: [],
       arrived: [],
+      tierChanges: [],
       durationMs: 0,
     };
     window.__whesoDegradeResult = failed;
@@ -532,6 +626,7 @@ window.__whesoIsolation = async (specs, room, nodeKey, durationMs) => {
           keyframeRequests: 0,
           closures: [],
           arrived: [],
+          tierChanges: [],
           durationMs: 0,
         };
       }
