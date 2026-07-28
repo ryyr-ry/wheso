@@ -177,6 +177,32 @@ jobs:
       - name: 実環境に対する試験
         run: npm run test:${{ matrix.kind }}
 
+  # ── 段 D（劣化）: プロファイルごとに並列。劣化は tc netem でループバックへ適用する ──
+  degrade:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ['N-0', 'N-1', 'N-2', 'N-3', 'N-4', 'N-5', 'N-6', 'N-7']
+    env:
+      WHESO_LIVE_HOST: ${{ secrets.WHESO_LIVE_HOST }}
+      WHESO_SKIP_DEPLOY: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Chromium を導入する
+        run: npx playwright install --with-deps chromium
+      - name: root で tc を触れることを確認する
+        run: sudo -n tc qdisc show dev lo
+      - name: 劣化下の記録と判定
+        run: node --test --test-force-exit --test-name-pattern='^${{ matrix.profile }}:' tests/e2e/degrade.test.ts
+
   # ── 段 B（疎通）: 5 言語が実環境へ実データを流す。言語ごとに並列 ──
   transport:
     needs: deploy
