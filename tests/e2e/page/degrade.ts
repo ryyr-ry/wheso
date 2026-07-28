@@ -31,7 +31,9 @@ import {
   FLAG_KEY,
 } from "../../../packages/core/src/generated/wire-layout.ts";
 import {
+  IMPAIRMENT_LOWER_AT_DELAY_MS,
   IMPAIRMENT_MAX_BUFFERED_BYTES,
+  IMPAIRMENT_RAISE_BELOW_DELAY_MS,
   IMPAIRMENT_VIDEO_BITRATE,
 } from "../../../packages/core/src/generated/impairment.ts";
 
@@ -315,6 +317,8 @@ async function run(
    * 1.7 秒で層を下げてしまった。
    */
   const sentAtByIndex = new Map<number, number>();
+  /** 直近 1 秒の片道遅延（ミリ秒）。下りの詰まりを判定する。 */
+  let recentDelaysMs: number[] = [];
   /** 現在の購読上限層。最初は最上位を要求する。 */
   let currentTier = LAYERS[LAYERS.length - 1]?.spatialId ?? 0;
   /**
@@ -397,6 +401,11 @@ async function run(
     for (const unit of decoded.value.units) {
       const isKey = (unit.flags & FLAG_KEY) !== 0;
       arrived.push(unit.sequenceNumber);
+      // 片道遅延を測る。送信と受信が同じページであるため時計が共通である。
+      const sentAt = sentAtByIndex.get(unit.sequenceNumber);
+      if (sentAt !== undefined) {
+        recentDelaysMs.push(performance.now() - sentAt);
+      }
       const decoder = decoders.get(unit.spatialId);
       const queue = pendingByLayer.get(unit.spatialId);
       if (decoder === undefined || queue === undefined) {
@@ -544,7 +553,17 @@ async function run(
   const adjustTier = (): void => {
     const lowest = LAYERS[0]?.spatialId ?? 0;
     const highest = LAYERS[LAYERS.length - 1]?.spatialId ?? 0;
-    const congested = sender.bufferedAmount > IMPAIRMENT_MAX_BUFFERED_BYTES / 2;
+    // 上りの詰まり（送れずに溜まる）と下りの詰まり（届くのが遅れる）の両方を見る。
+    // 上りだけでは下りの不足を検知できない（実測: N-6 で層を下げないまま 115 枚が
+    // 届かなかった）。下りは片道遅延の中央値で見る。
+    const sorted = [...recentDelaysMs].sort((a, b) => a - b);
+    const medianDelayMs = sorted.length === 0 ? 0 : (sorted[Math.trunc(sorted.length / 2)] ?? 0);
+    recentDelaysMs = [];
+    const uplinkCongested = sender.bufferedAmount > IMPAIRMENT_MAX_BUFFERED_BYTES / 2;
+    const downlinkCongested = medianDelayMs > IMPAIRMENT_LOWER_AT_DELAY_MS;
+    const congested = uplinkCongested || downlinkCongested;
+    // 上げる条件は「詰まっておらず、遅延も十分小さい」ことである。
+    const clear = !congested && medianDelayMs < IMPAIRMENT_RAISE_BELOW_DELAY_MS;
     const now = performance.now();
     if (congested) {
       clearSince = now;
@@ -553,12 +572,16 @@ async function run(
       }
     } else {
       congestedSince = null;
+      if (!clear) {
+        // 詰まっていないが遅延が十分小さくない。上げる猶予を数え直す。
+        clearSince = now;
+      }
     }
 
     // 2 秒続けて詰まっていれば下げる。単発の詰まりで下げると上下を繰り返す。
     const shouldLower = congestedSince !== null && now - congestedSince >= 2000;
     // 5 秒続けて詰まりが無ければ上げる。判定 C-3（5 秒で元の層へ戻る）に合わせる。
-    const shouldRaise = !congested && now - clearSince >= 5000;
+    const shouldRaise = clear && now - clearSince >= 5000;
     const next = shouldLower
       ? Math.max(lowest, currentTier - 1)
       : shouldRaise

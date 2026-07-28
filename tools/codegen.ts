@@ -1064,6 +1064,9 @@ function generateImpairmentTs(schema: Record<string, unknown>): string {
   lines.push(`export const IMPAIRMENT_MAX_BUFFERED_BYTES = ${JSON.stringify(recorderRecord["maxBufferedBytes"])};`);
   lines.push("/** 記録の器が使う映像のビットレート。劣化が意味を持つ値にする。 */");
   lines.push(`export const IMPAIRMENT_VIDEO_BITRATE = ${JSON.stringify(recorderRecord["videoBitrate"])};`);
+  lines.push("/** 下りの詰まりを判定する片道遅延（ミリ秒）。 */");
+  lines.push(`export const IMPAIRMENT_LOWER_AT_DELAY_MS = ${JSON.stringify(recorderRecord["lowerAtDelayMs"])};`);
+  lines.push(`export const IMPAIRMENT_RAISE_BELOW_DELAY_MS = ${JSON.stringify(recorderRecord["raiseBelowDelayMs"])};`);
   lines.push("");
   const judgeRecord = asRecord(schema["judgement"]);
   lines.push("/** 受入条件 4.3 の連続性の閾値。 */");

@@ -228,6 +228,9 @@ export const IMPAIRMENT_DEVICE_MTU = 1500;
 export const IMPAIRMENT_MAX_BUFFERED_BYTES = 131072;
 /** 記録の器が使う映像のビットレート。劣化が意味を持つ値にする。 */
 export const IMPAIRMENT_VIDEO_BITRATE = 1200000;
+/** 下りの詰まりを判定する片道遅延（ミリ秒）。 */
+export const IMPAIRMENT_LOWER_AT_DELAY_MS = 400;
+export const IMPAIRMENT_RAISE_BELOW_DELAY_MS = 150;
 
 /** 受入条件 4.3 の連続性の閾値。 */
 export const IMPAIRMENT_MAX_GAP_MS = 1000;
