@@ -1,5 +1,5 @@
 {
-  "$comment": "ネットワーク劣化プロファイル（段 D）。出典は internal/spec/acceptance.md 3.2 である。数値をコードに書かないため、ここを単一情報源とし tools/codegen.ts が生成物を作る。",
+  "$comment": "ネットワーク劣化プロファイル（段 D）。出典は受入条件の規範である。数値をコードに書かないため、ここを単一情報源とし tools/codegen.ts が生成物を作る。",
   "durationSec": 60,
   "profiles": [
     {
