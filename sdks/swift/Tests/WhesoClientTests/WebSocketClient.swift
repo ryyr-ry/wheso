@@ -15,8 +15,19 @@
 
 import Foundation
 
+// プラットフォームごとに POSIX の口が入っている場所が違う。Linux は Glibc、
+// macOS は Darwin である。名前が型の初期化子（connect / send）と衝突するため、
+// モジュールを明示した関数値を 1 箇所で束ねる。
 #if canImport(Glibc)
     import Glibc
+
+    private let systemConnect = Glibc.connect
+    private let systemSend = Glibc.send
+#elseif canImport(Darwin)
+    import Darwin
+
+    private let systemConnect = Darwin.connect
+    private let systemSend = Darwin.send
 #endif
 
 enum WebSocketError: Error, CustomStringConvertible {
@@ -106,7 +117,7 @@ final class WebSocketClient {
 
         let connected = withUnsafePointer(to: &address) { pointer -> Int32 in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { rebound in
-                Glibc.connect(descriptor, rebound, socklen_t(MemoryLayout<sockaddr_in>.size))
+                systemConnect(descriptor, rebound, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
         if connected < 0 {
@@ -355,7 +366,7 @@ final class WebSocketClient {
                 guard let base = raw.baseAddress else {
                     return -1
                 }
-                return Glibc.send(descriptor, base + sent, bytes.count - sent, 0)
+                return systemSend(descriptor, base + sent, bytes.count - sent, 0)
             }
             if written <= 0 {
                 return .ioFailed("send が失敗した")
