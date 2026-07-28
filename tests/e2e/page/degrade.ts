@@ -67,6 +67,10 @@ interface DegradeResult {
   readonly durationMs: number;
 }
 
+interface IsolationResult {
+  readonly participants: readonly DegradeResult[];
+}
+
 declare global {
   interface Window {
     __whesoDegradeResult?: DegradeResult;
@@ -76,14 +80,38 @@ declare global {
       nodeKey: string,
       durationMs: number,
     ) => Promise<DegradeResult>;
+    /**
+     * N-8（参加者ごとに別々の劣化）。参加者ごとに別の終端（別ポート）へ繋ぎ、
+     * 同時に送受信する。悪い回線の 1 人が他の参加者を壊さないことを確かめるための器である。
+     */
+    __whesoIsolation?: (
+      specs: readonly { readonly wsBase: string; readonly senderId: number }[],
+      room: string,
+      nodeKey: string,
+      durationMs: number,
+    ) => Promise<IsolationResult>;
   }
 }
 
 const WIDTH = 320;
 const HEIGHT = 240;
 const FRAMERATE = 15;
-/** 送信者 ID。購読側はこれを指定して購読する。 */
-const SENDER_ID = 1;
+
+/**
+ * 1 人の参加者の接続の指定。
+ *
+ * wsBase を参加者ごとに変えられるようにしてある。**別のポートの終端を指すことで、
+ * 参加者ごとに別々の劣化を掛けられる**（N-8。劣化はポート単位で適用する。ADR-0023）。
+ */
+interface ParticipantSpec {
+  readonly wsBase: string;
+  readonly senderId: number;
+}
+
+/** 購読側の接続 ID。送信側と衝突しないように離す。 */
+function subscriberPk(senderId: number): number {
+  return senderId + 100;
+}
 
 /**
  * 既知の模様を描く。frameIndex が判る形にする理由: 復号後のハッシュだけでは
@@ -179,11 +207,13 @@ async function sendNodeHello(socket: WebSocket, room: string, nodeKey: string, r
 }
 
 async function run(
-  wsBase: string,
+  spec: ParticipantSpec,
   room: string,
   nodeKey: string,
   durationMs: number,
 ): Promise<DegradeResult> {
+  const wsBase = spec.wsBase;
+  const senderId = spec.senderId;
   const fail = (detail: string, codec = ""): DegradeResult => ({
     ok: false,
     detail,
@@ -201,9 +231,9 @@ async function run(
     return fail("使える符号化器が無い");
   }
 
-  const receiver = new WebSocket(`${wsBase}/parties/shard/${room}?_pk=2`);
+  const receiver = new WebSocket(`${wsBase}/parties/shard/${room}?_pk=${String(subscriberPk(senderId))}`);
   receiver.binaryType = "arraybuffer";
-  const sender = new WebSocket(`${wsBase}/parties/shard/${room}?_pk=${String(SENDER_ID)}`);
+  const sender = new WebSocket(`${wsBase}/parties/shard/${room}?_pk=${String(senderId)}`);
   await Promise.all([waitOpen(receiver, "購読側"), waitOpen(sender, "送信側")]);
 
   // 購読側を先に登録する。逆にすると転送先が無く、送ったものが消える。
@@ -211,7 +241,7 @@ async function run(
   receiver.send(
     JSON.stringify({
       t: "subscribe",
-      entries: [{ senderId: SENDER_ID, channel: CHANNEL_VIDEO, maxSpatialId: 3, maxTemporalId: 7 }],
+      entries: [{ senderId, channel: CHANNEL_VIDEO, maxSpatialId: 3, maxTemporalId: 7 }],
     }),
   );
   await sendNodeHello(sender, room, nodeKey, "sender");
@@ -311,7 +341,7 @@ async function run(
       const temporalId = temporalOf(metadata);
       const packed = packEncoded({
         channel: CHANNEL_VIDEO,
-        senderId: SENDER_ID,
+        senderId,
         sequenceNumber: index,
         captureTimestampUs: BigInt(Math.trunc(chunk.timestamp)),
         spatialId: 0,
@@ -426,7 +456,7 @@ function temporalOf(metadata: unknown): number {
 window.__whesoDegrade = async (wsBase, room, nodeKey, durationMs) => {
   // 例外を投げずに結果として返す。投げると Playwright 側で理由が失われる。
   try {
-    const result = await run(wsBase, room, nodeKey, durationMs);
+    const result = await run({ wsBase, senderId: 1 }, room, nodeKey, durationMs);
     window.__whesoDegradeResult = result;
     return result;
   } catch (error) {
@@ -445,4 +475,29 @@ window.__whesoDegrade = async (wsBase, room, nodeKey, durationMs) => {
     window.__whesoDegradeResult = failed;
     return failed;
   }
+};
+
+window.__whesoIsolation = async (specs, room, nodeKey, durationMs) => {
+  // 参加者を**同時に**動かす。順に動かすと「悪い回線の影響」を測れない。
+  const results = await Promise.all(
+    specs.map(async (spec) => {
+      try {
+        return await run({ wsBase: spec.wsBase, senderId: spec.senderId }, room, nodeKey, durationMs);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          detail,
+          codec: "",
+          sent: [],
+          received: [],
+          lastSentAtMs: 0,
+          keyframeRequests: 0,
+          closures: [],
+          durationMs: 0,
+        };
+      }
+    }),
+  );
+  return { participants: results };
 };

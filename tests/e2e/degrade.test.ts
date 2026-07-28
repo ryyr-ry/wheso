@@ -70,6 +70,9 @@ let pageServer: Server | null = null;
 let pagePort = 0;
 let bridgePort = 0;
 let bridge: { close: () => void } | null = null;
+/** N-8 用の 2 本目の終端。参加者ごとに別ポートにすることで劣化を分ける。 */
+let bridgePortB = 0;
+let bridgeB: { close: () => void } | null = null;
 let impairAvailable = false;
 
 async function findFreePort(): Promise<number> {
@@ -156,6 +159,8 @@ before(async () => {
   live = await startLive();
   bridgePort = await findFreePort();
   bridge = startBridge(bridgePort, live.host);
+  bridgePortB = await findFreePort();
+  bridgeB = startBridge(bridgePortB, live.host);
 
   // 終端そのものが通ることを先に確かめる。ここを飛ばすと、ブラウザ側の失敗が
   // 「終端が壊れている」のか「ページが壊れている」のか切り分けられない。
@@ -217,6 +222,8 @@ after(async () => {
   pageServer = null;
   bridge?.close();
   bridge = null;
+  bridgeB?.close();
+  bridgeB = null;
   if (impairAvailable) {
     clearImpairment();
   }
@@ -403,4 +410,100 @@ for (const profile of IMPAIRMENT_PROFILES) {
         ` / 接続断 ${result.closures.length === 0 ? "なし" : result.closures.join(", ")}）`,
     );
   });
+}
+
+/**
+ * N-8: 参加者ごとに別々の劣化（受入条件 3.2 の最重要項目）。
+ *
+ * 何を確かめるか: **悪い回線の 1 人が他の参加者を壊さないこと。** SFU の要件はこれであり、
+ * これを検証しない試験は意味を持たない（受入条件 3.2 の注記）。
+ *
+ * どう分けるか: 参加者ごとに別のポートの終端へ繋ぎ、劣化をポート単位で適用する（ADR-0023）。
+ * 参加者 A は劣化なし、参加者 B に N-6（60 秒で 50 Mbps から 1 Mbps へ連続降下）を掛ける。
+ */
+test("N-8: 参加者ごとに別々の劣化を掛けても、健全な参加者は壊れない", { timeout: 300_000 }, async (context) => {
+  if (!impairAvailable || browser === null || live === null) {
+    context.skip("劣化を適用できない（tc に root が要る）");
+    return;
+  }
+  const seconds = durationSec();
+  const page = await browser.newPage();
+  const logs: string[] = [];
+  page.on("console", (message) => logs.push(message.text()));
+  page.on("pageerror", (error) => logs.push(`pageerror: ${error.message}`));
+  await page.goto(`http://127.0.0.1:${String(pagePort)}/`);
+  await page.waitForFunction("typeof window.__whesoIsolation === 'function'");
+
+  // 参加者 B のポートだけを劣化させる。A のポートには何も掛けない。
+  const driver = driveProfile("N-6", seconds, bridgePortB);
+  let raw: unknown;
+  try {
+    raw = await page.evaluate(
+      async ([baseA, baseB, room, nodeKey, durationMs]) => {
+        const runner = window.__whesoIsolation;
+        if (runner === undefined) {
+          return { participants: [] };
+        }
+        return await runner(
+          [
+            { wsBase: String(baseA), senderId: 11 },
+            { wsBase: String(baseB), senderId: 12 },
+          ],
+          String(room),
+          String(nodeKey),
+          Number(durationMs),
+        );
+      },
+      [
+        `ws://127.0.0.1:${String(bridgePort)}`,
+        `ws://127.0.0.1:${String(bridgePortB)}`,
+        live.room,
+        DEV_NODE_KEY,
+        seconds * 1000,
+      ],
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    driver.stop();
+    await page.close();
+    assert.fail(`ブラウザ側で失敗した: ${detail} / ログ: ${logs.slice(0, 10).join(" | ")}`);
+    return;
+  } finally {
+    driver.stop();
+  }
+  await page.close();
+
+  assert.equal(driver.failures(), 0, "劣化の適用が失敗していない");
+  assert.ok(driver.applied() > 0, "劣化が少なくとも 1 度適用された");
+
+  const participants = asParticipants(raw);
+  assert.equal(participants.length, 2, "2 人ぶんの記録がある");
+  const healthy = participants[0];
+  const impaired = participants[1];
+  assert.ok(healthy !== undefined && impaired !== undefined);
+
+  // 劣化した参加者も送受信は成立しているはずである（壊れていたら比較の意味が無い）。
+  assert.ok(impaired.sent.length > 0, "劣化した参加者も送信できている");
+
+  // **健全な参加者は無傷であること。** これが N-8 の主張である。
+  const violations = judgeAll(healthy, { maxGapMs: IMPAIRMENT_MAX_GAP_MS, requireComplete: true });
+  assert.deepEqual(
+    violations.map((entry) => `${entry.judgement}: ${entry.detail}`),
+    [],
+    `健全な参加者に違反が無い（送 ${String(healthy.sent.length)} / 受 ${String(healthy.received.length)}` +
+      ` / 劣化側 送 ${String(impaired.sent.length)} / 受 ${String(impaired.received.length)}）`,
+  );
+});
+
+/** N-8 の記録を型を確かめて読む。 */
+function asParticipants(value: unknown): readonly DegradeResult[] {
+  if (typeof value !== "object" || value === null) {
+    throw new Error("記録が対象でない");
+  }
+  const record: Record<string, unknown> = { ...value };
+  const participants = record["participants"];
+  if (!Array.isArray(participants)) {
+    throw new Error("参加者の配列が無い");
+  }
+  return participants.map((entry) => asResult(entry));
 }
