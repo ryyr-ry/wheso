@@ -173,15 +173,24 @@ export function judgeCompleteness(record: DegradeRecord): readonly Violation[] {
   ];
 }
 
-/** 判定 E-1: キーフレーム要求が 0 回である。 */
-export function judgeKeyframeRequests(record: DegradeRecord): readonly Violation[] {
-  if (record.keyframeRequests === 0) {
+/**
+ * 判定 E-1: キーフレーム要求が 0 回である。
+ *
+ * ただし受入条件 4.5 は例外を 2 つ認めている。**遮断からの復帰時**と
+ * **tier の spatialId を変更したとき**である。層を上げるときは参照フレームが無いため
+ * 要求が必要であり、これを違反にすると規範より厳しくなる。
+ *
+ * 許される回数を超えた要求は違反である。超えた分は「破棄の実装の誤り」を意味する
+ * （TCP 上では欠落が起こらないため、依存構造に従って捨てれば参照連鎖は壊れない）。
+ */
+export function judgeKeyframeRequests(record: DegradeRecord, allowed = 0): readonly Violation[] {
+  if (record.keyframeRequests <= allowed) {
     return [];
   }
   return [
     {
       judgement: "E-1",
-      detail: `キーフレーム要求が ${String(record.keyframeRequests)} 回発生した`,
+      detail: `キーフレーム要求が ${String(record.keyframeRequests)} 回発生した（許されるのは ${String(allowed)} 回）`,
     },
   ];
 }
@@ -190,6 +199,11 @@ export interface JudgeOptions {
   readonly maxGapMs: number;
   /** 劣化なしの段では欠落 0 を要求する（判定 B-1）。 */
   readonly requireComplete: boolean;
+  /**
+   * 許されるキーフレーム要求の回数（受入条件 4.5 の例外）。
+   * tier の spatialId を変更した回数と、遮断からの復帰回数の合計を渡す。
+   */
+  readonly allowedKeyframeRequests?: number;
 }
 
 /**
@@ -224,7 +238,7 @@ export function judgeAll(record: DegradeRecord, options: JudgeOptions): readonly
     ...judgeHashes(record),
     ...judgeContinuity(record, options.maxGapMs),
     ...judgeDrops(record),
-    ...judgeKeyframeRequests(record),
+    ...judgeKeyframeRequests(record, options.allowedKeyframeRequests ?? 0),
   ];
   if (options.requireComplete) {
     violations.push(...judgeCompleteness(record));

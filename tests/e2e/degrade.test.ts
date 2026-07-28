@@ -420,6 +420,8 @@ for (const profile of IMPAIRMENT_PROFILES) {
       maxGapMs: profile.outage === undefined ? IMPAIRMENT_MAX_GAP_MS : IMPAIRMENT_MAX_GAP_WITH_OUTAGE_MS,
       // 劣化なしの段だけ欠落 0 を要求する（判定 B-1）。
       requireComplete: profile.id === "N-0",
+      // 層を上げた回数だけキーフレーム要求を許す（受入条件 4.5 の例外）。
+      allowedKeyframeRequests: result.tierChanges.filter((entry) => entry.startsWith("上げ")).length,
     });
     assert.deepEqual(
       violations.map((entry) => `${entry.judgement}: ${entry.detail}`),
@@ -525,7 +527,11 @@ test("N-8: 参加者ごとに別々の劣化を掛けても、健全な参加者
   );
 
   // **健全な参加者は無傷であること。** これが N-8 の主張である。
-  const violations = judgeAll(healthy, { maxGapMs: IMPAIRMENT_MAX_GAP_MS, requireComplete: true });
+  const violations = judgeAll(healthy, {
+    maxGapMs: IMPAIRMENT_MAX_GAP_MS,
+    requireComplete: true,
+    allowedKeyframeRequests: healthy.tierChanges.filter((entry) => entry.startsWith("上げ")).length,
+  });
   assert.deepEqual(
     violations.map((entry) => `${entry.judgement}: ${entry.detail}`),
     [],

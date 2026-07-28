@@ -524,14 +524,25 @@ async function run(
     if (next === currentTier) {
       return;
     }
+    const raising = next > currentTier;
     currentTier = next;
-    tierChanges.push(`${degrading ? "下げ" : "上げ"}→${String(next)} at=${performance.now().toFixed(0)}ms`);
+    tierChanges.push(`${raising ? "上げ" : "下げ"}→${String(next)} at=${performance.now().toFixed(0)}ms`);
     receiver.send(
       JSON.stringify({
         t: "subscribe",
         entries: [{ senderId, channel: CHANNEL_VIDEO, maxSpatialId: next, maxTemporalId: 7 }],
       }),
     );
+    if (raising) {
+      // 層を上げるときはキーフレームを要求する（wire-format.md 2.5）。要求しないと、
+      // 参照フレームを持たない層のフレームが届き、復号器が壊れる（実測:
+      // 「復号に失敗: Decoding error.」で全プロファイルが落ちた）。
+      // 判定 E-1 は「tier の spatialId 変更時」の要求を許している（受入条件 4.5）。
+      receiver.send(
+        JSON.stringify({ t: "keyframeRequest", senderId, channel: CHANNEL_VIDEO, spatialId: next }),
+      );
+      keyframeRequests += 1;
+    }
   };
 
   const startedAt = performance.now();
