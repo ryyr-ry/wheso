@@ -5,32 +5,39 @@
  * 通って転送され、実際の復号器で復号でき、画素が送信した模様と一致すること。
  *
  * 構成:
- *   1. 空きポートで `partykit dev` を起動する（認証情報は不要。F-039）
- *   2. E2E の本体（tests/e2e/page/main.ts）を esbuild で束ね、静的に配る
- *   3. Chromium（Playwright）で開き、window.__whesoRun を呼ぶ
+ *   1. 現在のコードを**実環境**（PartyKit managed）へデプロイする
+ *   2. E2E の本体（tests/e2e/page/main.ts）を esbuild で束ね、局所の口から静的に配る
+ *   3. Chromium（Playwright）で開き、window.__whesoRun を呼ぶ。**繋ぐ先は実環境**である
  *   4. 結果を検査する
+ *
+ * 局所実行環境（partykit dev）は使わない。理由は tests/support/live-env.ts の冒頭にある。
+ * ブラウザは wss で実環境へ直に繋ぐ（TLS の終端は要らない）。
  *
  * カメラは使わない。CI の実行機にカメラは無い。映像は canvas から作る（Q-020）。
  */
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { build } from "esbuild";
 import { chromium, type Browser } from "playwright";
 
-const ROOM = "vsh-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0";
+import { DEV_NODE_KEY, newMeetingId, startLive } from "../support/live-env.ts";
+
+/**
+ * 部屋名は実行ごとに新しくする。実環境の Durable Object は試験の後も生き続けるため、
+ * 固定名を使い回すと前回の購読と送信者の登録が残り、結果が変わる。
+ */
+const MEETING_ID = newMeetingId();
+const ROOM = `vsh-${MEETING_ID}-auto-1-0`;
+/** 音声の中継部屋。映像とは別の経路を通る（ADR-0005）。 */
+const AUDIO_ROOM = `ash-${MEETING_ID}-auto-1-0`;
 const root = new URL("../..", import.meta.url).pathname;
 
-/** 局所実行環境で使う開発用のノード鍵。試験専用であり秘密ではない。 */
-const DEV_NODE_KEY = "wheso-dev-node-key-not-a-secret";
-
-let devServer: ChildProcess | null = null;
+let wsBase = "";
 let pageServer: Server | null = null;
 let browser: Browser | null = null;
-let devPort = 0;
 let pagePort = 0;
 
 async function findFreePort(): Promise<number> {
@@ -59,33 +66,12 @@ async function bundleEntry(entry: string): Promise<string> {
   return file === undefined ? "" : file.text;
 }
 
-async function waitForDev(baseUrl: string, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${baseUrl}/party/main`, { signal: AbortSignal.timeout(2000) });
-      if (response.ok) {
-        return true;
-      }
-    } catch {
-      // 起動前は接続できない。
-    }
-    await new Promise((resolve) => {
-      setTimeout(resolve, 500).unref();
-    });
-  }
-  return false;
-}
-
 before(async () => {
-  devPort = await findFreePort();
   pagePort = await findFreePort();
 
-  devServer = spawn("npx", ["partykit", "dev", "--port", String(devPort), "--var", `WHESO_NODE_KEY=${DEV_NODE_KEY}`], {
-    cwd: root,
-    stdio: "ignore",
-    detached: true,
-  });
+  // デプロイし、部屋が開くまで待つ。ブラウザはここへ wss で直に繋ぐ。
+  const live = await startLive();
+  wsBase = live.wsBase;
 
   const videoScript = await bundleEntry("main.ts");
   const audioScript = await bundleEntry("audio.ts");
@@ -115,8 +101,6 @@ before(async () => {
     pageServer?.listen(pagePort, "127.0.0.1", () => resolve());
   });
 
-  const ready = await waitForDev(`http://127.0.0.1:${devPort}`, 120_000);
-  assert.equal(ready, true, "partykit dev が起動する");
 
   browser = await chromium.launch({
     args: [
@@ -139,15 +123,7 @@ after(async () => {
     pageServer.close(() => resolve());
   });
   pageServer = null;
-  const pid = devServer?.pid;
-  devServer = null;
-  if (pid !== undefined) {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      // 既に終了している場合は何もしない。
-    }
-  }
+  // 実環境は落とさない（デプロイしたノードは残る）。
 });
 
 test("実映像が符号化・転送・復号され、画素が一致する", { timeout: 180_000 }, async () => {
@@ -168,7 +144,7 @@ test("実映像が符号化・転送・復号され、画素が一致する", { 
       }
       return await run(String(wsBase), String(room), String(nodeKey));
     },
-    [`ws://127.0.0.1:${devPort}`, ROOM, DEV_NODE_KEY],
+    [wsBase, ROOM, DEV_NODE_KEY],
   );
 
   assert.equal(
@@ -206,7 +182,7 @@ test("否定対照: 購読していない送信者の映像は届かず、検査
       }
       return await run(String(wsBase), String(room), String(nodeKey));
     },
-    [`ws://127.0.0.1:${devPort}`, ROOM, DEV_NODE_KEY],
+    [wsBase, ROOM, DEV_NODE_KEY],
   );
   process.stdout.write(`否定対照の結果: ${JSON.stringify(result)}\n`);
   assert.equal(result.ok, false, "届かない構成では失敗する");
@@ -233,7 +209,7 @@ test("実音声が Opus で符号化・束ね・転送・復号され、波形�
       }
       return await run(String(wsBase), String(room), String(nodeKey));
     },
-    [`ws://127.0.0.1:${devPort}`, "ash-01jxy8kq2r3mz5v7h9abcderfa-auto-1-0", DEV_NODE_KEY],
+    [wsBase, AUDIO_ROOM, DEV_NODE_KEY],
   );
 
   process.stdout.write(`音声 E2E 結果: ${JSON.stringify(result)}\n`);

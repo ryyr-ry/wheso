@@ -20,13 +20,15 @@
     "test": "node --test \"tests/*.test.ts\"",
     "ci": "npm run typecheck && npm run codegen:check && npm run vectors:check && npm run naming:check && npm run auth:check && npm run capacity:check && npm run forbidden:check && npm run trace:receiver:check && npm run trace:check && npm run real-media:check && npm run fuzz:check && npm test",
     "trace:receiver:check": "node tools/traces-receiver.ts check",
-    "test:integration": "node --test --test-concurrency=1 \"tests/integration/**/*.test.ts\"",
-    "test:e2e": "node --test \"tests/e2e/*.test.ts\"",
+    "test:integration": "node --test --test-force-exit --test-concurrency=1 \"tests/integration/*.test.ts\"",
+    "test:e2e": "node --test --test-force-exit \"tests/e2e/*.test.ts\"",
+    "test:transport": "node tools/transport-suite.ts all",
     "test:rust": "cargo test --manifest-path sdks/rust/Cargo.toml",
     "test:cpp": "bash sdks/cpp/run-tests.sh",
     "test:dart": "bash sdks/dart/run-tests.sh",
     "test:kotlin": "bash sdks/kotlin/run-tests.sh",
-    "test:swift": "bash sdks/swift/run-tests.sh"
+    "test:swift": "bash sdks/swift/run-tests.sh",
+    "deploy:test": "partykit deploy --var WHESO_NODE_KEY=wheso-dev-node-key-not-a-secret --var WHESO_TOKEN_KEY=wheso-dev-token-key-not-a-secret"
   },
   "devDependencies": {
     "@types/node": "24.3.0",

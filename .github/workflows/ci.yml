@@ -1,7 +1,14 @@
 name: ci
 
 # 公開リポジトリでのみ実行する。private では Actions の実行時間が課金対象になるため、
-# リポジトリが public であることをジョブの先頭で確認し、public でなければ失敗させる。
+# リポジトリが public であることを各ジョブの先頭で確認し、public でなければ失敗させる。
+#
+# ジョブの分け方: 検査は互いに独立であるため**並列**に走らせる。1 本の直列ジョブにすると、
+# 言語ごとの道具の導入と構築が積み上がり、待ち時間が実際の測定時間を何桁も上回る
+# （手元の直列実行では 1 言語あたり 30 分を超えた）。
+#
+# 疎通試験（段 B）と結合試験と E2E は**実際にデプロイしたノード**に対して行う。
+# 局所実行環境（partykit dev）は本番と前提が違うため使わない。
 on:
   push:
     branches: [main]
@@ -16,7 +23,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  # ── 実環境に触れない検査（型・生成物・凍結ベクタ・トレース・実データ・単体） ──
+  static:
     runs-on: ubuntu-latest
     steps:
       - name: このリポジトリが public であることを確認する
@@ -25,89 +33,64 @@ jobs:
             echo "private リポジトリでは実行しない（課金を避けるため）"
             exit 1
           fi
-
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
           cache: npm
-
       - run: npm ci
-
-      - name: typecheck
-        run: npm run typecheck
-
-      - name: codegen:check
-        run: npm run codegen:check
-
-      - name: vectors:check
-        run: npm run vectors:check
-
-      - name: naming:check
-        run: npm run naming:check
-
-      - name: auth:check
-        run: npm run auth:check
-
-      - name: capacity:check
-        run: npm run capacity:check
-
-      - name: forbidden:check
-        run: npm run forbidden:check
-
-      - name: trace:check
-        run: npm run trace:check
-
-      - name: trace:receiver:check
-        run: npm run trace:receiver:check
-
+      - run: npm run typecheck
+      - run: npm run codegen:check
+      - run: npm run vectors:check
+      - run: npm run naming:check
+      - run: npm run auth:check
+      - run: npm run capacity:check
+      - run: npm run forbidden:check
+      - run: npm run trace:check
+      - run: npm run trace:receiver:check
       - name: real-media:check（実 AV1 / Opus の凍結資産）
         run: npm run real-media:check
+      - run: npm run fuzz:check
+      - run: npm test
 
-      - name: fuzz:check
-        run: npm run fuzz:check
-
-      - name: tests
-        run: npm test
-
-      - name: 結合試験（局所実行環境の Durable Object に対する実接続）
-        run: npm run test:integration
-
-      - name: Chromium を導入する（E2E 用）
-        run: npx playwright install --with-deps chromium
-
-      - name: E2E（実映像の符号化・転送・復号と画素の一致）
-        run: npm run test:e2e
-
-      - name: Rust の適合試験（凍結ベクタとの一致）
-        run: npm run test:rust
-
-      - name: C++ の適合試験（凍結ベクタとの一致）
-        run: npm run test:cpp
-
+  # ── 各言語 SDK の凍結ベクタ・トレース・実データの照合（並列） ──
+  sdk:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, cpp, dart, kotlin]
+    steps:
+      - name: このリポジトリが public であることを確認する
+        run: |
+          if [ "${{ github.event.repository.private }}" = "true" ]; then
+            echo "private リポジトリでは実行しない（課金を避けるため）"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
       - name: Dart を導入する
+        if: matrix.language == 'dart'
         uses: dart-lang/setup-dart@v1
         with:
           sdk: stable
-
-      - name: Dart の適合試験（凍結ベクタとの一致）
-        run: npm run test:dart
-
       - name: JDK を導入する
+        if: matrix.language == 'kotlin'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
       - name: Gradle を導入する
+        if: matrix.language == 'kotlin'
         uses: gradle/actions/setup-gradle@v4
-
-      - name: Kotlin の適合試験（凍結ベクタとの一致）
-        run: npm run test:kotlin
+      - run: npm ci
+      - run: npm run test:${{ matrix.language }}
 
   # Swift は macOS でのみ構築できる。public リポジトリでは実行時間が無償である。
-  verify-swift:
+  sdk-swift:
     runs-on: macos-latest
     steps:
       - name: このリポジトリが public であることを確認する
@@ -116,8 +99,96 @@ jobs:
             echo "private リポジトリでは実行しない（課金を避けるため）"
             exit 1
           fi
-
       - uses: actions/checkout@v4
-
-      - name: Swift の適合試験（凍結ベクタとの一致）
+      - name: Swift の適合試験（凍結ベクタ・トレース・実データ）
         run: bash sdks/swift/run-tests.sh
+
+  # ── 実環境へ 1 度だけデプロイする。以降のジョブは WHESO_SKIP_DEPLOY=1 で使い回す ──
+  deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      deployed: ${{ steps.mark.outputs.deployed }}
+    steps:
+      - name: このリポジトリが public であることを確認する
+        run: |
+          if [ "${{ github.event.repository.private }}" = "true" ]; then
+            echo "private リポジトリでは実行しない（課金を避けるため）"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: 実環境へデプロイする
+        env:
+          PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
+          PARTYKIT_LOGIN: ${{ secrets.PARTYKIT_LOGIN }}
+        run: npm run deploy:test
+      - id: mark
+        run: echo "deployed=yes" >> "$GITHUB_OUTPUT"
+
+  # ── 実環境に対する結合試験と E2E（並列） ──
+  live:
+    needs: deploy
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [integration, e2e]
+    env:
+      WHESO_LIVE_HOST: ${{ secrets.WHESO_LIVE_HOST }}
+      WHESO_SKIP_DEPLOY: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Chromium を導入する（E2E 用）
+        if: matrix.kind == 'e2e'
+        run: npx playwright install --with-deps chromium
+      - name: 実環境に対する試験
+        run: npm run test:${{ matrix.kind }}
+
+  # ── 段 B（疎通）: 5 言語が実環境へ実データを流す。言語ごとに並列 ──
+  transport:
+    needs: deploy
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [kotlin, dart, rust, cpp, swift]
+    env:
+      WHESO_LIVE_HOST: ${{ secrets.WHESO_LIVE_HOST }}
+      WHESO_SKIP_DEPLOY: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Dart を導入する
+        if: matrix.language == 'dart'
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - name: JDK を導入する
+        if: matrix.language == 'kotlin'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Gradle を導入する
+        if: matrix.language == 'kotlin'
+        uses: gradle/actions/setup-gradle@v4
+      - name: Swift を導入する
+        if: matrix.language == 'swift'
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: '6.0'
+      - run: npm ci
+      - name: 疎通試験（実環境。否定対照を含む）
+        run: node tools/transport-suite.ts ${{ matrix.language }}

@@ -1,11 +1,14 @@
 /**
- * 局所実行環境（partykit dev）に対する結合試験（検証階層 L3）。
+ * **実環境（PartyKit managed）**に対する結合試験（検証階層 L3）。
  *
- * 目的は「単体試験が通ることと、実際の Durable Object 実行環境で動くことは別である」
+ * 目的は「単体試験が通ることと、実際の Durable Object で動くことは別である」
  * という前提に立ち、実物の WebSocket で転送が成立することを確かめることである。
  *
+ * 局所実行環境（partykit dev）は使わない。dev は本番と前提が違う（TLS が無い、
+ * 経路が無い、オブジェクトの寿命がプロセスに縛られる）。詳細は tests/support/live-env.ts。
+ *
  * 実行: node --test tests/integration/local-relay.test.ts
- * 起動に時間がかかるため単体試験とは分けている（npm run test:integration）。
+ * デプロイと伝播に時間がかかるため単体試験とは分けている（npm run test:integration）。
  *
  * 検証すること:
  *   1. 中継部屋へ 2 本の WebSocket を張り、購読者へメディアが転送される
@@ -15,10 +18,9 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
-
 import { encodeMediaMessage } from "../../packages/core/src/wire.ts";
 import { deriveMeetingSecret, nodeAuthTag, nodeAuthTimeWindow } from "../../packages/core/src/auth.ts";
+import { DEV_NODE_KEY, startLive } from "../support/live-env.ts";
 import {
   CHANNEL_VIDEO,
   FLAG_DISCARDABLE,
@@ -27,38 +29,17 @@ import {
   WIRE_MAGIC,
 } from "../../packages/core/src/generated/wire-layout.ts";
 
-/**
- * 空きポートを 1 個確保する。
- * 固定ポートにすると、前の実行が残っていた場合に衝突して失敗する。
- */
-async function findFreePort(): Promise<number> {
-  const { createServer } = await import("node:net");
-  return await new Promise<number>((resolve, reject) => {
-    const probe = createServer();
-    probe.on("error", reject);
-    probe.listen(0, "127.0.0.1", () => {
-      const address = probe.address();
-      const port = typeof address === "object" && address !== null ? address.port : 0;
-      probe.close(() => resolve(port));
-    });
-  });
-}
-
-let PORT = 0;
-let BASE = "";
 let WS_BASE = "";
-/** 部屋名は試験ごとに変える。同じ部屋を使い回すと前の試験の状態が残る。 */
-const ROOM_BASE = "vsh-01jxy8kq2r3mz5v7h9abcderfa-auto-1";
+/**
+ * 部屋名は実行ごとに新しくする。実環境の Durable Object は試験の後も生き続けるため、
+ * 固定名を使い回すと前回の購読と送信者の登録が残り、結果が変わる。
+ */
+let ROOM_BASE = "";
 function roomFor(index: number): string {
   return `${ROOM_BASE}-${index}`;
 }
-const ROOM = roomFor(0);
+let ROOM = "";
 
-/**
- * 局所実行環境で使う開発用のノード鍵。
- * 本番の鍵は環境の秘密として与える（Q-019）。この値は試験専用であり秘密ではない。
- */
-const DEV_NODE_KEY = "wheso-dev-node-key-not-a-secret";
 
 /** 中継部屋へノードとして認証する。認証前のメディアは破棄される（wire-format.md 2.8）。 */
 async function sendNodeHello(socket: globalThis.WebSocket, room: string, role: string): Promise<void> {
@@ -75,91 +56,22 @@ async function sendNodeHello(socket: globalThis.WebSocket, room: string, role: s
   socket.send(JSON.stringify({ t: "nodeHello", role, nodeId: room, authTag: tag.ok ? tag.value : "" }));
 }
 
-let server: ChildProcess | null = null;
-
-/** 起動を待つ。主入口の健全性応答が返れば準備完了とする。 */
-async function waitForReady(timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${BASE}/party/main`, { signal: AbortSignal.timeout(2000) });
-      if (response.ok) {
-        return true;
-      }
-    } catch {
-      // 起動前は接続できない。待って再試行する。
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  return false;
-}
-
 before(async () => {
-  PORT = await findFreePort();
-  BASE = `http://127.0.0.1:${PORT}`;
-  WS_BASE = `ws://127.0.0.1:${PORT}`;
-  // detached で起動し、終了時にプロセス群ごと落とす。
-  // partykit dev は子プロセス（実行環境）を起動するため、親だけ落とすと残る。
-  server = spawn("npx", ["partykit", "dev", "--port", String(PORT), "--var", `WHESO_NODE_KEY=${DEV_NODE_KEY}`], {
-    cwd: new URL("../..", import.meta.url).pathname,
-    stdio: "ignore",
-    detached: true,
-  });
-  const ready = await waitForReady(90_000);
-  assert.equal(ready, true, "partykit dev が起動する");
-
-  // 主入口が応えても、役割ごとの部屋は初回接続時に組み立てられる。
-  // 実際に WebSocket が開くまで待つ。待たないと最初の試験が組み立てを待って時限に達する。
-  const socketReady = await waitForSocket(60_000);
-  assert.equal(socketReady, true, "中継部屋へ WebSocket が開く");
+  // デプロイし、この実行のための部屋を用意して、接続できる状態になるまで待つ。
+  const live = await startLive();
+  WS_BASE = live.wsBase;
+  ROOM_BASE = `vsh-${live.meetingId}-auto-1`;
+  ROOM = roomFor(0);
 });
 
-/** 中継部屋へ実際に接続できるまで待つ。 */
-async function waitForSocket(timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const opened = await new Promise<boolean>((resolve) => {
-      const probe = new globalThis.WebSocket(`${WS_BASE}/parties/shard/${ROOM}?_pk=99`);
-      const timer = setTimeout(() => {
-        probe.close();
-        resolve(false);
-      }, 5000);
-      probe.addEventListener("open", () => {
-        clearTimeout(timer);
-        probe.close();
-        resolve(true);
-      });
-      probe.addEventListener("error", () => {
-        clearTimeout(timer);
-        resolve(false);
-      });
-    });
-    if (opened) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  return false;
-}
-
 after(() => {
+  // 実環境は落とさない（デプロイしたノードは残る）。開いた接続だけを閉じる。
   for (const socket of openSockets) {
     if (socket.readyState === socket.OPEN || socket.readyState === socket.CONNECTING) {
       socket.close();
     }
   }
   openSockets.length = 0;
-  const pid = server?.pid;
-  server = null;
-  if (pid === undefined) {
-    return;
-  }
-  try {
-    // 負の PID はプロセス群を指す。実行環境の子プロセスまで落とす。
-    process.kill(-pid, "SIGKILL");
-  } catch {
-    // 既に終了している場合は何もしない。
-  }
 });
 
 /** 接続 ID を指定して中継部屋へ繋ぐ。中継ノードは接続 ID を参加者 ID として読む。 */

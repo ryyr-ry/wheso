@@ -7,7 +7,7 @@
 //
 // 依存を追加しない: WebSocket は java.net.http（JDK 11 以降）、HMAC は javax.crypto を使う。
 //
-// 実行の前提: 局所実行環境が起動していること。環境変数で場所と鍵を受け取る
+// 実行の前提: 実環境（PartyKit managed）へデプロイされていること。環境変数で場所と鍵を受け取る
 // （WHESO_WS_BASE / WHESO_ROOM / WHESO_NODE_KEY / WHESO_SENDER_PK / WHESO_SUB_PK）。
 // 無い場合は飛ばす。起動は tools/transport-suite.ts の責務である。
 package dev.wheso
@@ -129,7 +129,9 @@ class TransportTest {
     @Test
     fun realMediaTravelsThroughLiveNode() {
         val environment = System.getenv()
-        val base = environment["WHESO_WS_BASE"]
+        // JDK の WebSocket は TLS を話せるため、実環境へ直に繋ぐ（wss）。
+        // WHESO_WSS_BASE が無い場合だけ平文の口（TLS 終端）へ落ちる。
+        val base = environment["WHESO_WSS_BASE"] ?: environment["WHESO_WS_BASE"]
         val room = environment["WHESO_ROOM"]
         val key = environment["WHESO_NODE_KEY"]
         val senderPk = environment["WHESO_SENDER_PK"]

@@ -19,7 +19,7 @@ if [ "$STATUS" -ne 0 ]; then
 fi
 
 PASSED=$(echo "$OUTPUT" | grep -c "' passed" || true)
-MIN_TESTS=11
+MIN_TESTS=22
 if [ "$PASSED" -lt "$MIN_TESTS" ]; then
   echo "FAIL 試験が ${MIN_TESTS} 件以上成功していない（実際 ${PASSED} 件）"
   exit 1
