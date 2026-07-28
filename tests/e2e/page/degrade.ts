@@ -545,7 +545,7 @@ async function run(
    *
    * この制御は段 D の前提（層を下げられること）を成立させるための最小限であり、
    * 受信ノードの判断コアの代用ではない。本来の姿は受信ノードを経由する構成である
-   * （PROGRESS 5.10.8 の「記録の器を SDK 経由にする」）。
+   * （記録の器を SDK 経由にする作業として計画に残してある）。
    */
   let congestedSince: number | null = null;
   let clearSince = performance.now();
