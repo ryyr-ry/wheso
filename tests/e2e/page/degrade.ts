@@ -30,6 +30,7 @@ import {
   CHANNEL_VIDEO,
   FLAG_KEY,
 } from "../../../packages/core/src/generated/wire-layout.ts";
+import { IMPAIRMENT_MAX_BUFFERED_BYTES } from "../../../packages/core/src/generated/impairment.ts";
 
 interface SentRecord {
   readonly frameIndex: number;
@@ -324,7 +325,9 @@ async function run(
         return;
       }
       // 送信が詰まっている間は送らない。詰めて送ると劣化ではなく自分で輻輳を作る。
-      if (sender.bufferedAmount > 1_000_000) {
+      // 閾値が大きいと詰まりに気付かず送り続け、経路が壊れてから欠落として現れる
+      // （N-7 で両方向が 1006 で切れた。実測）。
+      if (sender.bufferedAmount > IMPAIRMENT_MAX_BUFFERED_BYTES) {
         return;
       }
       sender.send(packed.value);

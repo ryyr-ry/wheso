@@ -221,8 +221,11 @@ export const IMPAIRMENT_PROFILES: readonly ImpairmentProfile[] =
 
 export const IMPAIRMENT_BURST_KBIT = 32;
 export const IMPAIRMENT_BURST_DIVISOR = 250;
-export const IMPAIRMENT_LATENCY_MS = 50;
+export const IMPAIRMENT_LATENCY_MS = 300;
 export const IMPAIRMENT_DEVICE_MTU = 1500;
+
+/** 記録の器が送信を止める送出待ちの上限。 */
+export const IMPAIRMENT_MAX_BUFFERED_BYTES = 131072;
 
 /** 受入条件 4.3 の連続性の閾値。 */
 export const IMPAIRMENT_MAX_GAP_MS = 1000;

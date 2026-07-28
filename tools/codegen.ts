@@ -1059,6 +1059,10 @@ function generateImpairmentTs(schema: Record<string, unknown>): string {
   lines.push(`export const IMPAIRMENT_LATENCY_MS = ${JSON.stringify(bucketRecord["latencyMs"])};`);
   lines.push(`export const IMPAIRMENT_DEVICE_MTU = ${JSON.stringify(bucketRecord["deviceMtu"])};`);
   lines.push("");
+  const recorderRecord = asRecord(schema["recorder"]);
+  lines.push("/** 記録の器が送信を止める送出待ちの上限。 */");
+  lines.push(`export const IMPAIRMENT_MAX_BUFFERED_BYTES = ${JSON.stringify(recorderRecord["maxBufferedBytes"])};`);
+  lines.push("");
   const judgeRecord = asRecord(schema["judgement"]);
   lines.push("/** 受入条件 4.3 の連続性の閾値。 */");
   lines.push(`export const IMPAIRMENT_MAX_GAP_MS = ${JSON.stringify(judgeRecord["maxGapMs"])};`);
