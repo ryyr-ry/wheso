@@ -128,6 +128,29 @@ function drawPattern(index: number): OffscreenCanvas {
   }
   context.fillStyle = "rgb(32, 160, 64)";
   context.fillRect(0, 0, WIDTH, HEIGHT);
+
+  // **非圧縮性のノイズを敷く**（測定の 5 原則の 1）。
+  //
+  // なぜ必要か: 単純な模様では符号化器が指定したビットレートを使わない。2.5 Mbps を
+  // 指定しても数百 kbps しか出ず、帯域を絞っても影響が現れなかった（N-8 で健全側と
+  // 劣化側がどちらも 904 枚と実測）。それでは「悪い回線」が存在せず、劣化試験が空洞になる。
+  //
+  // 画素ごとに乱数を書くと CPU が持たないため、8 画素の矩形で塗る。矩形の単位でも
+  // 隣接画素の相関が消えるため、フレーム間予測もフレーム内予測も効かない。
+  const blockSize = 8;
+  let seed = (index + 1) * 2654435761;
+  for (let y = 0; y < HEIGHT; y += blockSize) {
+    for (let x = 0; x < WIDTH; x += blockSize) {
+      // 決定的な擬似乱数（xorshift）。ブラウザの乱数に依らず再現できるようにする。
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      const level = Math.abs(seed) % 256;
+      context.fillStyle = `rgb(${level}, ${(level * 7) % 256}, ${(level * 13) % 256})`;
+      context.fillRect(x, y, blockSize, blockSize);
+    }
+  }
+
   // 動きを入れる。動きが無いとエンコーダが同じフレームを出さないことがある。
   context.fillStyle = "rgb(255, 255, 255)";
   context.fillRect((index * 8) % WIDTH, 0, 8, HEIGHT);

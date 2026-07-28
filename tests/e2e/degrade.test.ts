@@ -395,6 +395,12 @@ for (const profile of IMPAIRMENT_PROFILES) {
     assert.ok(result.sent.length > 0, "1 枚以上を送っている");
     assert.ok(result.received.length > 0, "1 枚以上を受け取っている");
 
+    // 実測を必ず残す。緑のときも数値が見えないと、劣化が効いていたのかを後から確かめられない。
+    process.stdout.write(
+      `${profile.id} の実測: 送 ${String(result.sent.length)} / 受 ${String(result.received.length)}` +
+        ` / 接続断 ${result.closures.length === 0 ? "なし" : result.closures.join(", ")}\n`,
+    );
+
     // 判定は共通の純関数で行う（tests/support/degrade-judge.ts）。
     // 遮断を持つ段は C-2（復帰 1500 ms 以内）で見る。遮断中の停止は避けられず、
     // C-1（1000 ms）を課すと TCP の再送を待つ分だけで超える（実測 1036 ms）。

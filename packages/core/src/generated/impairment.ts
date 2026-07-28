@@ -227,7 +227,7 @@ export const IMPAIRMENT_DEVICE_MTU = 1500;
 /** 記録の器が送信を止める送出待ちの上限。 */
 export const IMPAIRMENT_MAX_BUFFERED_BYTES = 131072;
 /** 記録の器が使う映像のビットレート。劣化が意味を持つ値にする。 */
-export const IMPAIRMENT_VIDEO_BITRATE = 2500000;
+export const IMPAIRMENT_VIDEO_BITRATE = 1200000;
 
 /** 受入条件 4.3 の連続性の閾値。 */
 export const IMPAIRMENT_MAX_GAP_MS = 1000;
