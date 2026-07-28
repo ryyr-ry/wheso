@@ -41,6 +41,7 @@ export const ERROR_DEFINITIONS = {
   E_EPOCH_STALE: { closeCode: 4040, recoverable: true, autoReconnect: true, i18nKey: "error.epoch.stale" },
   E_MEETING_ENDED: { closeCode: 4041, recoverable: false, autoReconnect: false, i18nKey: "error.meeting.ended" },
   E_EVICTED: { closeCode: 4042, recoverable: false, autoReconnect: false, i18nKey: "error.meeting.evicted" },
+  E_MEETING_LOCKED: { closeCode: 4043, recoverable: false, autoReconnect: false, i18nKey: "error.meeting.locked" },
   E_NAME_MEETING_ID: { closeCode: 4050, recoverable: false, autoReconnect: false, i18nKey: "error.name.meetingId" },
   E_NAME_USER_ID: { closeCode: 4051, recoverable: false, autoReconnect: false, i18nKey: "error.name.userId" },
   E_NAME_REGION: { closeCode: 4052, recoverable: false, autoReconnect: false, i18nKey: "error.name.region" },

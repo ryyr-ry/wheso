@@ -31,6 +31,7 @@ public enum WhesoErrors {
     public static let E_EPOCH_STALE_CLOSE_CODE: Int64 = 4040
     public static let E_MEETING_ENDED_CLOSE_CODE: Int64 = 4041
     public static let E_EVICTED_CLOSE_CODE: Int64 = 4042
+    public static let E_MEETING_LOCKED_CLOSE_CODE: Int64 = 4043
     public static let E_NAME_MEETING_ID_CLOSE_CODE: Int64 = 4050
     public static let E_NAME_USER_ID_CLOSE_CODE: Int64 = 4051
     public static let E_NAME_REGION_CLOSE_CODE: Int64 = 4052

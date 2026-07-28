@@ -34,6 +34,7 @@ inline constexpr std::int64_t E_ROOM_FULL_CLOSE_CODE = 4033;
 inline constexpr std::int64_t E_EPOCH_STALE_CLOSE_CODE = 4040;
 inline constexpr std::int64_t E_MEETING_ENDED_CLOSE_CODE = 4041;
 inline constexpr std::int64_t E_EVICTED_CLOSE_CODE = 4042;
+inline constexpr std::int64_t E_MEETING_LOCKED_CLOSE_CODE = 4043;
 inline constexpr std::int64_t E_NAME_MEETING_ID_CLOSE_CODE = 4050;
 inline constexpr std::int64_t E_NAME_USER_ID_CLOSE_CODE = 4051;
 inline constexpr std::int64_t E_NAME_REGION_CLOSE_CODE = 4052;

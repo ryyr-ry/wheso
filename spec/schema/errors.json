@@ -198,6 +198,14 @@
       "i18nKey": "error.meeting.evicted"
     },
     {
+      "name": "E_MEETING_LOCKED",
+      "closeCode": 4043,
+      "recoverable": false,
+      "autoReconnect": false,
+      "i18nKey": "error.meeting.locked",
+      "note": "会議が施錠されている。主催者が解錠するまで参加できない（state-machines 6 節）"
+    },
+    {
       "name": "E_NAME_MEETING_ID",
       "closeCode": 4050,
       "recoverable": false,

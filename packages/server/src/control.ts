@@ -23,9 +23,17 @@ import {
   type ControlState,
 } from "./control-handler.ts";
 import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
+import { MAX_CONNECT_ATTEMPTS_PER_MIN } from "@wheso/core/src/generated/constants.ts";
+import { admit, initialRateWindow, type RateWindow } from "@wheso/core/src/rate-limit.ts";
 
 /** 認証前の接続に許す猶予。これを超えて hello が来ない接続は閉じる。 */
 const HELLO_TIMEOUT_MS = 5000;
+
+/**
+ * 接続試行を数える窓の長さ。規範は「20 回/分」であるため 1 分とする（auth.md 5 節）。
+ * 秒数をここに書かないため、分をミリ秒へ直す形で表す。
+ */
+const CONNECT_WINDOW_MS = 60_000;
 
 export class ControlNode implements Party.Server {
   private state: ControlState = createControlState();
@@ -33,12 +41,31 @@ export class ControlNode implements Party.Server {
   /** 接続 ID から認証済みの利用者 ID を引く。未認証の接続は含まない。 */
   private readonly authenticated = new Map<string, string>();
 
+  /**
+   * 接続試行の計数（auth.md 5 節。1 利用者あたり 20 回/分）。
+   *
+   * この部屋は 1 利用者専用である（部屋名が `ctl-<会議 ID>-<利用者 ID>`）。
+   * したがって部屋あたりの試行を数えれば利用者あたりの制限になる。
+   * カウンタはインメモリで保持し、evict で失われてよい（規範に明記がある）。
+   */
+  private connectWindow: RateWindow = initialRateWindow(0);
+
   constructor(readonly room: Party.Room) {}
 
   onConnect(connection: Party.Connection): void {
+    // 接続試行のレート制限。超過は E_RATE_LIMIT_CONNECT で閉じる。
+    // 判断は純関数（rate-limit.ts）に置き、ここでは時刻の取得と切断だけを行う。
+    const decision = admit(this.connectWindow, Date.now(), CONNECT_WINDOW_MS, MAX_CONNECT_ATTEMPTS_PER_MIN);
+    this.connectWindow = decision.window;
+    if (!decision.allowed) {
+      connection.close(
+        ERROR_DEFINITIONS.E_RATE_LIMIT_CONNECT.closeCode,
+        "E_RATE_LIMIT_CONNECT",
+      );
+      return;
+    }
     // 未認証の接続を放置しない。猶予を過ぎたら閉じる（auth.md 5 節の濫用対策）。
     void this.room.storage.setAlarm(Date.now() + HELLO_TIMEOUT_MS);
-    void connection;
   }
 
   onClose(connection: Party.Connection): void {

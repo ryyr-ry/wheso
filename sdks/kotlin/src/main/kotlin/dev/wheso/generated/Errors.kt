@@ -32,6 +32,7 @@ public object Errors {
     public const val E_EPOCH_STALE_CLOSE_CODE: Long = 4040L
     public const val E_MEETING_ENDED_CLOSE_CODE: Long = 4041L
     public const val E_EVICTED_CLOSE_CODE: Long = 4042L
+    public const val E_MEETING_LOCKED_CLOSE_CODE: Long = 4043L
     public const val E_NAME_MEETING_ID_CLOSE_CODE: Long = 4050L
     public const val E_NAME_USER_ID_CLOSE_CODE: Long = 4051L
     public const val E_NAME_REGION_CLOSE_CODE: Long = 4052L
