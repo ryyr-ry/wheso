@@ -492,6 +492,18 @@ test("N-8: 参加者ごとに別々の劣化を掛けても、健全な参加者
   // 劣化した参加者も送受信は成立しているはずである（壊れていたら比較の意味が無い）。
   assert.ok(impaired.sent.length > 0, "劣化した参加者も送信できている");
 
+  // **劣化が実際に劣化側へ効いたこと。** これが無いと「悪い回線の 1 人」が存在せず、
+  // N-8 の主張（他の参加者を壊さない）を検証したことにならない。
+  // 効き方は 2 通りある。送出待ちが溢れて送信を止める（送信枚数が減る）か、
+  // 帯域が足りず転送で捨てられる（受信が送信より少ない）である。
+  const fewerSent = impaired.sent.length < healthy.sent.length;
+  const droppedInTransit = impaired.received.length < impaired.sent.length;
+  assert.ok(
+    fewerSent || droppedInTransit,
+    `劣化側に劣化の影響が現れている（送 ${String(impaired.sent.length)} 対 健全 ${String(healthy.sent.length)}` +
+      ` / 受 ${String(impaired.received.length)}）`,
+  );
+
   // **健全な参加者は無傷であること。** これが N-8 の主張である。
   const violations = judgeAll(healthy, { maxGapMs: IMPAIRMENT_MAX_GAP_MS, requireComplete: true });
   assert.deepEqual(

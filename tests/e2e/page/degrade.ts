@@ -30,7 +30,10 @@ import {
   CHANNEL_VIDEO,
   FLAG_KEY,
 } from "../../../packages/core/src/generated/wire-layout.ts";
-import { IMPAIRMENT_MAX_BUFFERED_BYTES } from "../../../packages/core/src/generated/impairment.ts";
+import {
+  IMPAIRMENT_MAX_BUFFERED_BYTES,
+  IMPAIRMENT_VIDEO_BITRATE,
+} from "../../../packages/core/src/generated/impairment.ts";
 
 interface SentRecord {
   readonly frameIndex: number;
@@ -143,7 +146,7 @@ async function pickCodec(): Promise<string | null> {
       width: WIDTH,
       height: HEIGHT,
       framerate: FRAMERATE,
-      bitrate: 600_000,
+      bitrate: IMPAIRMENT_VIDEO_BITRATE,
     });
     if (support.supported === true) {
       return codec;
@@ -382,10 +385,10 @@ async function run(
         width: WIDTH,
         height: HEIGHT,
         framerate: FRAMERATE,
-        bitrate: 600_000,
+        bitrate: IMPAIRMENT_VIDEO_BITRATE,
         scalabilityMode: "L1T3",
       }
-    : { codec, width: WIDTH, height: HEIGHT, framerate: FRAMERATE, bitrate: 600_000 };
+    : { codec, width: WIDTH, height: HEIGHT, framerate: FRAMERATE, bitrate: IMPAIRMENT_VIDEO_BITRATE };
   encoder.configure(encoderConfig);
 
   const startedAt = performance.now();
