@@ -134,7 +134,26 @@ export function showImpairment(): string {
  * 構造: root に tbf（帯域）、その子に netem（遅延・ジッタ・再順序・重複）を置く。
  * 帯域制限が無い段では tbf を置かず netem だけを root に置く（tbf は帯域が必須である）。
  */
-export function applyStep(step: ImpairmentStep): boolean {
+/**
+ * 1 つの段を、**指定したポート宛（および発）の通信だけ**に適用する。
+ *
+ * なぜポートで絞るか: 装置全体（ループバック）に qdisc を置くと、試験に無関係な通信も
+ * 同じ制限を受ける。段 D ではページの配信と Playwright の CDP がループバックを通るため、
+ * 帯域を絞ると Chromium との通信ごと詰まり、**劣化ではなく試験系が壊れる**。
+ * 実測では N-6（50 Mbps）で 5.7 秒、N-7（2 Mbps）で 17.3 秒に両方向の接続が 1006
+ * （異常切断）になった。原因は経路の共有である。
+ *
+ * 構造:
+ *   root に prio（3 バンド）を置き、既定の通信はバンド 1（無劣化）へ流す。
+ *   バンド 3 に tbf（帯域）と netem（遅延・ジッタ・再順序・重複）を置く。
+ *   u32 フィルタで「送信元ポート または 宛先ポートが port」の通信だけをバンド 3 へ送る。
+ *
+ * この形は N-8（参加者ごとに別々の劣化）への道でもある。参加者ごとに別のポートを使えば、
+ * 同じ装置の上で別々の劣化を掛けられる（ネットワーク名前空間を作らずに済む）。
+ *
+ * port が 0 の場合は装置全体へ適用する（自己検査で使う）。
+ */
+export function applyStep(step: ImpairmentStep, port = 0): boolean {
   clearImpairment();
 
   const netemArgs: string[] = [];
@@ -153,56 +172,109 @@ export function applyStep(step: ImpairmentStep): boolean {
     netemArgs.push("duplicate", `${String(step.duplicatePercent)}%`);
   }
 
-  if (step.rateKbit > 0) {
-    // burst は帯域に比例させる（規範の目安は rate の 1/250 秒）。固定値にすると
-    // 高い帯域で小さすぎ、TCP のバーストが常に落ちて接続が壊れる（実測）。
-    const burstKbit = Math.max(
-      Math.trunc(step.rateKbit / IMPAIRMENT_BURST_DIVISOR),
-      IMPAIRMENT_BURST_KBIT,
-    );
-    const added = runTc([
-      "qdisc",
-      "add",
-      "dev",
-      DEVICE,
-      "root",
-      "handle",
-      "1:",
-      "tbf",
-      "rate",
-      `${String(step.rateKbit)}kbit`,
-      "burst",
-      `${String(burstKbit)}kbit`,
-      "latency",
-      `${String(IMPAIRMENT_LATENCY_MS)}ms`,
-    ]);
-    if (!added.ok) {
-      return false;
-    }
-    if (netemArgs.length === 0) {
-      return true;
-    }
-    const child = runTc([
-      "qdisc",
-      "add",
-      "dev",
-      DEVICE,
-      "parent",
-      "1:",
-      "handle",
-      "10:",
-      "netem",
-      ...netemArgs,
-    ]);
-    return child.ok;
-  }
-
-  if (netemArgs.length === 0) {
+  if (step.rateKbit <= 0 && netemArgs.length === 0) {
     // N-0（劣化なし）。何も置かない状態が正しい。
     return true;
   }
-  const added = runTc(["qdisc", "add", "dev", DEVICE, "root", "netem", ...netemArgs]);
-  return added.ok;
+
+  // burst は帯域に比例させる（規範の目安は rate の 1/250 秒）。固定値にすると
+  // 高い帯域で小さすぎ、TCP のバーストが常に落ちて接続が壊れる（実測）。
+  const burstKbit = Math.max(
+    Math.trunc(step.rateKbit / IMPAIRMENT_BURST_DIVISOR),
+    IMPAIRMENT_BURST_KBIT,
+  );
+
+  if (port <= 0) {
+    // 装置全体へ適用する（自己検査。ほかの通信が無い前提で使う）。
+    if (step.rateKbit > 0) {
+      const added = runTc([
+        "qdisc", "add", "dev", DEVICE, "root", "handle", "1:",
+        "tbf", "rate", `${String(step.rateKbit)}kbit`,
+        "burst", `${String(burstKbit)}kbit`,
+        "latency", `${String(IMPAIRMENT_LATENCY_MS)}ms`,
+      ]);
+      if (!added.ok) {
+        return false;
+      }
+      if (netemArgs.length === 0) {
+        return true;
+      }
+      return runTc([
+        "qdisc", "add", "dev", DEVICE, "parent", "1:", "handle", "10:", "netem", ...netemArgs,
+      ]).ok;
+    }
+    return runTc(["qdisc", "add", "dev", DEVICE, "root", "netem", ...netemArgs]).ok;
+  }
+
+  // ポート限定。既定のバンドは無劣化のままにする。
+  const root = runTc(["qdisc", "add", "dev", DEVICE, "root", "handle", "1:", "prio", "bands", "3"]);
+  if (!root.ok) {
+    return false;
+  }
+
+  // バンド 3（1:3）に劣化を積む。帯域と遅延の両方がある場合は tbf の子に netem を置く。
+  if (step.rateKbit > 0) {
+    const shaped = runTc([
+      "qdisc", "add", "dev", DEVICE, "parent", "1:3", "handle", "30:",
+      "tbf", "rate", `${String(step.rateKbit)}kbit`,
+      "burst", `${String(burstKbit)}kbit`,
+      "latency", `${String(IMPAIRMENT_LATENCY_MS)}ms`,
+    ]);
+    if (!shaped.ok) {
+      return false;
+    }
+    if (netemArgs.length > 0) {
+      const delayed = runTc([
+        "qdisc", "add", "dev", DEVICE, "parent", "30:", "handle", "31:", "netem", ...netemArgs,
+      ]);
+      if (!delayed.ok) {
+        return false;
+      }
+    }
+  } else {
+    const delayed = runTc([
+      "qdisc", "add", "dev", DEVICE, "parent", "1:3", "handle", "30:", "netem", ...netemArgs,
+    ]);
+    if (!delayed.ok) {
+      return false;
+    }
+  }
+
+  // 送信元と宛先の両方向を拾う。片方だけでは上りか下りのどちらかが素通しになる。
+  const asDestination = runTc([
+    "filter", "add", "dev", DEVICE, "protocol", "ip", "parent", "1:", "prio", "1",
+    "u32", "match", "ip", "dport", String(port), "0xffff", "flowid", "1:3",
+  ]);
+  const asSource = runTc([
+    "filter", "add", "dev", DEVICE, "protocol", "ip", "parent", "1:", "prio", "1",
+    "u32", "match", "ip", "sport", String(port), "0xffff", "flowid", "1:3",
+  ]);
+  return asDestination.ok && asSource.ok;
+}
+
+/** ポート限定で 100% 落とす（遮断）。 */
+function applyLossOnPort(port: number): CommandResult {
+  const root = runTc(["qdisc", "add", "dev", DEVICE, "root", "handle", "1:", "prio", "bands", "3"]);
+  if (!root.ok) {
+    return root;
+  }
+  const loss = runTc([
+    "qdisc", "add", "dev", DEVICE, "parent", "1:3", "handle", "30:", "netem", "loss", "100%",
+  ]);
+  if (!loss.ok) {
+    return loss;
+  }
+  const asDestination = runTc([
+    "filter", "add", "dev", DEVICE, "protocol", "ip", "parent", "1:", "prio", "1",
+    "u32", "match", "ip", "dport", String(port), "0xffff", "flowid", "1:3",
+  ]);
+  if (!asDestination.ok) {
+    return asDestination;
+  }
+  return runTc([
+    "filter", "add", "dev", DEVICE, "protocol", "ip", "parent", "1:", "prio", "1",
+    "u32", "match", "ip", "sport", String(port), "0xffff", "flowid", "1:3",
+  ]);
 }
 
 export function profileById(id: string): ImpairmentProfile | undefined {
@@ -220,10 +292,16 @@ export function stepAt(profile: ImpairmentProfile, atSec: number): ImpairmentSte
   return current;
 }
 
-/** 完全な遮断。qdisc で全部を落とす（loss 100%）。 */
-export async function outage(durationMs: number): Promise<boolean> {
+/**
+ * 完全な遮断。指定したポートの通信だけを 100% 落とす。
+ * port が 0 の場合は装置全体を落とす（自己検査で使う）。
+ */
+export async function outage(durationMs: number, port = 0): Promise<boolean> {
   clearImpairment();
-  const added = runTc(["qdisc", "add", "dev", DEVICE, "root", "netem", "loss", "100%"]);
+  const added =
+    port <= 0
+      ? runTc(["qdisc", "add", "dev", DEVICE, "root", "netem", "loss", "100%"])
+      : applyLossOnPort(port);
   if (!added.ok) {
     return false;
   }

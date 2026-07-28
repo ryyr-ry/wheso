@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 
 import {
   judgeAll,
+  judgeConnections,
   judgeCompleteness,
   judgeContinuity,
   judgeDrops,
@@ -155,4 +156,24 @@ test("劣化下では欠落を許すが、破棄できない層の欠落は許�
   const strict = judgeAll({ ...base, received: dropTop }, { maxGapMs: 1500, requireComplete: true });
   assert.equal(strict.length, 1);
   assert.equal(strict[0]?.judgement, "B-1");
+});
+
+test("接続が切れた記録は、それ自体を違反として報告する", () => {
+  const base = healthyRecord(30);
+  // 途中で切れ、以降が届かない記録を作る。
+  const truncated = { ...base, received: base.received.slice(0, 10), closures: ["購読側 code=1006 at=5768ms"] };
+  const violations = judgeConnections(truncated);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0]?.judgement, "接続");
+
+  // judgeAll では切断だけを返す。B-2 の大量違反に埋もれさせない。
+  const all = judgeAll(truncated, { maxGapMs: 1000, requireComplete: false });
+  assert.equal(all.length, 1, "報告は切断 1 件だけである");
+  assert.equal(all[0]?.judgement, "接続");
+});
+
+test("接続が切れていなければ通常の判定を行う", () => {
+  const base = healthyRecord(30);
+  const clean = { ...base, closures: [] };
+  assert.deepEqual(judgeAll(clean, { maxGapMs: 1000, requireComplete: true }), []);
 });

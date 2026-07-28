@@ -283,7 +283,11 @@ function durationSec(): number {
 }
 
 /** プロファイルの段を時刻に沿って適用し続ける。終わったら劣化を解除する。 */
-function driveProfile(profileId: string, seconds: number): { stop: () => void; failures: () => number; applied: () => number } {
+function driveProfile(
+  profileId: string,
+  seconds: number,
+  port: number,
+): { stop: () => void; failures: () => number; applied: () => number } {
   const profile = IMPAIRMENT_PROFILES.find((entry) => entry.id === profileId);
   if (profile === undefined) {
     throw new Error(`未知のプロファイル: ${profileId}`);
@@ -301,7 +305,7 @@ function driveProfile(profileId: string, seconds: number): { stop: () => void; f
     const step = stepAt(profile, elapsedSec);
     if (step !== undefined && step.atSec !== appliedAtSec) {
       appliedAtSec = step.atSec;
-      if (applyStep(step)) {
+      if (applyStep(step, port)) {
         appliedCount += 1;
       } else {
         failureCount += 1;
@@ -312,10 +316,10 @@ function driveProfile(profileId: string, seconds: number): { stop: () => void; f
       // 遮断の適用と解除は同期で行う（ここは試験の実行側であり判断コアではない）。
       void (async () => {
         const { outage: applyOutage } = await import("../../tools/impair.ts");
-        await applyOutage(outage.durationMs);
+        await applyOutage(outage.durationMs, port);
         const back = stepAt(profile, elapsedSec);
         if (back !== undefined) {
-          applyStep(back);
+          applyStep(back, port);
         }
       })();
     }
@@ -346,7 +350,9 @@ for (const profile of IMPAIRMENT_PROFILES) {
     await page.goto(`http://127.0.0.1:${String(pagePort)}/`);
     await page.waitForFunction("typeof window.__whesoDegrade === 'function'");
 
-    const driver = driveProfile(profile.id, seconds);
+    // 劣化は**この試験の終端のポートだけ**に掛ける。装置全体に掛けると、ページの配信と
+    // Playwright の CDP も同じ制限を受け、劣化ではなく試験系が壊れる（実測）。
+    const driver = driveProfile(profile.id, seconds, bridgePort);
     let raw: unknown;
     try {
       raw = await page.evaluate(

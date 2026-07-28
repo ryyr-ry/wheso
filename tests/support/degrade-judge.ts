@@ -31,6 +31,8 @@ export interface DegradeRecord {
   /** 最後に送った時刻。これ以降の受信間隔は「固まった」の判定に含めない。 */
   readonly lastSentAtMs: number;
   readonly keyframeRequests: number;
+  /** 接続が閉じた記録（閉鎖コードと時刻）。空であれば切れていない。 */
+  readonly closures?: readonly string[];
 }
 
 export interface Violation {
@@ -162,8 +164,33 @@ export interface JudgeOptions {
   readonly requireComplete: boolean;
 }
 
+/**
+ * 接続が切れていないこと。
+ *
+ * これを独立した判定にする理由: 経路が切れると以降の全フレームが届かず、B-2（破棄できない
+ * 層が落ちた）の違反が大量に並ぶ。原因は破棄の判断ではなく経路であり、真の原因が
+ * 埋もれる。切断を先に報告し、B-2 は切断が無い場合にのみ意味を持つ。
+ */
+export function judgeConnections(record: DegradeRecord): readonly Violation[] {
+  const closures = record.closures ?? [];
+  if (closures.length === 0) {
+    return [];
+  }
+  return [
+    {
+      judgement: "接続",
+      detail: `試験の途中で接続が切れた（${closures.join(", ")}）`,
+    },
+  ];
+}
+
 /** すべての判定を行い、違反の一覧を返す。空であれば合格である。 */
 export function judgeAll(record: DegradeRecord, options: JudgeOptions): readonly Violation[] {
+  // 接続が切れていたら、そこで報告を打ち切る。以降の判定は経路の失敗の写しになる。
+  const closed = judgeConnections(record);
+  if (closed.length > 0) {
+    return closed;
+  }
   const violations: Violation[] = [
     ...judgeMonotonic(record),
     ...judgeHashes(record),
