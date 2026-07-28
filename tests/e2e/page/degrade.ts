@@ -535,12 +535,32 @@ async function run(
    * 上げる。閾値は SHARD_TREND_* の定数）。器が判断を持たないと、下り帯域が詰まったまま
    * 無選別に落ち、破棄優先順位の検証ができない（実測: N-6 で破棄できない層まで欠落した）。
    */
+  /**
+   * 遅延の趨勢に使う標本列。1 秒ごとの**中央値**を並べる。
+   *
+   * なぜ中央値か: 毎フレームの生の遅延は揺れが大きく、劣化が無くても勾配が閾値を超える
+   * （実測: N-0 で層が 10 回以上上下した）。1 秒ごとに代表値を 1 つ取れば、
+   * 趨勢だけが残る。規範の受信ノードも「集約した標本列」を受け取る形になっている。
+   */
+  const trendSamplesUs: number[] = [];
+
   const adjustTier = (): void => {
     if (delaySamplesUs.length < 4) {
       return;
     }
-    const trend = delaySlope(delaySamplesUs);
+    const sorted = [...delaySamplesUs].sort((a, b) => a - b);
+    const median = sorted[Math.trunc(sorted.length / 2)] ?? 0;
     delaySamplesUs = [];
+    trendSamplesUs.push(median);
+    // 直近 6 秒ぶんだけを見る。長く持つと復帰に時間がかかり、判定 C-3（5 秒で戻る）に
+    // 間に合わない。
+    while (trendSamplesUs.length > 6) {
+      trendSamplesUs.shift();
+    }
+    if (trendSamplesUs.length < 3) {
+      return;
+    }
+    const trend = delaySlope(trendSamplesUs);
     const degrading =
       trend.numerator * SHARD_TREND_ENTER_T2_DEN > SHARD_TREND_ENTER_T2_NUM * trend.denominator;
     const recovering =
