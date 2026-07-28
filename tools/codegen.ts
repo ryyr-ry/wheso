@@ -1056,6 +1056,7 @@ function generateImpairmentTs(schema: Record<string, unknown>): string {
   const bucketRecord = asRecord(schema["tokenBucket"]);
   lines.push(`export const IMPAIRMENT_BURST_KBIT = ${JSON.stringify(bucketRecord["burstKbit"])};`);
   lines.push(`export const IMPAIRMENT_LATENCY_MS = ${JSON.stringify(bucketRecord["latencyMs"])};`);
+  lines.push(`export const IMPAIRMENT_DEVICE_MTU = ${JSON.stringify(bucketRecord["deviceMtu"])};`);
   lines.push("");
   const verifyRecord = asRecord(schema["verification"]);
   lines.push("/** 劣化が実際に効いていることを確かめるための判定値。 */");

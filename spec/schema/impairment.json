@@ -62,7 +62,9 @@
   "tokenBucket": {
     "$comment": "tbf の付帯値。burst は rate の 1/250 秒相当を目安とし、latency は輻輳判定が働く前に落とさない値にする",
     "burstKbit": 32,
-    "latencyMs": 50
+    "latencyMs": 50,
+    "$comment2": "ループバックの既定 MTU は 65536 バイト（512 kbit）であり、burst 32 kbit ではパケットが 1 つも通らず TCP が ETIMEDOUT で壊れる（CI で実測）。実際のクライアント経路に合わせて 1500 へ下げる",
+    "deviceMtu": 1500
   },
   "verification": {
     "$comment": "劣化が実際に効いていることを確かめるための判定値。効いていない劣化試験は無意味であるため必ず測る",

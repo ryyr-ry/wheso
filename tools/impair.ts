@@ -21,6 +21,7 @@
  *
  * 実行:
  *   node tools/impair.ts show
+ *   node tools/impair.ts prepare          装置の MTU を実際の経路に合わせる
  *   node tools/impair.ts apply N-1        プロファイルの最初の段を適用する
  *   node tools/impair.ts step N-2 15      指定秒の段を適用する
  *   node tools/impair.ts outage 500       指定ミリ秒だけ完全に遮断する
@@ -34,6 +35,7 @@ import { performance } from "node:perf_hooks";
 
 import {
   IMPAIRMENT_BURST_KBIT,
+  IMPAIRMENT_DEVICE_MTU,
   IMPAIRMENT_LATENCY_MS,
   IMPAIRMENT_MIN_DELAY_INCREASE_MS,
   IMPAIRMENT_MIN_SECONDS_AT_PROBE_RATE,
@@ -70,6 +72,32 @@ function runTc(args: readonly string[]): CommandResult {
     ok: false,
     output: `${direct.stderr}${viaSudo.stderr}`.trim(),
   };
+}
+
+/** ip を実行する。tc と同じく失敗を例外にしない。 */
+function runIp(args: readonly string[]): CommandResult {
+  const direct = spawnSync("ip", args, { encoding: "utf8" });
+  if (direct.status === 0) {
+    return { ok: true, output: `${direct.stdout}${direct.stderr}` };
+  }
+  const viaSudo = spawnSync("sudo", ["-n", "ip", ...args], { encoding: "utf8" });
+  if (viaSudo.status === 0) {
+    return { ok: true, output: `${viaSudo.stdout}${viaSudo.stderr}` };
+  }
+  return { ok: false, output: `${direct.stderr}${viaSudo.stderr}`.trim() };
+}
+
+/**
+ * 装置の MTU を実際のクライアント経路に合わせる。
+ *
+ * なぜ必要か: ループバックの既定 MTU は 65536 バイト（512 kbit）である。tbf の burst
+ * （32 kbit）より 1 パケットが大きいと、パケットが 1 つも通らず TCP が ETIMEDOUT で
+ * 壊れる（CI で実測。帯域制限を適用した直後に接続が死んだ）。
+ * 家庭回線の MTU に合わせて下げることで、劣化の再現も実際の経路に近づく。
+ */
+export function prepareDevice(): boolean {
+  const applied = runIp(["link", "set", "dev", DEVICE, "mtu", String(IMPAIRMENT_DEVICE_MTU)]);
+  return applied.ok;
 }
 
 /** 劣化を適用できるかを確かめる。使えない環境では段 D を飛ばす。 */
@@ -222,7 +250,7 @@ async function measure(bytes: number): Promise<number> {
   const port = typeof address === "object" && address !== null ? address.port : 0;
 
   const started = performance.now();
-  const elapsed = await new Promise<number>((resolve, reject) => {
+  const elapsed = await new Promise<number>((resolve) => {
     const client = connect({ host: "127.0.0.1", port }, () => {
       client.write(payload);
     });
@@ -231,7 +259,13 @@ async function measure(bytes: number): Promise<number> {
       client.destroy();
       resolve(value);
     });
-    client.on("error", reject);
+    // 劣化が強いと接続そのものが壊れる。例外にせず、経過時間として扱う
+    // （呼び出し側は「時間がかかった」ことを劣化の効果として判定する）。
+    client.on("error", () => {
+      const value = performance.now() - started;
+      client.destroy();
+      resolve(value);
+    });
     setTimeout(() => {
       client.destroy();
       resolve(performance.now() - started);
@@ -254,6 +288,12 @@ export async function selftest(): Promise<boolean> {
     process.stdout.write("SKIP 劣化を適用できない（tc に root が要る）\n");
     return true;
   }
+
+  if (!prepareDevice()) {
+    process.stdout.write("FAIL 装置の MTU を設定できない\n");
+    return false;
+  }
+  process.stdout.write(`装置 ${DEVICE} の MTU を ${String(IMPAIRMENT_DEVICE_MTU)} にした\n`);
 
   const baselineTime = await measure(IMPAIRMENT_PROBE_BYTES);
   process.stdout.write(`劣化なしの往復: ${baselineTime.toFixed(1)} ms\n`);
@@ -335,6 +375,12 @@ async function main(): Promise<void> {
     process.stdout.write(`${showImpairment()}\n`);
     return;
   }
+  if (command === "prepare") {
+    const ok = prepareDevice();
+    process.stdout.write(ok ? `MTU を ${String(IMPAIRMENT_DEVICE_MTU)} にした\n` : "MTU を設定できない（root が要る）\n");
+    process.exitCode = ok ? 0 : 1;
+    return;
+  }
   if (command === "clear") {
     process.stdout.write(clearImpairment() ? "劣化を解除した\n" : "解除できない（root が要る）\n");
     return;
@@ -366,6 +412,7 @@ async function main(): Promise<void> {
       process.exitCode = 2;
       return;
     }
+    prepareDevice();
     const ok = applyStep(step);
     process.stdout.write(
       ok
