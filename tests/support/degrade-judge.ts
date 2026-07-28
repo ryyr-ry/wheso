@@ -33,6 +33,12 @@ export interface DegradeRecord {
   readonly keyframeRequests: number;
   /** 接続が閉じた記録（閉鎖コードと時刻）。空であれば切れていない。 */
   readonly closures?: readonly string[];
+  /**
+   * ワイヤで届いた frameIndex の一覧（復号の成否に依らない）。
+   * 与えられた場合、転送の判定（B-2）はこちらに対して行う。与えられない場合は
+   * received を使う（合成した記録で判定そのものを試験するときに使う）。
+   */
+  readonly arrived?: readonly number[];
 }
 
 export interface Violation {
@@ -107,7 +113,12 @@ export function judgeContinuity(record: DegradeRecord, maxGapMs: number): readon
  * 依存構造が壊れた状態で描画したか、単発の欠落が起きたことを意味する。
  */
 export function judgeDrops(record: DegradeRecord): readonly Violation[] {
-  const arrived = new Set(record.received.map((entry) => entry.frameIndex));
+  // 転送の欠落を見る。復号できたかは別の問題であり、混ぜると原因の層を取り違える。
+  const arrived = new Set(
+    record.arrived !== undefined
+      ? record.arrived
+      : record.received.map((entry) => entry.frameIndex),
+  );
   const temporalIds = record.sent.map((entry) => entry.temporalId);
   const highestTemporal = temporalIds.length === 0 ? 0 : Math.max(...temporalIds);
   const violations: Violation[] = [];

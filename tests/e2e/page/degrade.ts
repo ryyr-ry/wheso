@@ -67,6 +67,12 @@ interface DegradeResult {
    * 区別するために要る（区別できないと、原因を取り違えたまま実装を直そうとする）。
    */
   readonly closures: readonly string[];
+  /**
+   * **ワイヤで届いた** frameIndex の一覧（復号の成否に依らない）。
+   * received（復号できたもの）と分ける理由: 欠落が「転送で捨てられた」のか
+   * 「届いたが復号器が出力しなかった」のかを区別できないと、原因の層を取り違える。
+   */
+  readonly arrived: readonly number[];
   readonly durationMs: number;
 }
 
@@ -249,6 +255,7 @@ async function run(
     lastSentAtMs: 0,
     keyframeRequests: 0,
     closures: [],
+    arrived: [],
     durationMs: 0,
   });
 
@@ -278,6 +285,7 @@ async function run(
   let keyframeRequests = 0;
   let decodeError = "";
   const closures: string[] = [];
+  const arrived: number[] = [];
   receiver.addEventListener("close", (event: CloseEvent) => {
     closures.push(`購読側 code=${String(event.code)} at=${performance.now().toFixed(0)}ms`);
   });
@@ -335,6 +343,7 @@ async function run(
     }
     for (const unit of decoded.value.units) {
       const isKey = (unit.flags & FLAG_KEY) !== 0;
+      arrived.push(unit.sequenceNumber);
       pendingIndexes.push({
         frameIndex: unit.sequenceNumber,
         temporalId: unit.temporalId,
@@ -454,6 +463,7 @@ async function run(
     lastSentAtMs,
     keyframeRequests,
     closures,
+    arrived,
     durationMs: Math.trunc(durationActual),
   };
 }
@@ -496,6 +506,7 @@ window.__whesoDegrade = async (wsBase, room, nodeKey, durationMs) => {
       lastSentAtMs: 0,
       keyframeRequests: 0,
       closures: [],
+      arrived: [],
       durationMs: 0,
     };
     window.__whesoDegradeResult = failed;
@@ -520,6 +531,7 @@ window.__whesoIsolation = async (specs, room, nodeKey, durationMs) => {
           lastSentAtMs: 0,
           keyframeRequests: 0,
           closures: [],
+          arrived: [],
           durationMs: 0,
         };
       }

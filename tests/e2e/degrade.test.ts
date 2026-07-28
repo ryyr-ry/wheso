@@ -62,6 +62,7 @@ interface DegradeResult {
   readonly lastSentAtMs: number;
   readonly keyframeRequests: number;
   readonly closures: readonly string[];
+  readonly arrived: readonly number[];
   readonly durationMs: number;
 }
 
@@ -278,6 +279,9 @@ function asResult(value: unknown): DegradeResult {
     closures: Array.isArray(record["closures"])
       ? record["closures"].filter((entry): entry is string => typeof entry === "string")
       : [],
+    arrived: Array.isArray(record["arrived"])
+      ? record["arrived"].filter((entry): entry is number => typeof entry === "number")
+      : [],
     durationMs: typeof record["durationMs"] === "number" ? record["durationMs"] : 0,
   };
 }
@@ -397,7 +401,8 @@ for (const profile of IMPAIRMENT_PROFILES) {
 
     // 実測を必ず残す。緑のときも数値が見えないと、劣化が効いていたのかを後から確かめられない。
     process.stdout.write(
-      `${profile.id} の実測: 送 ${String(result.sent.length)} / 受 ${String(result.received.length)}` +
+      `${profile.id} の実測: 送 ${String(result.sent.length)} / 届 ${String(result.arrived.length)}` +
+        ` / 復号 ${String(result.received.length)}` +
         ` / 接続断 ${result.closures.length === 0 ? "なし" : result.closures.join(", ")}\n`,
     );
 
@@ -490,8 +495,10 @@ test("N-8: 参加者ごとに別々の劣化を掛けても、健全な参加者
 
   // 実測を必ず残す。緑のときも数値が見えないと「劣化が効いていたのか」を後から確かめられない。
   process.stdout.write(
-    `N-8 の実測: 健全 送 ${String(healthy.sent.length)} / 受 ${String(healthy.received.length)}` +
-      `、劣化 送 ${String(impaired.sent.length)} / 受 ${String(impaired.received.length)}` +
+    `N-8 の実測: 健全 送 ${String(healthy.sent.length)} / 届 ${String(healthy.arrived.length)}` +
+      ` / 復号 ${String(healthy.received.length)}` +
+      `、劣化 送 ${String(impaired.sent.length)} / 届 ${String(impaired.arrived.length)}` +
+      ` / 復号 ${String(impaired.received.length)}` +
       `、劣化側の接続断 ${impaired.closures.length === 0 ? "なし" : impaired.closures.join(", ")}\n`,
   );
 
@@ -503,7 +510,7 @@ test("N-8: 参加者ごとに別々の劣化を掛けても、健全な参加者
   // 効き方は 2 通りある。送出待ちが溢れて送信を止める（送信枚数が減る）か、
   // 帯域が足りず転送で捨てられる（受信が送信より少ない）である。
   const fewerSent = impaired.sent.length < healthy.sent.length;
-  const droppedInTransit = impaired.received.length < impaired.sent.length;
+  const droppedInTransit = impaired.arrived.length < impaired.sent.length;
   assert.ok(
     fewerSent || droppedInTransit,
     `劣化側に劣化の影響が現れている（送 ${String(impaired.sent.length)} 対 健全 ${String(healthy.sent.length)}` +
