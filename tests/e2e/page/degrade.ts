@@ -324,37 +324,48 @@ async function run(
     closures.push(`送信側 code=${String(event.code)} at=${performance.now().toFixed(0)}ms`);
   });
 
-  // 受信したフレームと frameIndex を結び付けるため、復号の順に待ち行列から引く。
-  // 復号器は入力順に出力するため、この対応は崩れない。
-  const pendingIndexes: { frameIndex: number; temporalId: number; isKey: boolean }[] = [];
-  const decoder = new VideoDecoder({
-    output: (frame) => {
-      const head = pendingIndexes.shift();
-      // 時刻は**復号できた瞬間**に取る。ハッシュの計算完了を待って記録すると、
-      // 計算がまとまって遅れたときに「固まった」と誤判定する（実測で 2 秒の見かけの
-      // 間隔が出た）。ハッシュは後から差し込む。
-      const atMs = performance.now();
-      const slot = received.length;
-      received.push({
-        frameIndex: head?.frameIndex ?? 0,
-        temporalId: head?.temporalId ?? 0,
-        isKey: head?.isKey ?? false,
-        sha256: "",
-        atMs,
-      });
-      void hashFrame(frame).then((sha256) => {
-        const entry = received[slot];
-        if (entry !== undefined) {
-          received[slot] = { ...entry, sha256 };
-        }
-        frame.close();
-      });
-    },
-    error: (error) => {
-      decodeError = error.message;
-    },
-  });
-  decoder.configure({ codec, codedWidth: WIDTH, codedHeight: HEIGHT });
+  /**
+   * 復号器は**空間層ごとに**持つ。1 つの復号器へ異なる解像度のフレームを入れると
+   * 設定と食い違い、復号器が閉じる（実測: 全プロファイルが
+   * 「Cannot call 'decode' on a closed codec」で失敗した）。
+   *
+   * 受信したフレームと frameIndex を結び付けるため、層ごとに待ち行列から順に引く。
+   * 復号器は入力順に出力するため、この対応は崩れない。
+   */
+  const pendingByLayer = new Map<number, { frameIndex: number; temporalId: number; isKey: boolean }[]>();
+  const decoders = new Map<number, VideoDecoder>();
+  for (const layer of LAYERS) {
+    const queue: { frameIndex: number; temporalId: number; isKey: boolean }[] = [];
+    pendingByLayer.set(layer.spatialId, queue);
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        const head = queue.shift();
+        // 時刻は**復号できた瞬間**に取る。ハッシュの計算完了を待って記録すると、
+        // 計算がまとまって遅れたときに「固まった」と誤判定する。
+        const atMs = performance.now();
+        const slot = received.length;
+        received.push({
+          frameIndex: head?.frameIndex ?? 0,
+          temporalId: head?.temporalId ?? 0,
+          isKey: head?.isKey ?? false,
+          sha256: "",
+          atMs,
+        });
+        void hashFrame(frame).then((sha256) => {
+          const entry = received[slot];
+          if (entry !== undefined) {
+            received[slot] = { ...entry, sha256 };
+          }
+          frame.close();
+        });
+      },
+      error: (error) => {
+        decodeError = error.message;
+      },
+    });
+    decoder.configure({ codec, codedWidth: layer.width, codedHeight: layer.height });
+    decoders.set(layer.spatialId, decoder);
+  }
 
   receiver.addEventListener("message", (event: MessageEvent<unknown>) => {
     if (typeof event.data === "string") {
@@ -375,10 +386,16 @@ async function run(
     for (const unit of decoded.value.units) {
       const isKey = (unit.flags & FLAG_KEY) !== 0;
       arrived.push(unit.sequenceNumber);
+      const decoder = decoders.get(unit.spatialId);
+      const queue = pendingByLayer.get(unit.spatialId);
+      if (decoder === undefined || queue === undefined) {
+        // 知らない層は数えない（購読の上限を下げた直後に届くことがある）。
+        continue;
+      }
       // 遅延の標本を集める。送信と受信が同じページであるため時計が共通であり、
       // 撮影時刻との差がそのまま片道の遅延になる。
       delaySamplesUs.push(Math.trunc(performance.now() * 1000) - Number(unit.captureTimestampUs));
-      pendingIndexes.push({
+      queue.push({
         frameIndex: unit.sequenceNumber,
         temporalId: unit.temporalId,
         isKey,
@@ -532,7 +549,12 @@ async function run(
   const lastSentAtMs = sent[sent.length - 1]?.atMs ?? 0;
   // 転送と復号が追いつくのを待つ。実環境の往復（片道 12.5 ms）と復号の待ちを見込む。
   await sleep(3000);
-  await decoder.flush();
+  for (const decoder of decoders.values()) {
+    // 閉じた復号器へ flush すると例外になる。誤りが記録されている場合は飛ばす。
+    if (decodeError === "") {
+      await decoder.flush();
+    }
+  }
   await sleep(1000);
 
   const durationActual = performance.now() - startedAt;
