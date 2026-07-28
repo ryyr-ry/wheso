@@ -155,6 +155,28 @@ before(async () => {
   bridgePort = await findFreePort();
   bridge = startBridge(bridgePort, live.host);
 
+  // 終端そのものが通ることを先に確かめる。ここを飛ばすと、ブラウザ側の失敗が
+  // 「終端が壊れている」のか「ページが壊れている」のか切り分けられない。
+  const bridgeOk = await new Promise<boolean>((resolve) => {
+    const probe = new globalThis.WebSocket(
+      `ws://127.0.0.1:${String(bridgePort)}/parties/shard/${live?.room ?? ""}?_pk=98`,
+    );
+    const timer = setTimeout(() => {
+      probe.close();
+      resolve(false);
+    }, 20_000);
+    probe.addEventListener("open", () => {
+      clearTimeout(timer);
+      probe.close();
+      resolve(true);
+    });
+    probe.addEventListener("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+  assert.equal(bridgeOk, true, "TLS 終端を通して実環境の部屋へ繋がる");
+
   pagePort = await findFreePort();
   const script = await bundleEntry("degrade.ts");
   assert.notEqual(script, "", "記録の器を束ねられる");
@@ -346,6 +368,8 @@ for (const profile of IMPAIRMENT_PROFILES) {
     const page = await browser.newPage();
     const logs: string[] = [];
     page.on("console", (message) => logs.push(message.text()));
+    page.on("pageerror", (error) => logs.push(`pageerror: ${error.message}`));
+    page.on("requestfailed", (request) => logs.push(`requestfailed: ${request.url()}`));
     await page.goto(`http://127.0.0.1:${String(pagePort)}/`);
     await page.waitForFunction("typeof window.__whesoDegrade === 'function'");
 
@@ -362,6 +386,12 @@ for (const profile of IMPAIRMENT_PROFILES) {
         },
         [`ws://127.0.0.1:${String(bridgePort)}`, live.room, DEV_NODE_KEY, seconds * 1000],
       );
+    } catch (error) {
+      // 何が起きたかを記録に残す。ブラウザ側の例外だけでは原因が判らない。
+      const detail = error instanceof Error ? error.message : String(error);
+      driver.stop();
+      await page.close();
+      assert.fail(`ブラウザ側で失敗した: ${detail} / ログ: ${logs.slice(0, 10).join(" | ")}`);
     } finally {
       driver.stop();
       await page.close();

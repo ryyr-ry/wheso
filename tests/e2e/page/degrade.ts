@@ -134,14 +134,23 @@ async function hashFrame(frame: VideoFrame): Promise<string> {
   return out;
 }
 
-function waitOpen(socket: WebSocket): Promise<void> {
+function waitOpen(socket: WebSocket, label: string): Promise<void> {
   return new Promise((resolve, reject) => {
     if (socket.readyState === WebSocket.OPEN) {
       resolve();
       return;
     }
+    // 閉じられた理由（コード）を残す。4023 なら認証、それ以外は経路の問題である。
     socket.addEventListener("open", () => resolve());
-    socket.addEventListener("error", () => reject(new Error("WebSocket を開けない")));
+    socket.addEventListener("close", (event: CloseEvent) => {
+      reject(new Error(`${label} が閉じた（code=${String(event.code)} reason=${event.reason}）`));
+    });
+    socket.addEventListener("error", () => {
+      reject(new Error(`${label} を開けない（url=${socket.url}）`));
+    });
+    setTimeout(() => {
+      reject(new Error(`${label} が 20 秒で開かない（url=${socket.url}）`));
+    }, 20_000);
   });
 }
 
@@ -185,7 +194,7 @@ async function run(
   const receiver = new WebSocket(`${wsBase}/parties/shard/${room}?_pk=2`);
   receiver.binaryType = "arraybuffer";
   const sender = new WebSocket(`${wsBase}/parties/shard/${room}?_pk=${String(SENDER_ID)}`);
-  await Promise.all([waitOpen(receiver), waitOpen(sender)]);
+  await Promise.all([waitOpen(receiver, "購読側"), waitOpen(sender, "送信側")]);
 
   // 購読側を先に登録する。逆にすると転送先が無く、送ったものが消える。
   await sendNodeHello(receiver, room, nodeKey, "receiver");
@@ -384,7 +393,23 @@ function temporalOf(metadata: unknown): number {
 }
 
 window.__whesoDegrade = async (wsBase, room, nodeKey, durationMs) => {
-  const result = await run(wsBase, room, nodeKey, durationMs);
-  window.__whesoDegradeResult = result;
-  return result;
+  // 例外を投げずに結果として返す。投げると Playwright 側で理由が失われる。
+  try {
+    const result = await run(wsBase, room, nodeKey, durationMs);
+    window.__whesoDegradeResult = result;
+    return result;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const failed: DegradeResult = {
+      ok: false,
+      detail,
+      codec: "",
+      sent: [],
+      received: [],
+      keyframeRequests: 0,
+      durationMs: 0,
+    };
+    window.__whesoDegradeResult = failed;
+    return failed;
+  }
 };
