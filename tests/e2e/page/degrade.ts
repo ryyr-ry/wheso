@@ -324,6 +324,14 @@ async function run(
   const sentAtByIndex = new Map<number, number>();
   /** 現在の購読上限層。最初は最上位を要求する。 */
   let currentTier = LAYERS[LAYERS.length - 1]?.spatialId ?? 0;
+  /**
+   * 層ごとの「キーフレームを待っている」状態。
+   *
+   * 層を上げた直後は、その層のフレームが中継ノードで捨てられていた期間があるため、
+   * 参照フレームが揃っていない。キーフレームが来るまで復号器へ入れない。
+   * 入れると復号器が壊れる（実測: Decoding error）。
+   */
+  const waitingForKey = new Set<number>();
   /** tier を変えた回数と履歴。判定と診断に使う。 */
   const tierChanges: string[] = [];
   receiver.addEventListener("close", (event: CloseEvent) => {
@@ -401,6 +409,14 @@ async function run(
         // 知らない層は数えない（購読の上限を下げた直後に届くことがある）。
         continue;
       }
+      const isKeyUnit = (unit.flags & FLAG_KEY) !== 0;
+      if (waitingForKey.has(unit.spatialId)) {
+        if (!isKeyUnit) {
+          // キーフレームが来るまでは復号しない。参照が揃っていない。
+          continue;
+        }
+        waitingForKey.delete(unit.spatialId);
+      }
       // 遅延の標本を集める。送信と受信が同じページであるため時計が共通である。
       const sentAt = sentAtByIndex.get(unit.sequenceNumber);
       if (sentAt !== undefined) {
@@ -421,11 +437,26 @@ async function run(
     }
   });
 
+  /**
+   * 層ごとに「次はキーフレームを出す」印。キーフレーム要求を受けたら立てる。
+   * 応答しないと、層を上げた受信側に参照フレームが揃わず復号器が壊れる（実測）。
+   */
+  const forceKeyframe = new Set<number>();
+
   // 送信側もキーフレーム要求を受け取る立場にある（中継が送信ノード経由で伝える）。
   sender.addEventListener("message", (event: MessageEvent<unknown>) => {
-    if (typeof event.data === "string" && event.data.includes("keyframeRequest")) {
-      keyframeRequests += 1;
+    if (typeof event.data !== "string" || !event.data.includes("keyframeRequest")) {
+      return;
     }
+    // 要求された層を読む。読めない場合は全層に出す（安全側）。
+    const requested = readRequestedSpatialId(event.data);
+    if (requested === null) {
+      for (const layer of LAYERS) {
+        forceKeyframe.add(layer.spatialId);
+      }
+      return;
+    }
+    forceKeyframe.add(requested);
   });
 
   let frameIndex = 0;
@@ -534,6 +565,8 @@ async function run(
       }),
     );
     if (raising) {
+      // 上げた層はキーフレームが来るまで復号しない。
+      waitingForKey.add(next);
       // 層を上げるときはキーフレームを要求する（wire-format.md 2.5）。要求しないと、
       // 参照フレームを持たない層のフレームが届き、復号器が壊れる（実測:
       // 「復号に失敗: Decoding error.」で全プロファイルが落ちた）。
@@ -553,9 +586,11 @@ async function run(
     for (const entry of encoders) {
       const canvas = drawPattern(index, entry.width, entry.height);
       const frame = new VideoFrame(canvas, { timestamp: index * frameIntervalMs * 1000 });
-      // キーフレームは最初の 1 枚だけにする。判定 E-1（要求 0 回）を確かめるため、
-      // 定期キーフレームで欠落が隠れないようにする。
-      entry.encoder.encode(frame, { keyFrame: index === 0 });
+      // キーフレームは最初の 1 枚と、要求されたときだけにする。定期キーフレームを出すと
+      // 欠落が隠れ、破棄の判定が働かなくなる。
+      const wanted = index === 0 || forceKeyframe.has(entry.spatialId);
+      forceKeyframe.delete(entry.spatialId);
+      entry.encoder.encode(frame, { keyFrame: wanted });
       frame.close();
     }
     index += 1;
@@ -604,6 +639,25 @@ async function run(
     tierChanges,
     durationMs: Math.trunc(durationActual),
   };
+}
+
+/**
+ * キーフレーム要求から spatialId を読む。読めない場合は null を返す。
+ * JSON.parse の結果は unknown で受け、実行時に検査する（型定義を信用しない）。
+ */
+function readRequestedSpatialId(text: string): number | null {
+  let value: unknown = null;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const record: Record<string, unknown> = { ...value };
+  const spatialId = record["spatialId"];
+  return typeof spatialId === "number" ? spatialId : null;
 }
 
 /**
