@@ -90,14 +90,31 @@ function startBridge(port: number, host: string): { close: () => void } {
   const open = new Set<import("node:net").Socket>();
   const server = createNetServer((client) => {
     const upstream = tlsConnect({ host, port: 443, servername: host }, () => {
-      client.pipe(upstream);
       upstream.pipe(client);
+    });
+    // Host ヘッダを実環境の名前へ書き換える。
+    //
+    // なぜ終端で書き換えるか: 実環境は Host でルーティングする。ブラウザは
+    // `127.0.0.1:<port>` を Host に書き、上書きできない（禁止ヘッダである）。
+    // 自前のクライアント（Swift / Rust / C++）は自分で書けるため書き換えない。
+    // 書き換えるのは**最初のリクエストの頭だけ**で、以降のフレームは素通しする。
+    let rewritten = false;
+    client.on("data", (chunk: Buffer) => {
+      if (rewritten) {
+        upstream.write(chunk);
+        return;
+      }
+      rewritten = true;
+      const text = chunk.toString("latin1");
+      const fixed = text.replace(/\r\nHost:[^\r\n]*\r\n/i, `\r\nHost: ${host}\r\n`);
+      upstream.write(Buffer.from(fixed, "latin1"));
     });
     open.add(client);
     client.on("close", () => open.delete(client));
     upstream.on("error", () => client.destroy());
     client.on("error", () => upstream.destroy());
     upstream.on("close", () => client.destroy());
+    client.on("end", () => upstream.end());
   });
   server.listen(port, "127.0.0.1");
   return {
