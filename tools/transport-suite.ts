@@ -147,17 +147,33 @@ async function waitForRoom(timeoutMs: number): Promise<boolean> {
  * Host ヘッダはクライアントが書くため、各言語へ WHESO_WS_HOST で正しい名前を渡す。
  * 終端側で書き換えると HTTP を解釈することになり、余計な誤りの余地が生まれる。
  */
-function startTlsBridge(port: number): Server {
+function startTlsBridge(port: number): { server: Server; closeAll: () => void } {
+  // 開いた口を覚えておく理由: server.close() は待ち受けを閉じるだけで、確立済みの接続は
+  // 残る。残った接続がイベントループを掴み、判定が済んでもプロセスが終わらない
+  // （CI で「OK」を出した後に 12 分の時限で打ち切られた。実測）。
+  const open = new Set<Socket>();
   const server = createServer((client: Socket) => {
     const upstream = tlsConnect({ host: HOST, port: 443, servername: HOST }, () => {
       client.pipe(upstream);
       upstream.pipe(client);
     });
+    open.add(client);
+    client.on("close", () => open.delete(client));
     upstream.on("error", () => client.destroy());
     client.on("error", () => upstream.destroy());
+    upstream.on("close", () => client.destroy());
   });
   server.listen(port, "127.0.0.1");
-  return server;
+  return {
+    server,
+    closeAll: () => {
+      for (const socket of open) {
+        socket.destroy();
+      }
+      open.clear();
+      server.close();
+    },
+  };
 }
 
 interface Target {
@@ -321,14 +337,17 @@ async function main(): Promise<void> {
       }
     }
   } finally {
-    bridge.close();
+    bridge.closeAll();
   }
 
   if (failed) {
     process.exitCode = 1;
-    return;
+    // 明示的に終える。判定が済んでも、待ち受けや解決済みでない接続が残ると
+    // プロセスが終わらない。CI では時限まで待たされる。
+    process.exit(1);
   }
   process.stdout.write(`OK: 疎通試験（段 B）が実環境（${HOST}）で通った\n`);
+  process.exit(0);
 }
 
 await main();

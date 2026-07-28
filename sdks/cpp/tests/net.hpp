@@ -268,6 +268,9 @@ class WebSocketClient {
 
   /// 1 フレームを受け取る。断片は連結し、ping には pong を返す。
   /// 読めなかった場合は kind = None を返す（時間切れか切断）。
+  /// 未処理の受信バイト数。解釈のずれを診断するために覗く。
+  std::size_t pendingSize() const { return pending_.size(); }
+
   Frame receive() {
     for (;;) {
       if (!fill(2)) {

@@ -198,6 +198,10 @@ int main(int argc, char** argv) {
       if (frame.kind == FrameKind::Binary) {
         const std::lock_guard<std::mutex> lock(guard);
         receivedHex.push_back(bytesToHex(frame.payload));
+        // 受け取った順と大きさを残す。件数が足りない場合、欠落（届いていない）と
+        // 解釈のずれ（境界を誤って待ち続ける）を記録から区別するために要る。
+        std::cout << "受信 " << receivedHex.size() << " 件目 " << frame.payload.size()
+                  << " バイト\n";
         if (receivedHex.size() >= kSendCount) {
           return;
         }
@@ -206,7 +210,8 @@ int main(int argc, char** argv) {
         std::cout << "購読側が閉じられた: " << frame.code << " " << frame.reason << "\n";
         return;
       } else if (frame.kind == FrameKind::None) {
-        std::cout << "購読側の受信が終わった（時間切れか切断）\n";
+        std::cout << "購読側の受信が終わった（時間切れか切断）。未処理の残り "
+                  << subscriber.pendingSize() << " バイト\n";
         return;
       }
       // 制御メッセージ（nodeHelloAck など）は数えない。
@@ -236,6 +241,7 @@ int main(int argc, char** argv) {
     expectTrue(!hex.empty(), std::to_string(index) + " 番目に期待バイト列がある");
     sentHex.push_back(hex);
     expectTrue(sender.sendBinary(hexToBytes(hex), failure), std::to_string(index) + " 番目が送れる");
+    std::cout << "送信 " << index << " 番目 " << (hex.size() / 2) << " バイト\n";
     // 実際の間隔で送る。詰めて送ると予算超過の破棄が働き、疎通の検証にならない。
     std::this_thread::sleep_for(
         std::chrono::milliseconds(1000 / (framerate < 1 ? 1 : framerate)));
