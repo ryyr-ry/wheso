@@ -313,6 +313,15 @@ async function run(
   const arrived: number[] = [];
   /** 直近の遅延標本（マイクロ秒）。tier の上下判断に使う。 */
   let delaySamplesUs: number[] = [];
+  /**
+   * 送った時刻。frameIndex から引く。
+   *
+   * 遅延は「受信時刻 - 送信時刻」で測る。撮影時刻（captureTimestampUs）との差では
+   * 測れない。撮影時刻は送信の開始からの相対値であり、`performance.now()` は
+   * ページ読み込みからの値であるため、基準が違う。実測では劣化なし（N-0）でも
+   * 1.7 秒で層を下げてしまった。
+   */
+  const sentAtByIndex = new Map<number, number>();
   /** 現在の購読上限層。最初は最上位を要求する。 */
   let currentTier = LAYERS[LAYERS.length - 1]?.spatialId ?? 0;
   /** tier を変えた回数と履歴。判定と診断に使う。 */
@@ -392,9 +401,11 @@ async function run(
         // 知らない層は数えない（購読の上限を下げた直後に届くことがある）。
         continue;
       }
-      // 遅延の標本を集める。送信と受信が同じページであるため時計が共通であり、
-      // 撮影時刻との差がそのまま片道の遅延になる。
-      delaySamplesUs.push(Math.trunc(performance.now() * 1000) - Number(unit.captureTimestampUs));
+      // 遅延の標本を集める。送信と受信が同じページであるため時計が共通である。
+      const sentAt = sentAtByIndex.get(unit.sequenceNumber);
+      if (sentAt !== undefined) {
+        delaySamplesUs.push(Math.trunc((performance.now() - sentAt) * 1000));
+      }
       queue.push({
         frameIndex: unit.sequenceNumber,
         temporalId: unit.temporalId,
@@ -457,6 +468,7 @@ async function run(
           return;
         }
         sender.send(packed.value);
+        sentAtByIndex.set(index, performance.now());
         sent.push({
           frameIndex: index,
           spatialId: layer.spatialId,
