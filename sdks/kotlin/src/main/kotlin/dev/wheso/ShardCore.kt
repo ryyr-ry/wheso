@@ -8,7 +8,11 @@
 // 浮動小数点を使わない。例外を投げない。反復順序は決定的にする。
 package dev.wheso
 
+import dev.wheso.generated.AUDIO_SELECTIVE_FORWARD_COUNT
+import dev.wheso.generated.AUDIO_SPEAKER_HOLD_MS
+import dev.wheso.generated.CHANNEL_AUDIO
 import dev.wheso.generated.Errors
+import dev.wheso.generated.FLAG_ACTIVE_SPEAKER
 import dev.wheso.generated.NODE_MAX_OUT_BYTES_PER_SEC
 import dev.wheso.generated.NODE_MAX_OUT_MESSAGES_PER_SEC
 import dev.wheso.generated.SHARD_TREND_ENTER_KEY_ONLY_DEN
@@ -76,6 +80,18 @@ public data class ShardState(
     val trends: List<ReceiverTrend>,
     val maxSpatial: List<MaxSpatial>,
     val encoderTiers: List<EncoderTier>,
+    /**
+     * 送信者ごとの直近の発話時刻。音声の選別転送に使う（ADR-0024）。
+     * senderId の昇順で保持する（決定性のため）。
+     */
+    val speakers: List<SpeakerActivity>,
+)
+
+/** 送信者ごとの直近の発話時刻（ADR-0024）。 */
+public data class SpeakerActivity(
+    val senderId: Long,
+    /** 最後に ACTIVE_SPEAKER=1 の音声が届いた時刻。 */
+    val lastSpeechAtMs: Long,
 )
 
 /** 入力イベント。sealed で閉じる（判定漏れを防ぐ）。 */
@@ -137,6 +153,7 @@ public fun initialShardState(t: Long): ShardState = ShardState(
     trends = emptyList(),
     maxSpatial = emptyList(),
     encoderTiers = emptyList(),
+    speakers = emptyList(),
 )
 
 /** 1 ステップの状態遷移。 */
@@ -165,9 +182,62 @@ public fun shardStep(state: ShardState, event: ShardEvent, t: Long): ShardStepRe
  *   4. 予算超過なら破棄可能なものを破棄
  *   5. 転送し、計数を進めてから輻輳を再評価する
  */
+/**
+ * 音声の選別転送の判断（ADR-0024）。
+ *
+ * 転送対象は「直近に ACTIVE_SPEAKER=1 の音声が届いた時刻」が新しい上位
+ * AUDIO_SELECTIVE_FORWARD_COUNT 名である。保持時間の内側に居る発話者だけを候補とし、
+ * 時刻が同じ場合は senderId の昇順とする（決定性のため）。
+ */
+private fun isAudioForwarded(state: ShardState, senderId: Long, t: Long): Boolean {
+    val active = state.speakers.filter { t - it.lastSpeechAtMs <= AUDIO_SPEAKER_HOLD_MS }
+    if (active.size.toLong() <= AUDIO_SELECTIVE_FORWARD_COUNT) {
+        return true
+    }
+    val ordered = active.sortedWith(
+        compareByDescending<SpeakerActivity> { it.lastSpeechAtMs }.thenBy { it.senderId },
+    )
+    return ordered.take(AUDIO_SELECTIVE_FORWARD_COUNT.toInt()).any { it.senderId == senderId }
+}
+
+/** 発話の記録を更新する。senderId の昇順を保つ（決定性のため）。 */
+private fun recordSpeech(speakers: List<SpeakerActivity>, senderId: Long, t: Long): List<SpeakerActivity> {
+    val updated = mutableListOf<SpeakerActivity>()
+    var replaced = false
+    for (entry in speakers) {
+        if (entry.senderId == senderId) {
+            updated.add(SpeakerActivity(senderId, t))
+            replaced = true
+            continue
+        }
+        updated.add(entry)
+    }
+    if (!replaced) {
+        updated.add(SpeakerActivity(senderId, t))
+        updated.sortBy { it.senderId }
+    }
+    return updated
+}
+
 private fun handleMedia(state: ShardState, unit: ShardEvent.Media, t: Long): ShardStepResult {
     val windowed = maybeResetWindow(state, t)
-    val next = updateMaxSpatial(windowed, unit.from, unit.ch, unit.sid)
+    val updated = updateMaxSpatial(windowed, unit.from, unit.ch, unit.sid)
+
+    // 音声で ACTIVE_SPEAKER が立っていれば発話時刻を記録する（選別転送。ADR-0024）。
+    // 記録は選別の前に行う。今まさに発話している者の音声は通す必要がある。
+    val isAudio = unit.ch == CHANNEL_AUDIO.toLong()
+    val isSpeaking = (unit.flags and FLAG_ACTIVE_SPEAKER.toLong()) != 0L
+    val next = if (isAudio && isSpeaking) {
+        updated.copy(speakers = recordSpeech(updated.speakers, unit.from, t))
+    } else {
+        updated
+    }
+
+    // 上限に入らない送信者の音声は破棄する。輻輳ではないため priority は 0 とする。
+    if (isAudio && !isAudioForwarded(next, unit.from, t)) {
+        return ShardStepResult(next, listOf(ShardCommand.Drop(0L, 1L)))
+    }
+
     val priority = dropPriority(unit.ch.toInt(), unit.flags.toInt())?.toLong()
 
     if (shouldDropInCongestion(next, unit.sid, unit.tid, unit.from, unit.ch, priority)) {

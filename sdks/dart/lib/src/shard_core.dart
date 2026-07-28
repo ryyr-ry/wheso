@@ -9,6 +9,7 @@
 import 'fixed.dart' show delaySlope, Slope;
 import 'generated/constants.dart' as constants;
 import 'generated/errors.dart' as errors;
+import 'generated/wire_layout.dart' as wire_layout;
 import 'wire.dart' show dropPriority;
 
 /// 輻輳状態（state-machines.md 3 節）。
@@ -76,6 +77,16 @@ class EncoderTier {
 }
 
 /// shard の状態。
+/// 送信者ごとの直近の発話時刻（音声の選別転送。ADR-0024）。
+class SpeakerActivity {
+  const SpeakerActivity(this.senderId, this.lastSpeechAtMs);
+
+  final int senderId;
+
+  /// 最後に ACTIVE_SPEAKER=1 の音声が届いた時刻。
+  final int lastSpeechAtMs;
+}
+
 class ShardState {
   ShardState({
     required this.congestion,
@@ -90,6 +101,7 @@ class ShardState {
     required this.trends,
     required this.maxSpatial,
     required this.encoderTiers,
+    required this.speakers,
   });
 
   final Congestion congestion;
@@ -105,6 +117,9 @@ class ShardState {
   final List<MaxSpatial> maxSpatial;
   final List<EncoderTier> encoderTiers;
 
+  /// 送信者ごとの直近の発話時刻。senderId の昇順で保持する（ADR-0024）。
+  final List<SpeakerActivity> speakers;
+
   /// コピーを作る。変更は新しいインスタンスとして返す（sans-IO の純関数）。
   ShardState copyWith({
     Congestion? congestion,
@@ -119,6 +134,7 @@ class ShardState {
     List<ReceiverTrend>? trends,
     List<MaxSpatial>? maxSpatial,
     List<EncoderTier>? encoderTiers,
+    List<SpeakerActivity>? speakers,
   }) {
     return ShardState(
       congestion: congestion ?? this.congestion,
@@ -133,6 +149,7 @@ class ShardState {
       trends: trends ?? List.of(this.trends),
       maxSpatial: maxSpatial ?? List.of(this.maxSpatial),
       encoderTiers: encoderTiers ?? List.of(this.encoderTiers),
+      speakers: speakers ?? List.of(this.speakers),
     );
   }
 }
@@ -251,6 +268,7 @@ ShardState initialState(int t) {
     trends: [],
     maxSpatial: [],
     encoderTiers: [],
+    speakers: [],
   );
 }
 
@@ -285,9 +303,74 @@ StepResult step(ShardState state, ShardEvent event, int t) {
   }
 }
 
+/// 音声の選別転送の判断（ADR-0024）。
+///
+/// 転送対象は「直近に ACTIVE_SPEAKER=1 の音声が届いた時刻」が新しい上位
+/// constants.AUDIO_SELECTIVE_FORWARD_COUNT 名である。保持時間の内側に居る発話者だけを候補とし、
+/// 時刻が同じ場合は senderId の昇順とする（決定性のため）。
+bool _isAudioForwarded(ShardState state, int senderId, int t) {
+  final List<SpeakerActivity> active = <SpeakerActivity>[];
+  for (final SpeakerActivity entry in state.speakers) {
+    if (t - entry.lastSpeechAtMs <= constants.AUDIO_SPEAKER_HOLD_MS) {
+      active.add(entry);
+    }
+  }
+  if (active.length <= constants.AUDIO_SELECTIVE_FORWARD_COUNT) {
+    return true;
+  }
+  active.sort((SpeakerActivity a, SpeakerActivity b) {
+    if (a.lastSpeechAtMs != b.lastSpeechAtMs) {
+      return b.lastSpeechAtMs - a.lastSpeechAtMs;
+    }
+    return a.senderId - b.senderId;
+  });
+  for (int index = 0; index < active.length && index < constants.AUDIO_SELECTIVE_FORWARD_COUNT; index += 1) {
+    if (active[index].senderId == senderId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// 発話の記録を更新する。senderId の昇順を保つ（決定性のため）。
+List<SpeakerActivity> _recordSpeech(List<SpeakerActivity> speakers, int senderId, int t) {
+  final List<SpeakerActivity> updated = <SpeakerActivity>[];
+  bool replaced = false;
+  for (final SpeakerActivity entry in speakers) {
+    if (entry.senderId == senderId) {
+      updated.add(SpeakerActivity(senderId, t));
+      replaced = true;
+      continue;
+    }
+    updated.add(entry);
+  }
+  if (!replaced) {
+    updated.add(SpeakerActivity(senderId, t));
+    updated.sort((SpeakerActivity a, SpeakerActivity b) => a.senderId - b.senderId);
+  }
+  return updated;
+}
+
 StepResult _handleMedia(ShardState state, MediaEvent unit, int t) {
   final resetState = _maybeResetWindow(state, t);
-  final next = _updateMaxSpatial(resetState, unit.from, unit.ch, unit.sid);
+  final windowed = _updateMaxSpatial(resetState, unit.from, unit.ch, unit.sid);
+
+  // 音声で ACTIVE_SPEAKER が立っていれば発話時刻を記録する（選別転送。ADR-0024）。
+  // 記録は選別の前に行う。今まさに発話している者の音声は通す必要がある。
+  final bool isAudio = unit.ch == wire_layout.CHANNEL_AUDIO;
+  final bool isSpeaking = (unit.flags & wire_layout.FLAG_ACTIVE_SPEAKER) != 0;
+  final ShardState next = isAudio && isSpeaking
+      ? windowed.copyWith(speakers: _recordSpeech(windowed.speakers, unit.from, t))
+      : windowed;
+
+  // 上限に入らない送信者の音声は破棄する。輻輳ではないため priority は 0 とする。
+  if (isAudio && !_isAudioForwarded(next, unit.from, t)) {
+    return StepResult(
+      state: next,
+      commands: <ShardCommand>[DropCommand(priority: 0, count: 1)],
+    );
+  }
+
   final priority = dropPriority(unit.ch, unit.flags);
 
   if (_shouldDropInCongestion(next, unit.sid, unit.tid, unit.from, unit.ch, priority)) {

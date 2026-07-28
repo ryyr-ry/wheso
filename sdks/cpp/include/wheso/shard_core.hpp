@@ -18,6 +18,7 @@
 #include "wheso/fixed.hpp"
 #include "wheso/generated/constants.hpp"
 #include "wheso/generated/errors.hpp"
+#include "wheso/generated/wire_layout.hpp"
 #include "wheso/wire.hpp"
 
 namespace wheso::shard {
@@ -67,6 +68,13 @@ struct EncoderTier {
   std::int64_t tier = 0;
 };
 
+/// 送信者ごとの直近の発話時刻（ADR-0024）。
+struct SpeakerActivity {
+  std::int64_t sender_id = 0;
+  /// 最後に ACTIVE_SPEAKER=1 の音声が届いた時刻。
+  std::int64_t last_speech_at_ms = 0;
+};
+
 struct State {
   Congestion congestion = Congestion::Normal;
   std::int64_t congestion_entered_at = 0;
@@ -80,6 +88,9 @@ struct State {
   std::vector<ReceiverTrend> trends;
   std::vector<MaxSpatial> max_spatial;
   std::vector<EncoderTier> encoder_tiers;
+  /// 送信者ごとの直近の発話時刻。音声の選別転送に使う（ADR-0024）。
+  /// sender_id の昇順で保持する（決定性のため）。
+  std::vector<SpeakerActivity> speakers;
 };
 
 /// 入力イベントの種類。
@@ -370,9 +381,83 @@ inline StepResult with_encoder_tiers(const State& state) {
   return StepResult{next, commands};
 }
 
+/// 音声の選別転送の判断（ADR-0024）。
+///
+/// 転送対象は「直近に ACTIVE_SPEAKER=1 の音声が届いた時刻」が新しい上位
+/// AUDIO_SELECTIVE_FORWARD_COUNT 名である。保持時間の内側に居る発話者だけを候補とし、
+/// 時刻が同じ場合は sender_id の昇順とする（決定性のため）。
+inline bool is_audio_forwarded(const State& state, std::int64_t sender_id, std::int64_t t) {
+  std::vector<SpeakerActivity> active;
+  for (const SpeakerActivity& entry : state.speakers) {
+    if (t - entry.last_speech_at_ms <= constants::AUDIO_SPEAKER_HOLD_MS) {
+      active.push_back(entry);
+    }
+  }
+  if (static_cast<std::int64_t>(active.size()) <= constants::AUDIO_SELECTIVE_FORWARD_COUNT) {
+    return true;
+  }
+  std::stable_sort(active.begin(), active.end(),
+                   [](const SpeakerActivity& a, const SpeakerActivity& b) {
+                     if (a.last_speech_at_ms != b.last_speech_at_ms) {
+                       return a.last_speech_at_ms > b.last_speech_at_ms;
+                     }
+                     return a.sender_id < b.sender_id;
+                   });
+  const std::size_t limit =
+      static_cast<std::size_t>(constants::AUDIO_SELECTIVE_FORWARD_COUNT);
+  for (std::size_t index = 0; index < active.size() && index < limit; ++index) {
+    if (active[index].sender_id == sender_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// 発話の記録を更新する。sender_id の昇順を保つ（決定性のため）。
+inline std::vector<SpeakerActivity> record_speech(const std::vector<SpeakerActivity>& speakers,
+                                                 std::int64_t sender_id, std::int64_t t) {
+  std::vector<SpeakerActivity> updated;
+  bool replaced = false;
+  for (const SpeakerActivity& entry : speakers) {
+    if (entry.sender_id == sender_id) {
+      updated.push_back(SpeakerActivity{sender_id, t});
+      replaced = true;
+      continue;
+    }
+    updated.push_back(entry);
+  }
+  if (!replaced) {
+    updated.push_back(SpeakerActivity{sender_id, t});
+    std::stable_sort(updated.begin(), updated.end(),
+                     [](const SpeakerActivity& a, const SpeakerActivity& b) {
+                       return a.sender_id < b.sender_id;
+                     });
+  }
+  return updated;
+}
+
 inline StepResult handle_media(const State& state, const Event& event, std::int64_t t) {
   const State windowed = maybe_reset_window(state, t);
-  const State next = update_max_spatial(windowed, event.from, event.ch, event.sid);
+  State next = update_max_spatial(windowed, event.from, event.ch, event.sid);
+
+  // 音声で ACTIVE_SPEAKER が立っていれば発話時刻を記録する（選別転送。ADR-0024）。
+  // 記録は選別の前に行う。今まさに発話している者の音声は通す必要がある。
+  const bool is_audio = event.ch == static_cast<std::int64_t>(wire_layout::CHANNEL_AUDIO);
+  const bool is_speaking =
+      (event.flags & static_cast<std::int64_t>(wire_layout::FLAG_ACTIVE_SPEAKER)) != 0;
+  if (is_audio && is_speaking) {
+    next.speakers = record_speech(next.speakers, event.from, t);
+  }
+
+  // 上限に入らない送信者の音声は破棄する。輻輳ではないため priority は 0 とする。
+  if (is_audio && !is_audio_forwarded(next, event.from, t)) {
+    Command selective;
+    selective.kind = CommandKind::Drop;
+    selective.priority = 0;
+    selective.count = 1;
+    return StepResult{next, {selective}};
+  }
+
   const std::optional<std::uint8_t> raw_priority =
       drop_priority(static_cast<std::uint8_t>(event.ch), static_cast<std::uint8_t>(event.flags));
   std::optional<std::int64_t> priority;

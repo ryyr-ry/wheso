@@ -20,6 +20,8 @@ import {
   FLAG_SCREEN_CONTENT,
 } from "../packages/core/src/generated/wire-layout.ts";
 import {
+  AUDIO_SELECTIVE_FORWARD_COUNT,
+  AUDIO_SPEAKER_HOLD_MS,
   NODE_MAX_OUT_BYTES_PER_SEC,
 } from "../packages/core/src/generated/constants.ts";
 
@@ -111,6 +113,103 @@ export function generateShardEvents(seed: bigint, steps: number): Result<readonl
     event: { kind: "budget", bytesPerSec: NODE_MAX_OUT_BYTES_PER_SEC },
   });
   t += 100;
+
+  // --- フェーズ 3.4: 音声の選別転送（ADR-0024） ---
+  //
+  // なぜ専用の段が必要か: 混合イベント列では発話者が上限（AUDIO_SELECTIVE_FORWARD_COUNT）を
+  // 超える状況が偶然にしか起きない。トレースに現れない入力は検証されない（X-024 と同じ誤り）。
+  // 上限を必ず超える形で発話を作り、選別による破棄と、保持時間の経過による復帰を記録する。
+  {
+    // 参加者が上限より多いことを前提にする。5〜12 人であるため、少ない場合は全員で回す。
+    const speakers = participants.slice(0, Math.min(participants.length, AUDIO_SELECTIVE_FORWARD_COUNT + 3));
+    // 順に発話する（時刻が異なるため順位が一意に決まる）。
+    for (const id of speakers) {
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: id,
+          ch: CHANNEL_AUDIO,
+          sid: 0,
+          tid: 0,
+          key: false,
+          bytes: 160,
+          flags: FLAG_END_OF_FRAME | FLAG_ACTIVE_SPEAKER,
+        },
+      });
+      t += 20;
+    }
+    // 発話を止めた音声を全員ぶん流す。上限を超えた分（古い発話者）が破棄される。
+    for (const id of speakers) {
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: id,
+          ch: CHANNEL_AUDIO,
+          sid: 0,
+          tid: 0,
+          key: false,
+          bytes: 160,
+          flags: FLAG_END_OF_FRAME,
+        },
+      });
+      t += 5;
+    }
+    // 保持時間を跨ぐ。候補が消えるため、同じ音声が今度は通る（境界の記録）。
+    t += AUDIO_SPEAKER_HOLD_MS + 50;
+    for (const id of speakers) {
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: id,
+          ch: CHANNEL_AUDIO,
+          sid: 0,
+          tid: 0,
+          key: false,
+          bytes: 160,
+          flags: FLAG_END_OF_FRAME,
+        },
+      });
+      t += 5;
+    }
+    // 同時刻の発話（senderId の昇順で選ぶことの記録）。
+    for (const id of speakers) {
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: id,
+          ch: CHANNEL_AUDIO,
+          sid: 0,
+          tid: 0,
+          key: false,
+          bytes: 160,
+          flags: FLAG_END_OF_FRAME | FLAG_ACTIVE_SPEAKER,
+        },
+      });
+    }
+    t += 30;
+    for (const id of speakers) {
+      events.push({
+        t,
+        event: {
+          kind: "media",
+          from: id,
+          ch: CHANNEL_AUDIO,
+          sid: 0,
+          tid: 0,
+          key: false,
+          bytes: 160,
+          flags: FLAG_END_OF_FRAME,
+        },
+      });
+      t += 5;
+    }
+    // 次の段の判定に影響しないよう、保持時間を跨いで発話の記録を無効化する。
+    t += AUDIO_SPEAKER_HOLD_MS + 50;
+  }
 
   // --- フェーズ 3.5: ストレスフェーズ（破棄と輻輳遷移を確実に発生させる） ---
   // なぜこの構成か: shard-core の輻輳状態遷移は budget イベント時の util 判定で起きる。

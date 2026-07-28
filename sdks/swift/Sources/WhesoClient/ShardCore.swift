@@ -62,6 +62,21 @@ public struct WhesoShardState: Equatable {
     public var trends: [WhesoReceiverTrend]
     public var maxSpatial: [WhesoMaxSpatial]
     public var encoderTiers: [WhesoEncoderTier]
+    /// 送信者ごとの直近の発話時刻。音声の選別転送に使う（ADR-0024）。
+    /// senderId の昇順で保持する（決定性のため）。
+    public var speakers: [WhesoSpeakerActivity]
+}
+
+/// 送信者ごとの直近の発話時刻（ADR-0024）。
+public struct WhesoSpeakerActivity: Equatable {
+    public var senderId: Int64
+    /// 最後に ACTIVE_SPEAKER=1 の音声が届いた時刻。
+    public var lastSpeechAtMs: Int64
+
+    public init(senderId: Int64, lastSpeechAtMs: Int64) {
+        self.senderId = senderId
+        self.lastSpeechAtMs = lastSpeechAtMs
+    }
 }
 
 /// 入力イベント。
@@ -103,7 +118,8 @@ public func whesoInitialShardState(_ t: Int64) -> WhesoShardState {
         unexpectedEvents: [],
         trends: [],
         maxSpatial: [],
-        encoderTiers: []
+        encoderTiers: [],
+        speakers: []
     )
 }
 
@@ -176,6 +192,54 @@ private func maxSpatialFor(_ state: WhesoShardState, from: Int64, ch: Int64) -> 
    4. 予算超過なら破棄可能なものを破棄
    5. 転送し、計数を進めてから輻輳を再評価する
  */
+/// 音声の選別転送の判断（ADR-0024）。
+///
+/// 転送対象は「直近に ACTIVE_SPEAKER=1 の音声が届いた時刻」が新しい上位
+/// AUDIO_SELECTIVE_FORWARD_COUNT 名である。保持時間の内側に居る発話者だけを候補とし、
+/// 時刻が同じ場合は senderId の昇順とする（決定性のため）。
+private func isAudioForwarded(_ state: WhesoShardState, senderId: Int64, t: Int64) -> Bool {
+    let active = state.speakers.filter { t - $0.lastSpeechAtMs <= WhesoConstants.AUDIO_SPEAKER_HOLD_MS }
+    if Int64(active.count) <= WhesoConstants.AUDIO_SELECTIVE_FORWARD_COUNT {
+        return true
+    }
+    let ordered = active.sorted { left, right in
+        if left.lastSpeechAtMs != right.lastSpeechAtMs {
+            return left.lastSpeechAtMs > right.lastSpeechAtMs
+        }
+        return left.senderId < right.senderId
+    }
+    let limit = Int(WhesoConstants.AUDIO_SELECTIVE_FORWARD_COUNT)
+    for index in 0..<min(ordered.count, limit) {
+        if ordered[index].senderId == senderId {
+            return true
+        }
+    }
+    return false
+}
+
+/// 発話の記録を更新する。senderId の昇順を保つ（決定性のため）。
+private func recordSpeech(
+    _ speakers: [WhesoSpeakerActivity],
+    senderId: Int64,
+    t: Int64
+) -> [WhesoSpeakerActivity] {
+    var updated: [WhesoSpeakerActivity] = []
+    var replaced = false
+    for entry in speakers {
+        if entry.senderId == senderId {
+            updated.append(WhesoSpeakerActivity(senderId: senderId, lastSpeechAtMs: t))
+            replaced = true
+            continue
+        }
+        updated.append(entry)
+    }
+    if !replaced {
+        updated.append(WhesoSpeakerActivity(senderId: senderId, lastSpeechAtMs: t))
+        updated.sort { $0.senderId < $1.senderId }
+    }
+    return updated
+}
+
 private func handleMedia(
     _ state: WhesoShardState,
     from: Int64,
@@ -187,7 +251,21 @@ private func handleMedia(
     t: Int64
 ) -> WhesoShardStepResult {
     let windowed = maybeResetWindow(state, t)
-    let next = updateMaxSpatial(windowed, from: from, ch: ch, sid: sid)
+    var next = updateMaxSpatial(windowed, from: from, ch: ch, sid: sid)
+
+    // 音声で ACTIVE_SPEAKER が立っていれば発話時刻を記録する（選別転送。ADR-0024）。
+    // 記録は選別の前に行う。今まさに発話している者の音声は通す必要がある。
+    let isAudio = ch == Int64(WhesoWireLayout.CHANNEL_AUDIO)
+    let isSpeaking = (flags & Int64(WhesoWireLayout.FLAG_ACTIVE_SPEAKER)) != 0
+    if isAudio && isSpeaking {
+        next.speakers = recordSpeech(next.speakers, senderId: from, t: t)
+    }
+
+    // 上限に入らない送信者の音声は破棄する。輻輳ではないため priority は 0 とする。
+    if isAudio && !isAudioForwarded(next, senderId: from, t: t) {
+        return WhesoShardStepResult(state: next, commands: [.drop(priority: 0, count: 1)])
+    }
+
     let priority = whesoDropPriority(channel: UInt8(truncatingIfNeeded: ch), flags: UInt8(truncatingIfNeeded: flags))
     let priorityValue: Int64? = priority.map { Int64($0) }
 

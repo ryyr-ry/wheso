@@ -7,6 +7,8 @@
 //! 浮動小数点を使わない。パニックしない。
 
 use crate::generated::constants::{
+    AUDIO_SELECTIVE_FORWARD_COUNT,
+    AUDIO_SPEAKER_HOLD_MS,
     NODE_MAX_OUT_BYTES_PER_SEC, NODE_MAX_OUT_MESSAGES_PER_SEC, SHARD_TREND_ENTER_KEY_ONLY_DEN,
     SHARD_TREND_ENTER_KEY_ONLY_NUM, SHARD_TREND_ENTER_SPATIAL_DEN, SHARD_TREND_ENTER_SPATIAL_NUM,
     SHARD_TREND_ENTER_T1_DEN, SHARD_TREND_ENTER_T1_NUM, SHARD_TREND_ENTER_T2_DEN,
@@ -19,6 +21,7 @@ use crate::generated::constants::{
     SHARD_UTIL_EXIT_T1_NUM, SHARD_UTIL_EXIT_T2_DEN, SHARD_UTIL_EXIT_T2_NUM, SHARD_UTIL_WINDOW_MS,
     SHEDDING_HYSTERESIS_MS,
 };
+use crate::generated::wire_layout::{CHANNEL_AUDIO, FLAG_ACTIVE_SPEAKER};
 use crate::fixed::delay_slope;
 use crate::wire::drop_priority;
 
@@ -87,6 +90,17 @@ pub struct ShardState {
     pub max_spatial: Vec<MaxSpatial>,
     /// 送信者ごとに指令したエンコーダの上限層。target_id の昇順で保持する（ADR-0022）。
     pub encoder_tiers: Vec<EncoderTier>,
+    /// 送信者ごとの直近の発話時刻。音声の選別転送に使う（ADR-0024）。
+    /// sender_id の昇順で保持する（決定性のため）。
+    pub speakers: Vec<SpeakerActivity>,
+}
+
+/// 送信者ごとの直近の発話時刻（ADR-0024）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeakerActivity {
+    pub sender_id: i64,
+    /// 最後に ACTIVE_SPEAKER=1 の音声が届いた時刻。
+    pub last_speech_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +168,7 @@ pub fn initial_state(t: i64) -> ShardState {
         trends: Vec::new(),
         max_spatial: Vec::new(),
         encoder_tiers: Vec::new(),
+            speakers: Vec::new(),
     }
 }
 
@@ -208,9 +223,72 @@ struct MediaUnit {
     flags: i64,
 }
 
+/// 音声の選別転送の判断（ADR-0024）。
+///
+/// 転送対象は「直近に ACTIVE_SPEAKER=1 の音声が届いた時刻」が新しい上位
+/// AUDIO_SELECTIVE_FORWARD_COUNT 名である。保持時間の内側に居る発話者だけを候補とし、
+/// 時刻が同じ場合は sender_id の昇順とする（決定性のため）。
+fn is_audio_forwarded(state: &ShardState, sender_id: i64, t: i64) -> bool {
+    let mut active: Vec<&SpeakerActivity> = Vec::new();
+    for entry in &state.speakers {
+        if t - entry.last_speech_at_ms <= AUDIO_SPEAKER_HOLD_MS {
+            active.push(entry);
+        }
+    }
+    if (active.len() as i64) <= AUDIO_SELECTIVE_FORWARD_COUNT {
+        return true;
+    }
+    // 新しい順、同時刻なら sender_id の昇順。
+    active.sort_by(|a, b| {
+        b.last_speech_at_ms
+            .cmp(&a.last_speech_at_ms)
+            .then(a.sender_id.cmp(&b.sender_id))
+    });
+    active
+        .iter()
+        .take(AUDIO_SELECTIVE_FORWARD_COUNT as usize)
+        .any(|entry| entry.sender_id == sender_id)
+}
+
+/// 発話の記録を更新する。sender_id の昇順を保つ（決定性のため）。
+fn record_speech(speakers: &[SpeakerActivity], sender_id: i64, t: i64) -> Vec<SpeakerActivity> {
+    let mut updated: Vec<SpeakerActivity> = Vec::new();
+    let mut replaced = false;
+    for entry in speakers {
+        if entry.sender_id == sender_id {
+            updated.push(SpeakerActivity { sender_id, last_speech_at_ms: t });
+            replaced = true;
+            continue;
+        }
+        updated.push(entry.clone());
+    }
+    if !replaced {
+        updated.push(SpeakerActivity { sender_id, last_speech_at_ms: t });
+        updated.sort_by_key(|entry| entry.sender_id);
+    }
+    updated
+}
+
 fn handle_media(state: &ShardState, unit: &MediaUnit, t: i64) -> StepResult {
     let MediaUnit { from, ch, sid, tid, bytes, flags } = *unit;
     let mut next = update_max_spatial(&maybe_reset_window(state, t), from, ch, sid);
+
+    // 音声で ACTIVE_SPEAKER が立っていれば発話時刻を記録する（選別転送。ADR-0024）。
+    // 記録は選別の前に行う。今まさに発話している者の音声は通す必要がある。
+    let is_audio = ch == i64::from(CHANNEL_AUDIO);
+    let is_speaking = (flags & i64::from(FLAG_ACTIVE_SPEAKER)) != 0;
+    if is_audio && is_speaking {
+        next.speakers = record_speech(&next.speakers, from, t);
+    }
+
+    // 上限に入らない送信者の音声は破棄する。輻輳ではないため priority は 0 とする。
+    if is_audio && !is_audio_forwarded(&next, from, t) {
+        return StepResult {
+            state: next,
+            commands: vec![ShardCommand::Drop { priority: 0, count: 1 }],
+        };
+    }
+
     let priority = drop_priority(ch as u8, flags as u8).map(i64::from);
 
     if should_drop_in_congestion(&next, sid, tid, from, ch, priority) {

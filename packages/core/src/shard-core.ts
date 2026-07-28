@@ -5,7 +5,10 @@
  * 規範: state-machines.md 3 節、conformance.md 4 節、wire-format.md 1.4。
  */
 
+import { CHANNEL_AUDIO, FLAG_ACTIVE_SPEAKER } from "./generated/wire-layout.ts";
 import {
+  AUDIO_SELECTIVE_FORWARD_COUNT,
+  AUDIO_SPEAKER_HOLD_MS,
   SHEDDING_HYSTERESIS_MS,
   NODE_MAX_OUT_BYTES_PER_SEC,
   NODE_MAX_OUT_MESSAGES_PER_SEC,
@@ -211,6 +214,16 @@ export interface Subscription {
 
 // --- 状態 ---
 
+/**
+ * 送信者ごとの直近の発話時刻。音声の選別転送に使う（ADR-0024）。
+ * senderId の昇順で保持する（決定性のため）。
+ */
+export interface SpeakerActivity {
+  readonly senderId: number;
+  /** 最後に ACTIVE_SPEAKER=1 の音声が届いた時刻。 */
+  readonly lastSpeechAtMs: number;
+}
+
 export interface ShardState {
   /** 現在の輻輳状態 */
   readonly congestion: CongestionState;
@@ -230,6 +243,12 @@ export interface ShardState {
   readonly windowStartMs: number;
   /** 無視されたイベントの記録（W_UNEXPECTED_EVENT） */
   readonly unexpectedEvents: readonly string[];
+  /**
+   * 送信者ごとの直近の発話時刻（音声の選別転送。ADR-0024）。
+   * 上限は AUDIO_SELECTIVE_FORWARD_COUNT 名であり、これを超える送信者の音声は破棄する。
+   * senderId の昇順で保持する。
+   */
+  readonly speakers: readonly SpeakerActivity[];
   /**
    * 受信者ごとの遅延勾配。report イベントで更新する。
    * subscriberId の昇順で保持する（決定性のため）。
@@ -287,6 +306,7 @@ export function initialState(t: number): ShardState {
     trends: [],
     maxSpatial: [],
     encoderTiers: [],
+    speakers: [],
   };
 }
 
@@ -329,7 +349,23 @@ function handleMedia(state: ShardState, event: MediaEvent, t: number): StepResul
 
   // 窓のリセット（観測窓が満了したら）
   // 観測した spatialId の最大値も更新する。SHEDDING_SPATIAL の判定に使う。
-  const newState = updateMaxSpatial(maybeResetWindow(state, t), event);
+  const windowed = updateMaxSpatial(maybeResetWindow(state, t), event);
+
+  // 音声で ACTIVE_SPEAKER が立っていれば発話時刻を記録する（選別転送。ADR-0024）。
+  // 記録は選別の前に行う。自分が今まさに発話している場合、その音声は通す必要がある。
+  const isAudio = event.ch === CHANNEL_AUDIO;
+  const isSpeaking = (event.flags & FLAG_ACTIVE_SPEAKER) !== 0;
+  const newState: ShardState =
+    isAudio && isSpeaking
+      ? { ...windowed, speakers: recordSpeech(windowed.speakers, event.from, t) }
+      : windowed;
+
+  // 音声の選別転送。上位 AUDIO_SELECTIVE_FORWARD_COUNT 名に入らない送信者は破棄する。
+  // 輻輳による破棄ではないため priority は 0 とする。
+  if (isAudio && !isAudioForwarded(newState, event.from, t)) {
+    commands.push({ kind: "drop", priority: 0, count: 1 });
+    return { state: newState, commands };
+  }
 
   // 破棄優先順位を計算（wire.ts の dropPriority を再利用する）
   const priority = dropPriority(event.ch, event.flags);
@@ -389,6 +425,62 @@ function handleMedia(state: ShardState, event: MediaEvent, t: number): StepResul
   // 評価しないと util が閾値を超えても遷移が起きない（state-machines.md 3 節）。
   const evaluated = evaluateCongestionTransition(stateAfterForward, t);
   return { state: evaluated.state, commands: [...commands, ...evaluated.commands] };
+}
+
+/**
+ * 音声の選別転送の判断（ADR-0024）。
+ *
+ * 転送対象は「直近に ACTIVE_SPEAKER=1 の音声が届いた時刻」が新しい上位
+ * AUDIO_SELECTIVE_FORWARD_COUNT 名である。発話が止まってからも AUDIO_SPEAKER_HOLD_MS は
+ * 対象に残す。時刻が同じ場合は senderId の昇順とする（決定性のため）。
+ *
+ * 発話中の送信者が上限に達していない場合は、発話していない送信者の音声も転送する。
+ * DTX で無音の間に相手の環境音が完全に消えると通話が不自然になるためである。
+ */
+function isAudioForwarded(state: ShardState, senderId: number, t: number): boolean {
+  // 保持時間の内側にいる発話者だけを候補とする。
+  const active: SpeakerActivity[] = [];
+  for (const entry of state.speakers) {
+    if (t - entry.lastSpeechAtMs <= AUDIO_SPEAKER_HOLD_MS) {
+      active.push(entry);
+    }
+  }
+  if (active.length <= AUDIO_SELECTIVE_FORWARD_COUNT) {
+    // 上限に達していない。全員の音声を通す。
+    return true;
+  }
+  // 新しい順、同時刻なら senderId の昇順で並べる。
+  const ordered = [...active].sort((a, b) => {
+    if (a.lastSpeechAtMs !== b.lastSpeechAtMs) {
+      return b.lastSpeechAtMs - a.lastSpeechAtMs;
+    }
+    return a.senderId - b.senderId;
+  });
+  const chosen = ordered.slice(0, AUDIO_SELECTIVE_FORWARD_COUNT);
+  return chosen.some((entry) => entry.senderId === senderId);
+}
+
+/** 発話の記録を更新する。senderId の昇順を保つ（決定性のため）。 */
+function recordSpeech(
+  speakers: readonly SpeakerActivity[],
+  senderId: number,
+  t: number,
+): readonly SpeakerActivity[] {
+  const updated: SpeakerActivity[] = [];
+  let replaced = false;
+  for (const entry of speakers) {
+    if (entry.senderId === senderId) {
+      updated.push({ senderId, lastSpeechAtMs: t });
+      replaced = true;
+      continue;
+    }
+    updated.push(entry);
+  }
+  if (!replaced) {
+    updated.push({ senderId, lastSpeechAtMs: t });
+    updated.sort((a, b) => a.senderId - b.senderId);
+  }
+  return updated;
 }
 
 // --- 内部: 購読イベント処理 ---
