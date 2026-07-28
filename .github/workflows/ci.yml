@@ -133,6 +133,7 @@ jobs:
   live:
     needs: deploy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -157,6 +158,8 @@ jobs:
   transport:
     needs: deploy
     runs-on: ubuntu-latest
+    # 固まったまま何十分も回らないように時限を切る。実測では 1 言語 2 分で終わる。
+    timeout-minutes: 12
     strategy:
       fail-fast: false
       matrix:

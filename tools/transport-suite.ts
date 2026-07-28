@@ -250,8 +250,20 @@ async function runOne(target: Target, port: number, negative: boolean): Promise<
       stdio: negative ? "ignore" : "inherit",
       env: { ...process.env, ...env },
     });
-    child.on("exit", (code) => resolve(code === 0));
-    child.on("error", () => resolve(false));
+    // 時限を設ける理由: 試験が固まると実行系ごと待ち続ける。実測では構築を含めて
+    // 1 言語 2 分で終わるため、5 分を超えたら異常として殺し、失敗として扱う。
+    const timer = setTimeout(() => {
+      process.stdout.write(`  ${target.name}: 時間切れで打ち切った（${negative ? "否定対照" : "疎通"}）\n`);
+      child.kill("SIGKILL");
+    }, 300_000);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code === 0);
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
   });
 }
 
@@ -291,6 +303,7 @@ async function main(): Promise<void> {
         continue;
       }
 
+      process.stdout.write(`  ${target.name}: 疎通を開始する\n`);
       const ok = await runOne(target, port, false);
       process.stdout.write(`  ${target.name}: 疎通 ${ok ? "OK" : "FAIL"}\n`);
       if (!ok) {
@@ -298,6 +311,7 @@ async function main(): Promise<void> {
       }
 
       // 否定対照。誤った鍵では失敗しなければならない。通ったら認証が働いていない。
+      process.stdout.write(`  ${target.name}: 否定対照を開始する\n`);
       const rejected = await runOne(target, port, true);
       if (rejected) {
         process.stdout.write(`  ${target.name}: 否定対照 FAIL（誤った鍵でも通った）\n`);
