@@ -103,6 +103,29 @@ jobs:
       - name: Swift の適合試験（凍結ベクタ・トレース・実データ）
         run: bash sdks/swift/run-tests.sh
 
+  # ── 段 D の土台: 劣化（tc netem）が実際に効くことを確かめる ──
+  # 手元の作業機では tc の変更に root が無く確かめられない。CI の runner では sudo が使える。
+  impair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: このリポジトリが public であることを確認する
+        run: |
+          if [ "${{ github.event.repository.private }}" = "true" ]; then
+            echo "private リポジトリでは実行しない（課金を避けるため）"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: root で tc を触れることを確認する
+        run: sudo -n tc qdisc show dev lo
+      - name: 劣化が実際に効いていることを測る
+        run: node tools/impair.ts selftest
+
   # ── 実環境へ 1 度だけデプロイする。以降のジョブは WHESO_SKIP_DEPLOY=1 で使い回す ──
   deploy:
     runs-on: ubuntu-latest

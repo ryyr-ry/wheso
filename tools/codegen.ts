@@ -1001,6 +1001,72 @@ function generateWireSwift(schema: Record<string, unknown>): string {
   return `${lines.join("\n")}\n`;
 }
 
+
+/** 入れ子の対象を型検査で絞る。型アサーションを使わない（AGENTS 5.4）。 */
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    const record: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      record[key] = entry;
+    }
+    return record;
+  }
+  return {};
+}
+
+/**
+ * 劣化プロファイル（段 D）を TypeScript へ生成する。
+ *
+ * 6 言語へ生成しない理由: 劣化の適用は試験の実行側（TypeScript）が行い、SDK は関与しない。
+ * SDK に渡るのは劣化した通信そのものであり、プロファイルの値ではない。
+ */
+function generateImpairmentTs(schema: Record<string, unknown>): string {
+  const lines: string[] = [];
+  lines.push("// このファイルは spec/schema/impairment.json から生成される。手で編集してはならない。");
+  lines.push("// 生成: node tools/codegen.ts generate");
+  lines.push("");
+  lines.push("export interface ImpairmentStep {");
+  lines.push("  readonly atSec: number;");
+  lines.push("  /** 0 は帯域制限なしを表す。 */");
+  lines.push("  readonly rateKbit: number;");
+  lines.push("  readonly delayMs: number;");
+  lines.push("  readonly jitterMs: number;");
+  lines.push("  readonly reorderPercent: number;");
+  lines.push("  readonly duplicatePercent: number;");
+  lines.push("}");
+  lines.push("");
+  lines.push("export interface ImpairmentOutage {");
+  lines.push("  readonly everySec: number;");
+  lines.push("  readonly durationMs: number;");
+  lines.push("}");
+  lines.push("");
+  lines.push("export interface ImpairmentProfile {");
+  lines.push("  readonly id: string;");
+  lines.push("  readonly note: string;");
+  lines.push("  readonly steps: readonly ImpairmentStep[];");
+  lines.push("  readonly outage?: ImpairmentOutage;");
+  lines.push("  readonly egressOnly?: boolean;");
+  lines.push("}");
+  lines.push("");
+  lines.push(`export const IMPAIRMENT_DURATION_SEC = ${JSON.stringify(schema["durationSec"])};`);
+  lines.push("");
+  lines.push("export const IMPAIRMENT_PROFILES: readonly ImpairmentProfile[] =");
+  lines.push(`  ${JSON.stringify(schema["profiles"], null, 2).split("\n").join("\n  ")};`);
+  lines.push("");
+  const bucketRecord = asRecord(schema["tokenBucket"]);
+  lines.push(`export const IMPAIRMENT_BURST_KBIT = ${JSON.stringify(bucketRecord["burstKbit"])};`);
+  lines.push(`export const IMPAIRMENT_LATENCY_MS = ${JSON.stringify(bucketRecord["latencyMs"])};`);
+  lines.push("");
+  const verifyRecord = asRecord(schema["verification"]);
+  lines.push("/** 劣化が実際に効いていることを確かめるための判定値。 */");
+  lines.push(`export const IMPAIRMENT_PROBE_RATE_KBIT = ${JSON.stringify(verifyRecord["probeRateKbit"])};`);
+  lines.push(`export const IMPAIRMENT_PROBE_BYTES = ${JSON.stringify(verifyRecord["probeBytes"])};`);
+  lines.push(`export const IMPAIRMENT_MIN_SECONDS_AT_PROBE_RATE = ${JSON.stringify(verifyRecord["minSecondsAtProbeRate"])};`);
+  lines.push(`export const IMPAIRMENT_PROBE_DELAY_MS = ${JSON.stringify(verifyRecord["probeDelayMs"])};`);
+  lines.push(`export const IMPAIRMENT_MIN_DELAY_INCREASE_MS = ${JSON.stringify(verifyRecord["minDelayIncreaseMs"])};`);
+  return `${lines.join("\n")}\n`;
+}
+
 /* ------------------------------------------------------------------------- */
 /* 実行                                                                      */
 /* ------------------------------------------------------------------------- */
@@ -1014,10 +1080,12 @@ async function buildArtifacts(): Promise<readonly Artifact[]> {
   const wire = await readSchema("wire.json");
   const errors = await readSchema("errors.json");
   const constants = await readSchema("constants.json");
+  const impairment = await readSchema("impairment.json");
   return [
     { path: join(tsOutDir, "wire-layout.ts"), content: generateWireTs(wire) },
     { path: join(tsOutDir, "errors.ts"), content: generateErrorsTs(errors) },
     { path: join(tsOutDir, "constants.ts"), content: generateConstantsTs(constants) },
+    { path: join(tsOutDir, "impairment.ts"), content: generateImpairmentTs(impairment) },
     { path: join(rustOutDir, "constants.rs"), content: generateConstantsRs(constants) },
     { path: join(rustOutDir, "wire_layout.rs"), content: generateWireRs(wire) },
     { path: join(rustOutDir, "errors.rs"), content: generateErrorsRs(errors) },
