@@ -1058,6 +1058,11 @@ function generateImpairmentTs(schema: Record<string, unknown>): string {
   lines.push(`export const IMPAIRMENT_LATENCY_MS = ${JSON.stringify(bucketRecord["latencyMs"])};`);
   lines.push(`export const IMPAIRMENT_DEVICE_MTU = ${JSON.stringify(bucketRecord["deviceMtu"])};`);
   lines.push("");
+  const judgeRecord = asRecord(schema["judgement"]);
+  lines.push("/** 受入条件 4.3 の連続性の閾値。 */");
+  lines.push(`export const IMPAIRMENT_MAX_GAP_MS = ${JSON.stringify(judgeRecord["maxGapMs"])};`);
+  lines.push(`export const IMPAIRMENT_MAX_GAP_WITH_OUTAGE_MS = ${JSON.stringify(judgeRecord["maxGapWithOutageMs"])};`);
+  lines.push("");
   const verifyRecord = asRecord(schema["verification"]);
   lines.push("/** 劣化が実際に効いていることを確かめるための判定値。 */");
   lines.push(`export const IMPAIRMENT_PROBE_RATE_KBIT = ${JSON.stringify(verifyRecord["probeRateKbit"])};`);

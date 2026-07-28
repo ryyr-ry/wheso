@@ -223,6 +223,10 @@ export const IMPAIRMENT_BURST_KBIT = 32;
 export const IMPAIRMENT_LATENCY_MS = 50;
 export const IMPAIRMENT_DEVICE_MTU = 1500;
 
+/** 受入条件 4.3 の連続性の閾値。 */
+export const IMPAIRMENT_MAX_GAP_MS = 1000;
+export const IMPAIRMENT_MAX_GAP_WITH_OUTAGE_MS = 1500;
+
 /** 劣化が実際に効いていることを確かめるための判定値。 */
 export const IMPAIRMENT_PROBE_RATE_KBIT = 1000;
 export const IMPAIRMENT_PROBE_BYTES = 262144;
