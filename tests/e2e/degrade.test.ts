@@ -34,6 +34,7 @@ import {
   IMPAIRMENT_PROFILES,
 } from "../../packages/core/src/generated/impairment.ts";
 import { applyStep, canImpair, clearImpairment, prepareDevice, stepAt } from "../../tools/impair.ts";
+import { judgeAll } from "../support/degrade-judge.ts";
 
 const root = new URL("../..", import.meta.url).pathname;
 
@@ -278,13 +279,16 @@ function durationSec(): number {
 }
 
 /** プロファイルの段を時刻に沿って適用し続ける。終わったら劣化を解除する。 */
-function driveProfile(profileId: string, seconds: number): { stop: () => void } {
+function driveProfile(profileId: string, seconds: number): { stop: () => void; failures: () => number; applied: () => number } {
   const profile = IMPAIRMENT_PROFILES.find((entry) => entry.id === profileId);
   if (profile === undefined) {
     throw new Error(`未知のプロファイル: ${profileId}`);
   }
   const startedAt = Date.now();
   let appliedAtSec = -1;
+  // 適用の成否を数える。失敗を見逃すと「劣化なしで走って緑」という空洞になる。
+  let appliedCount = 0;
+  let failureCount = 0;
   const timer = setInterval(() => {
     const elapsedSec = Math.trunc((Date.now() - startedAt) / 1000);
     if (elapsedSec > seconds) {
@@ -293,7 +297,11 @@ function driveProfile(profileId: string, seconds: number): { stop: () => void } 
     const step = stepAt(profile, elapsedSec);
     if (step !== undefined && step.atSec !== appliedAtSec) {
       appliedAtSec = step.atSec;
-      applyStep(step);
+      if (applyStep(step)) {
+        appliedCount += 1;
+      } else {
+        failureCount += 1;
+      }
     }
     const outage = profile.outage;
     if (outage !== undefined && elapsedSec > 0 && elapsedSec % outage.everySec === 0) {
@@ -313,62 +321,9 @@ function driveProfile(profileId: string, seconds: number): { stop: () => void } 
       clearInterval(timer);
       clearImpairment();
     },
+    failures: () => failureCount,
+    applied: () => appliedCount,
   };
-}
-
-/** 判定 A-3: frameIndex が単調増加である。 */
-function assertMonotonic(result: DegradeResult): void {
-  let previous = 0;
-  for (const entry of result.received) {
-    assert.ok(
-      entry.frameIndex > previous,
-      `frameIndex が単調増加である（${String(previous)} の次に ${String(entry.frameIndex)}）`,
-    );
-    previous = entry.frameIndex;
-  }
-}
-
-/**
- * 判定 C-1: 連続する描画の間隔が 1000 ms を超えない。
- *
- * 送信が終わった後の受信は評価に入れない。送信を止めれば描画も止まるのは当然であり、
- * それを「固まった」と数えると、実際の固まりと区別できない。
- */
-function assertNoFreeze(result: DegradeResult, maxGapMs: number): void {
-  let previous: number | undefined;
-  let worst = 0;
-  let worstAt = 0;
-  for (const entry of result.received) {
-    if (entry.atMs > result.lastSentAtMs) {
-      break;
-    }
-    if (previous !== undefined && entry.atMs - previous > worst) {
-      worst = entry.atMs - previous;
-      worstAt = entry.atMs;
-    }
-    previous = entry.atMs;
-  }
-  assert.ok(
-    worst <= maxGapMs,
-    `描画の間隔が ${String(maxGapMs)} ms を超えない（最悪 ${worst.toFixed(0)} ms、${worstAt.toFixed(0)} ms 時点）`,
-  );
-}
-
-/** 判定 B-2: 落ちたフレームは破棄可能（時間層が最上位）である。 */
-function assertDropsAreDiscardable(result: DegradeResult): void {
-  const arrived = new Set(result.received.map((entry) => entry.frameIndex));
-  const highestTemporal = Math.max(...result.sent.map((entry) => entry.temporalId));
-  const badDrops: number[] = [];
-  for (const entry of result.sent) {
-    if (arrived.has(entry.frameIndex)) {
-      continue;
-    }
-    // 破棄が許されるのは最上位の時間層のみ。キーフレームと基底層が落ちたら不合格。
-    if (entry.isKey || entry.temporalId < highestTemporal) {
-      badDrops.push(entry.frameIndex);
-    }
-  }
-  assert.deepEqual(badDrops, [], "破棄されたのは最上位の時間層だけである");
 }
 
 for (const profile of IMPAIRMENT_PROFILES) {
@@ -411,36 +366,30 @@ for (const profile of IMPAIRMENT_PROFILES) {
       await page.close();
     }
 
+    // 劣化が実際に適用されたことを先に確かめる。適用に失敗したまま緑になると、
+    // 「劣化下でも動いた」という空虚な報告になる。
+    assert.equal(driver.failures(), 0, "劣化の適用が失敗していない");
+    if (profile.id !== "N-0") {
+      assert.ok(driver.applied() > 0, "劣化が少なくとも 1 度適用された");
+    }
+
     const result = asResult(raw);
     assert.ok(result.ok, `記録が取れる（詳細: ${result.detail} / ログ: ${logs.slice(0, 5).join(" | ")}）`);
     assert.ok(result.sent.length > 0, "1 枚以上を送っている");
     assert.ok(result.received.length > 0, "1 枚以上を受け取っている");
 
-    // 判定 A-3・C-1・B-2 は全プロファイルに課す。
-    assertMonotonic(result);
-    // 遮断を持つ段は判定 C-2（復帰 1500 ms 以内）で見る。遮断中の停止は避けられず、
+    // 判定は共通の純関数で行う（tests/support/degrade-judge.ts）。
+    // 遮断を持つ段は C-2（復帰 1500 ms 以内）で見る。遮断中の停止は避けられず、
     // C-1（1000 ms）を課すと TCP の再送を待つ分だけで超える（実測 1036 ms）。
-    assertNoFreeze(
-      result,
-      profile.outage === undefined ? IMPAIRMENT_MAX_GAP_MS : IMPAIRMENT_MAX_GAP_WITH_OUTAGE_MS,
+    const violations = judgeAll(result, {
+      maxGapMs: profile.outage === undefined ? IMPAIRMENT_MAX_GAP_MS : IMPAIRMENT_MAX_GAP_WITH_OUTAGE_MS,
+      // 劣化なしの段だけ欠落 0 を要求する（判定 B-1）。
+      requireComplete: profile.id === "N-0",
+    });
+    assert.deepEqual(
+      violations.map((entry) => `${entry.judgement}: ${entry.detail}`),
+      [],
+      `受入条件の違反が無い（送 ${String(result.sent.length)} / 受 ${String(result.received.length)}）`,
     );
-    assertDropsAreDiscardable(result);
-
-    // 判定 E-1: キーフレーム要求は 0 回である。
-    assert.equal(result.keyframeRequests, 0, "キーフレーム要求が発生しない");
-
-    // 判定 B-1: 劣化なし（N-0）では欠落 0 である。
-    if (profile.id === "N-0") {
-      assert.equal(
-        result.received.length,
-        result.sent.length,
-        `劣化なしでは全フレームが届く（送 ${String(result.sent.length)} / 受 ${String(result.received.length)}）`,
-      );
-    }
-
-    // 判定 A-1 の基準: すべての受信フレームでハッシュが得られている。
-    for (const entry of result.received) {
-      assert.equal(entry.sha256.length, 64, `${String(entry.frameIndex)} 番目のハッシュが取れている`);
-    }
   });
 }
