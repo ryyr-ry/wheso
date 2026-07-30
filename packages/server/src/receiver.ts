@@ -205,6 +205,11 @@ export class ReceiverNode implements Party.Server {
       // 事象が来ず、`ar` が再接続しないまま**音声が二度と戻らなかった**。
       if (message.includes('"t":"heartbeat"')) {
         sender.send(JSON.stringify({ t: "heartbeatAck" }));
+        // **上流への接続を進めることを忘れてはならない。** 接続は `onMessage` の文脈でしか
+        // 張れず、背後で進めるには入力が続く必要がある（F-046）。心拍はその入力を担う。
+        // 応えてすぐ返すと上流が張られず、**媒体が 1 件も流れない**（実測: 結合試験で
+        // 音声が 2 通しか届かなかった）。
+        void this.ensureUpstream();
         return;
       }
       // 購読や報告を受けた時点で割当先への接続を確かめる。

@@ -188,6 +188,9 @@ export class SenderNode implements Party.Server {
       // （実測: 段 E で `close` の事象が来ず、音声が二度と戻らなかった）。
       if (message.includes('"t":"heartbeat"')) {
         sender.send(JSON.stringify({ t: "heartbeatAck" }));
+        // **割当先への接続を進める。** 心拍は「入力が続くこと」を担っている（F-046）。
+        // 応えてすぐ返すと接続が張られず、媒体が上流へ渡らない。
+        void this.ensureShardLink(SHARD_PEER_CURRENT);
         return;
       }
       // クライアントの制御メッセージ。はしごの申告は中継ノードと ctl へ写す。
