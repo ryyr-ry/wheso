@@ -26,6 +26,7 @@ import {
   DELAY_TREND_DEGRADE_NUM,
   OPUS_FRAME_MS,
   REPORT_INTERVAL_MS,
+  VIDEO_JITTER_MAX_FRAMES,
 } from "@wheso/core/src/generated/constants.ts";
 import { delaySlope, wrap32 } from "@wheso/core/src/fixed.ts";
 import { advanceSequence } from "./send-pipeline.ts";
@@ -112,6 +113,11 @@ interface SenderObservation {
   readonly lastAudioAtMs: number;
   /** その送信者の映像の fps の推定（申告が無い間は 0）。 */
   readonly framerate: number;
+  /**
+   * 予定が規範の不連続の閾値を超えて続けて外れた回数。写像の狂いを 1 枚の遅れと
+   * 区別するために数える（0 で切れる）。
+   */
+  readonly farSkewStreak: number;
   /**
    * 申告された時間層の数（カタログから取り込む）。0 なら未申告。
    *
@@ -232,6 +238,7 @@ function observationOf(state: PipelineState, senderId: number): SenderObservatio
     lastVideoAtMs: 0,
     lastAudioAtMs: 0,
     framerate: 0,
+    farSkewStreak: 0,
     temporalLayers: 0,
     lastAudioSeq: 0,
     lastVideoSpatialId: -1,
@@ -372,7 +379,31 @@ function handleVideoUnit(
   }
 
   // 提示の可否を再生クロックで決める（ADR-0028）。
-  const presentation = decidePresent(next.playout, senderId, captureUs, nowMs);
+  let presentation = decidePresent(next.playout, senderId, captureUs, nowMs);
+  // **予定が遠すぎるなら写像が古い。作り直して、この枠は直ちに出す。**
+  //
+  // 予定は音声の再生位置からの写像で作る。頁が一瞬止まった時点で対応を取ると、その分だけ
+  // 写像が狂ったまま残る（ずれの補正は 1 パケット 20 µs であり、数秒の狂いは埋まらない）。
+  //
+  // 捨ててはならない: 狂いが続く間ずっと捨てることになる（実測: 届いた 318 枚のうち復号器へ
+  // 渡ったのは 63 枚）。待たせてもならない: 音声より数秒早い映像を出すことになる（実測
+  // 8.2 秒）。**作り直して 1 枚だけ直ちに出す**のが、映像を止めずずれを 1 枚に留める。
+  //
+  // **両向きに見る。** 遅れの側（音声が先行）で狂うと規範の `decidePresent` が全部を
+  // 「期限切れ」として捨てる（実測: 走行の頭で写像が 2.4 秒狂い、届いた 347 枚のうち
+  // 提示は 56 枚だった）。狂いが規範の不連続の閾値を超えたら、向きに依らず作り直す。
+  const farSkew = presentation.skewMs > AV_RESYNC_GAP_MS || -presentation.skewMs > AV_RESYNC_GAP_MS;
+  const streak = farSkew ? observationOf(next, senderId).farSkewStreak + 1 : 0;
+  next = replaceObservation(next, { ...observationOf(next, senderId), farSkewStreak: streak });
+  // **1 枚では作り直さない。** 1 枚だけ大きく外れているのは、本当に古い枠が遅れて届いた
+  // 場合である（規範どおり捨てる）。**続けて**外れているなら写像そのものが狂っている。
+  // 境目はジッタバッファの深さ（`VIDEO_JITTER_MAX_FRAMES`）に置く。それだけ続けて外れる
+  // 状態はバッファでは説明できない。
+  if (streak > VIDEO_JITTER_MAX_FRAMES) {
+    next = replaceObservation(next, { ...observationOf(next, senderId), farSkewStreak: 0 });
+    next = noteRouteChange(next, senderId);
+    presentation = { decision: "present", skewMs: 0 };
+  }
   // ずれの標本を残す（観測のみ。判断は playout.ts が行う）。
   next = { ...next, skewSamplesMs: appendSample(next.skewSamplesMs, presentation.skewMs, true) };
   if (presentation.decision === "discard") {
@@ -446,31 +477,6 @@ function handleVideoUnit(
     flags: unit.flags,
   });
   next = { ...next, decoders: pool.state };
-
-  // **予定が遠すぎるなら写像が古い。** 作り直して、この枠は捨てる。
-  //
-  // `skewMs` は音声の再生位置から作る（ADR-0028 の写像 M）。切り替えや復旧の直後には
-  // 音声の位置が飛ぶため、映像の予定が数秒先になることがある。以前は「待たずに直ちに
-  // 出す」ことで映像を止めない選択をしていたが、それは**音声より数秒早い映像を出す**
-  // ことであり、判定 D-1 に反する（実測: 段 E で 8.2 秒ずれた組が出た）。写像を作り直せば
-  // 次の音声（20 ms ごと）で正しい予定が作れるため、捨てるのは高々数枚である。
-  //
-  // 閾値は `AV_RESYNC_GAP_MS`（規範がクロックの不連続と見なす間隔）を使う。
-  // 予定は `now − skew` であるから、待ち時間は `−skew` である。
-  const plannedWaitMs = -presentation.skewMs;
-  if (plannedWaitMs > AV_RESYNC_GAP_MS) {
-    // **写像を作り直し、この枠だけを捨てる。連鎖は切らない。**
-    //
-    // 以前はここで `noteGap`（キーフレーム待ち）とキーフレーム要求も行っていた。写像が
-    // **続けて**古いと、届いた枠のほとんどを捨ててキーフレームを待ち続ける状態になる
-    // （実測: 届いた 574 枚のうち復号器へ渡ったのは 124 枚、描画の空白が 11.2 秒、
-    // キーフレーム要求 10 回）。1 枚を捨てただけで参照が欠けるなら、復号の失敗として
-    // 現れ、そこで復号器を作り直して要求する（ADR-0047）。**既に試験のある経路に任せる。**
-    return {
-      ...noteRouteChange(next, senderId),
-      reporter: recordVideoDrop(next.reporter),
-    };
-  }
 
   const input: DecodeInput = {
     senderId,

@@ -169,14 +169,13 @@ test("**連番の飛びを見たら復号へ渡さず、キーフレームを要
   assert.ok(state.decoders.entries.length > 0);
 });
 
-test("**予定が遠すぎる枠は捨てるが、連鎖は切らない**（音声より早く出さない。ADR-0053）", () => {
-  // `skewMs` は音声の再生位置から作る（ADR-0028 の写像 M）。映像が音声より大きく先を
-  // 走っていると予定は数秒先になる。**直ちに出してはならない**（音声より数秒早い映像を
-  // 出すことであり判定 D-1 に反する。実測 8.2 秒）。
+test("**予定が遠すぎるときは写像を作り直し、その枠は直ちに出す**（ADR-0053）", () => {
+  // 予定は音声の再生位置からの写像で作る（ADR-0028）。頁が一瞬止まった時点で対応を取ると、
+  // その分だけ写像が狂ったまま残る（補正は 1 パケット 20 µs であり数秒の狂いは埋まらない）。
   //
-  // **キーフレームを要求してはならない。** 写像が続けて古いと、届いた枠のほとんどを捨てて
-  // キーフレームを待ち続ける（実測: 届いた 574 枚のうち復号器へ渡ったのは 124 枚、
-  // 描画の空白 11.2 秒）。参照が欠けるなら復号の失敗として現れ、そこで作り直す（ADR-0047）。
+  // **捨ててはならない**（狂いが続く間ずっと捨てる。実測: 届いた 318 枚のうち復号器へ渡った
+  // のは 63 枚）。**待たせてもならない**（音声より数秒早い映像を出す。実測 8.2 秒）。
+  // 作り直して 1 枚だけ直ちに出すのが、映像を止めずずれを 1 枚に留める。
   const clock = { ms: 1000 };
   const { deps, log } = recorder(clock);
   let state = createPipeline(4, clock.ms);
@@ -187,22 +186,74 @@ test("**予定が遠すぎる枠は捨てるが、連鎖は切らない**（音�
   assert.ok(decodedBefore > 0, "対応が取れている枠は渡る");
 
   // **映像だけが 10 秒先を走っている**（予定が 10 秒先になる）。
-  clock.ms += 20;
+  //
+  // 1 枚では作り直さない（本当に外れた 1 枚は規範どおり扱う）。ジッタバッファの深さを
+  // 超えて続いたときに作り直す。
   const controlBefore = log.control.length;
-  state = handleMedia(state, mediaBytes({ key: false, seq: 2, captureUs: 10_000_000 }), deps);
-  assert.equal(log.decoded.length, decodedBefore, "**予定が遠すぎる枠は渡さない**");
+  for (let index = 0; index < 12; index += 1) {
+    clock.ms += 20;
+    state = handleMedia(
+      state,
+      mediaBytes({ key: false, seq: 2 + index, captureUs: 10_000_000 + index * 50_000 }),
+      deps,
+    );
+  }
+  assert.ok(log.decoded.length > decodedBefore, "**続けて外れたら捨てずに渡す**（映像を止めない）");
+  const scheduled = log.decoded[log.decoded.length - 1];
+  assert.equal(scheduled?.presentAtMs, clock.ms, "**直ちに出す**（10 秒後ではない）");
   assert.deepEqual(
     log.control.slice(controlBefore).filter((text: string) => text.includes("keyframeRequest")),
     [],
-    "**キーフレームは要求しない**（待ち続けになる）",
+    "キーフレームは要求しない（待ち続けになる）",
   );
 
-  // 写像は作り直されている。対応が取れる枠は続けて渡る（止まらない）。
+  // 続きも渡る（写像は作り直されている）。
   clock.ms += 20;
   state = handleMedia(state, mediaBytes({ channel: CHANNEL_AUDIO, seq: 2, captureUs: 20_000 }), deps);
   clock.ms += 20;
   state = handleMedia(state, mediaBytes({ key: false, seq: 3, captureUs: 40_000 }), deps);
-  assert.ok(log.decoded.length > decodedBefore, "作り直した後は渡る（キーフレームを待たない）");
+  // 対応が取れた後は規範の `decidePresent` が可否を決める（持つ・出す・捨てる）。
+  // ここで確かめるのは「止まっていない」ことである。
+  assert.ok(log.decoded.length >= decodedBefore + 1, `止まっていない（${String(log.decoded.length)}）`);
+});
+
+test("**遅れの側に狂った写像も作り直し、キーフレームで復帰する**", () => {
+  // 走行の頭で頁が止まると、対応を取った時点の分だけ写像が遅れの側へ狂う。規範の
+  // `decidePresent` は期限切れを捨てるため、**届いた枠のほとんどが捨てられ続ける**
+  // （実測: 届いた 347 枚のうち提示は 56 枚、SDK が思うずれは 2,406 ms）。
+  //
+  // 続けて外れたら写像を作り直す。捨てた分だけ連番が飛ぶため、**そこからは規範 1.4 の
+  // 経路（キーフレーム待ちと要求）で復帰する**（ADR-0049）。作り直さなければ復帰の
+  // きっかけが永久に来ない。
+  const clock = { ms: 1000 };
+  const { deps, log } = recorder(clock);
+  let state = createPipeline(4, clock.ms);
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_AUDIO, seq: 1, captureUs: 10_000_000 }), deps);
+  clock.ms += 20;
+  state = handleMedia(state, mediaBytes({ key: true, seq: 1, captureUs: 10_000_000 }), deps);
+  const decodedBefore = log.decoded.length;
+  const controlBefore = log.control.length;
+
+  // **10 秒古い映像**が続けて届く（写像の上では期限切れである）。
+  for (let index = 0; index < 12; index += 1) {
+    clock.ms += 20;
+    state = handleMedia(state, mediaBytes({ key: false, seq: 2 + index, captureUs: index * 50_000 }), deps);
+  }
+  assert.ok(state.discardedVideo > 0, "外れている間は捨てる（規範どおり）");
+  assert.ok(
+    log.control.slice(controlBefore).some((text: string) => text.includes("keyframeRequest")),
+    "**復帰のきっかけを出す**（キーフレームを要求する）",
+  );
+
+  // キーフレームが来たら復帰する（写像は作り直されている）。
+  clock.ms += 20;
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_AUDIO, seq: 2, captureUs: 600_000 }), deps);
+  clock.ms += 20;
+  state = handleMedia(state, mediaBytes({ key: true, seq: 14, captureUs: 600_000 }), deps);
+  assert.ok(
+    log.decoded.length > decodedBefore,
+    `キーフレームで復帰する（復号 ${String(log.decoded.length)}）`,
+  );
 });
 
 test("**遅れて届いた古いユニットを復号へ渡さない**（受入条件 A-3）", () => {
