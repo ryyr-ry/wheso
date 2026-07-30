@@ -77,6 +77,11 @@ export class ControlNode implements Party.Server {
    * hello として解釈すると形式違反で接続を閉じてしまう。
    */
   private readonly authenticating = new Set<string>();
+  /**
+   * 接続を開いた時刻（接続 ID → ミリ秒）。**認証の猶予を接続ごとに数えるために持つ。**
+   * アラームの刻みを猶予と混同すると、開いた直後の接続が `hello` の到着前に閉じられる。
+   */
+  private readonly openedAtMs = new Map<string, number>();
 
 
 
@@ -97,12 +102,15 @@ export class ControlNode implements Party.Server {
       return;
     }
     // 未認証の接続を放置しない。猶予を過ぎたら閉じる（auth.md 5 節の濫用対策）。
+    // **猶予は接続ごとに数える**（アラームの刻みを猶予と混同しない）。
+    this.openedAtMs.set(connection.id, Date.now());
     void this.room.storage.setAlarm(Date.now() + HELLO_TIMEOUT_MS);
   }
 
   onClose(connection: Party.Connection): void {
     this.gate = forgetNode(this.gate, connection.id);
     this.authenticating.delete(connection.id);
+    this.openedAtMs.delete(connection.id);
     const userId = this.authenticated.get(connection.id);
     if (userId === undefined) {
       return;
@@ -277,11 +285,23 @@ export class ControlNode implements Party.Server {
   }
 
   onAlarm(): void {
+    const now = Date.now();
     // 猶予を過ぎた未認証の接続を閉じる。ノードとして認証されたものは残す。
+    // **経過は接続ごとに見る**（アラームの刻みは猶予ではない）。
     for (const connection of this.room.getConnections()) {
-      if (!this.authenticated.has(connection.id) && !isNodeAuthenticated(this.gate, connection.id)) {
-        connection.close(ERROR_DEFINITIONS.E_AUTH.closeCode, "hello timeout");
+      if (this.authenticated.has(connection.id) || isNodeAuthenticated(this.gate, connection.id)) {
+        continue;
       }
+      const openedAt = this.openedAtMs.get(connection.id);
+      if (openedAt === undefined) {
+        // 実行環境が入れ替わると表は空になる。空を猶予切れと読んではならない（F-046）。
+        this.openedAtMs.set(connection.id, now);
+        continue;
+      }
+      if (now - openedAt < HELLO_TIMEOUT_MS) {
+        continue;
+      }
+      connection.close(ERROR_DEFINITIONS.E_AUTH.closeCode, "hello timeout");
     }
   }
 

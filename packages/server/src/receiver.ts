@@ -53,6 +53,11 @@ export class ReceiverNode implements Party.Server {
 
   /** 認証を通ったクライアント接続。予備接続があるため複数になる。 */
   private readonly clients = new Set<string>();
+  /**
+   * 接続を開いた時刻（接続 ID → ミリ秒）。**認証の猶予を接続ごとに数えるために持つ。**
+   * アラームの刻みを猶予と混同すると、開いた直後の接続が `hello` の到着前に閉じられる。
+   */
+  private readonly openedAtMs = new Map<string, number>();
 
   /**
    * 認証の処理中の接続。
@@ -160,8 +165,15 @@ export class ReceiverNode implements Party.Server {
     link.sendText(text);
   }
 
-  onConnect(): void {
+  onConnect(connection: Party.Connection): void {
     // 認証の猶予と ack の周期をこのアラームで兼ねる。
+    //
+    // **猶予は接続ごとに数える。** アラームは認証が済んだ後 `ACK_INTERVAL_MS`（50 ms）で
+    // 回り続ける。「アラームが鳴ったら未認証の接続を閉じる」と書くと、猶予は
+    // `HELLO_TIMEOUT_MS` ではなく**次の刻みまで**になり、開いた直後の接続が
+    // `hello` の到着を待たずに閉じられる。予備接続（同じ部屋への 2 本目）と再接続が
+    // これで死んだ（実測: `vr` が 4020「hello timeout」で落ち、以後 1 枚も届かない）。
+    this.openedAtMs.set(connection.id, Date.now());
     void this.room.storage.setAlarm(Date.now() + HELLO_TIMEOUT_MS);
   }
 
@@ -169,6 +181,7 @@ export class ReceiverNode implements Party.Server {
     this.clients.delete(connection.id);
     this.authenticating.delete(connection.id);
     this.subscribedClients.delete(connection.id);
+    this.openedAtMs.delete(connection.id);
   }
 
   async onMessage(message: string | ArrayBuffer, sender: Party.Connection): Promise<void> {
@@ -252,10 +265,23 @@ export class ReceiverNode implements Party.Server {
   onAlarm(): void {
     const now = Date.now();
     // 猶予を過ぎた未認証の接続を閉じる。放置すると接続だけを張る濫用を許す。
+    // **経過は接続ごとに見る**（アラームの刻みは 50 ms であり猶予ではない）。
     for (const connection of this.room.getConnections()) {
-      if (!this.clients.has(connection.id)) {
-        connection.close(ERROR_DEFINITIONS.E_AUTH.closeCode, "hello timeout");
+      if (this.clients.has(connection.id)) {
+        continue;
       }
+      const openedAt = this.openedAtMs.get(connection.id);
+      if (openedAt === undefined) {
+        // **開いた時刻を知らない接続は、その場で猶予を与え直す。** この表は isolate の
+        // 記憶であり、実行環境が入れ替わると空になる（F-046）。空を「猶予切れ」と読むと、
+        // 入れ替わりの直後に生きている接続を全部閉じる（実測: 音声受信部屋が 4020 で死んだ）。
+        this.openedAtMs.set(connection.id, now);
+        continue;
+      }
+      if (now - openedAt < HELLO_TIMEOUT_MS) {
+        continue;
+      }
+      connection.close(ERROR_DEFINITIONS.E_AUTH.closeCode, "hello timeout");
     }
     // ACK_INTERVAL_MS ごとに受信位置を上流へ返す（congestion.md 2 節）。
     this.counters = { ...this.counters, alarms: this.counters.alarms + 1 };

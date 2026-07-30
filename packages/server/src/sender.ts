@@ -49,6 +49,11 @@ export class SenderNode implements Party.Server {
 
   /** 認証を通ったクライアント接続。送信部屋は 1 人ぶんだが再接続で重なり得る。 */
   private readonly clients = new Set<string>();
+  /**
+   * 接続を開いた時刻（接続 ID → ミリ秒）。**認証の猶予を接続ごとに数えるために持つ。**
+   * アラームの刻みを猶予と混同すると、開いた直後の接続が `hello` の到着前に閉じられる。
+   */
+  private readonly openedAtMs = new Map<string, number>();
 
   /**
    * 認証の処理中の接続。
@@ -149,14 +154,18 @@ export class SenderNode implements Party.Server {
     };
   }
 
-  onConnect(): void {
+  onConnect(connection: Party.Connection): void {
     // 未認証の接続を放置しない（auth.md 5 節の濫用対策）。
+    // **猶予は接続ごとに数える。** アラームは送信窓の時限でも鳴るため、刻みを猶予と
+    // 混同すると開いた直後の接続が `hello` の到着前に閉じられる。
+    this.openedAtMs.set(connection.id, Date.now());
     void this.room.storage.setAlarm(Date.now() + HELLO_TIMEOUT_MS);
   }
 
   onClose(connection: Party.Connection): void {
     this.clients.delete(connection.id);
     this.authenticating.delete(connection.id);
+    this.openedAtMs.delete(connection.id);
   }
 
   async onMessage(message: string | ArrayBuffer, sender: Party.Connection): Promise<void> {
@@ -240,11 +249,21 @@ export class SenderNode implements Party.Server {
 
   onAlarm(): void {
     const now = Date.now();
-    // 猶予を過ぎた未認証の接続を閉じる。
+    // 猶予を過ぎた未認証の接続を閉じる。**経過は接続ごとに見る。**
     for (const connection of this.room.getConnections()) {
-      if (!this.clients.has(connection.id)) {
-        connection.close(4001, "hello timeout");
+      if (this.clients.has(connection.id)) {
+        continue;
       }
+      const openedAt = this.openedAtMs.get(connection.id);
+      if (openedAt === undefined) {
+        // 実行環境が入れ替わると表は空になる。空を猶予切れと読んではならない（F-046）。
+        this.openedAtMs.set(connection.id, now);
+        continue;
+      }
+      if (now - openedAt < HELLO_TIMEOUT_MS) {
+        continue;
+      }
+      connection.close(4001, "hello timeout");
     }
     // 旧接続の残量を伝える。0 になったら旧接続を閉じる判断が下る（state-machines.md 5 節）。
     const stale = this.shards.get(SHARD_PEER_CURRENT);

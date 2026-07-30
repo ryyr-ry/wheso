@@ -40,6 +40,30 @@ export function liveHost(): string {
 }
 
 /**
+ * 配備する PartyKit の企画名。**環境変数 WHESO_PARTYKIT_PROJECT で与える。**
+ *
+ * **なぜ必須にするか。** `partykit.json` の `name` を既定として使うと、環境変数を
+ * 与え忘れたときに**設定ファイルに書かれた企画へ配備してしまう**。同じ帳場に別の
+ * 企画があると、試験のための配備が無関係の企画を上書きする（実際に起きた）。
+ * 配備先は必ず呼び出し側が名指しする。
+ */
+export function livePartykitProject(): string {
+  const project = process.env["WHESO_PARTYKIT_PROJECT"];
+  if (project === undefined || project === "") {
+    throw new Error("WHESO_PARTYKIT_PROJECT が無い（配備先の企画名を環境変数で与える）");
+  }
+  const host = liveHost();
+  // **企画名とホストが対応していなければ失敗させる。** 片方だけを書き換えると、
+  // 「A へ配備して B を試験する」状態になり、何を測っているのか分からなくなる。
+  if (!host.startsWith(`${project}.`)) {
+    throw new Error(
+      `WHESO_PARTYKIT_PROJECT（${project}）と WHESO_LIVE_HOST（${host}）が対応していない`,
+    );
+  }
+  return project;
+}
+
+/**
  * 会議 ID を新しく作る。形式は部屋名規範 1 節（26 文字。i / l / o / u を含まない）。
  *
  * 毎回変える理由: 実環境の Durable Object は試験の後も生き続ける。同じ部屋を使い回すと
@@ -59,12 +83,14 @@ export function newShardRoom(meetingId: string): string {
   return `vsh-${meetingId}-auto-1-0`;
 }
 
-/** 実環境へデプロイする。鍵は変数として渡す。 */
+/** 実環境へデプロイする。鍵は変数として渡す。**配備先は必ず名指しする。** */
 export async function deployLive(): Promise<boolean> {
   if (process.env["WHESO_SKIP_DEPLOY"] === "1") {
     return true;
   }
   const root = new URL("../..", import.meta.url).pathname;
+  // 名指しできない状態では配備しない（`partykit.json` の既定へ落ちるのを防ぐ）。
+  const project = livePartykitProject();
   return await new Promise<boolean>((resolve) => {
     // 鍵は 2 種類とも渡す。片方を忘れると、その鍵を使う試験だけが実環境で失敗する。
     const child = spawn(
@@ -72,6 +98,8 @@ export async function deployLive(): Promise<boolean> {
       [
         "partykit",
         "deploy",
+        "--name",
+        project,
         "--var",
         `WHESO_NODE_KEY=${DEV_NODE_KEY}`,
         "--var",

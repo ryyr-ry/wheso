@@ -1,0 +1,321 @@
+/**
+ * SDK 経由の観測を段 D の判定（`degrade-judge.ts`）の形へ組み直す**純関数**。
+ *
+ * ここを純関数にする理由は判定と同じである。ブラウザの中で組むと、組み方の誤りを
+ * 試験できない。実際に旧い器では判定 D-1 の入力が空のまま「合格」になっていた（X-038）。
+ *
+ * **対応付けの原則。**
+ *
+ * 1. 映像と音声の対は**送信側の取得時刻**で決める。受信側の時刻で推測してはならない
+ *    （どのフレームとどの音が対応するのかが分からなくなる）。
+ * 2. 送信側が出した層のうち、**購読者が選んだ 1 段だけ**を判定の対象にする。
+ *    simulcast では送信側が複数段を出すが、中継ノードは購読ごとにちょうど 1 段を選ぶ
+ *    （ADR-0027）。選ばれていない段は「届かなくて当然」であり、欠落として数えては
+ *    ならない。逆に**選ばれた段の中の欠落は、破棄可能な層を除いてすべて違反**である。
+ * 3. 末尾は内容（取得時刻）で切る。時刻で切ると提示の門でずれた分を取り違える。
+ */
+
+import type {
+  DegradePlayedAudio,
+  DegradePresentedVideo,
+  DegradeRecord,
+  DegradeSent,
+  DegradeReceived,
+} from "./degrade-judge.ts";
+import { ERROR_DEFINITIONS } from "../../packages/core/src/generated/errors.ts";
+
+export interface ObservedSentVideo {
+  readonly frameIndex: number;
+  readonly spatialId: number;
+  readonly temporalId: number;
+  readonly isKey: boolean;
+  readonly captureUs: number;
+  readonly atMs: number;
+}
+
+export interface ObservedSentAudio {
+  readonly captureUs: number;
+  readonly atMs: number;
+  readonly silent: boolean;
+}
+
+export interface ObservedReceived {
+  readonly captureUs: number;
+  readonly sha256: string;
+  readonly atMs: number;
+}
+
+export interface ObservedDecoded {
+  readonly captureUs: number;
+  readonly spatialId: number;
+  readonly temporalId: number;
+  readonly isKey: boolean;
+  readonly atMs: number;
+}
+
+export interface ObservedPlayedAudio {
+  readonly captureUs: number;
+  readonly atMs: number;
+}
+
+export interface ObservedArrived {
+  readonly captureUs: number;
+  readonly spatialId: number;
+}
+
+export interface ObservedClosure {
+  readonly label: string;
+  readonly role: string;
+  readonly code: number;
+}
+
+export interface ObservedRun {
+  readonly sentVideo: readonly ObservedSentVideo[];
+  readonly sentAudio: readonly ObservedSentAudio[];
+  readonly received: readonly ObservedReceived[];
+  readonly decoded: readonly ObservedDecoded[];
+  readonly playedAudio: readonly ObservedPlayedAudio[];
+  readonly arrived: readonly ObservedArrived[];
+  readonly keyframeRequests: number;
+  readonly closures: readonly ObservedClosure[];
+  readonly lastSentAtMs: number;
+}
+
+/**
+ * **自動再接続で戻れない閉鎖コードの集合。**
+ *
+ * 生成物から導く（数値を書かない）。`autoReconnect: false` の誤りで閉じられた経路は
+ * 二度と戻らないため、1 回でも起きれば失敗である。逆に**戻れる閉鎖は失敗ではない**。
+ * 接続の状態機械と予備接続は切断からの復帰を仕事にしており（state-machines.md 1 節）、
+ * 劣化の下で切れて戻ることは設計どおりである。旧い器は 2 本の生の接続しか持たず
+ * 再接続もしなかったため、あらゆる切断を失敗として扱えた。SDK では扱えない。
+ */
+const FATAL_CLOSE_CODES: ReadonlySet<number> = new Set(
+  Object.values(ERROR_DEFINITIONS)
+    .filter((entry) => !entry.autoReconnect)
+    .map((entry) => entry.closeCode),
+);
+
+/** 戻れない閉鎖かどうか。実行環境由来の 1006（コードなしの異常終了）は戻れる扱いである。 */
+export function isFatalClosure(code: number): boolean {
+  return FATAL_CLOSE_CODES.has(code);
+}
+
+/** 層の切替の記録。判定 E-1（キーフレーム要求の許容回数）と C-3 に使う。 */
+export interface LayerSwitch {
+  readonly atMs: number;
+  readonly from: number;
+  readonly to: number;
+  /** 段を上げたか。上げたときはキーフレーム要求が許される（受入条件 4.5 の例外）。 */
+  readonly up: boolean;
+}
+
+export interface BuiltRecord {
+  readonly record: DegradeRecord;
+  readonly switches: readonly LayerSwitch[];
+  /** 判定の対象にした送信ユニットの数（選ばれた段のみ）。 */
+  readonly judgedSent: number;
+  /** 対応する音声が送られなかったため判定から外した映像の数。 */
+  readonly droppedForNoAudio: number;
+  /** 戻れる閉鎖（設計どおりの再接続）。報告のみ。 */
+  readonly transientClosures: readonly string[];
+}
+
+/** 取得時刻の昇順で「そのとき購読者が受けていた段」を引ける表を作る。 */
+function selectionTimeline(arrived: readonly ObservedArrived[]): readonly ObservedArrived[] {
+  return [...arrived].sort((a, b) => a.captureUs - b.captureUs);
+}
+
+/** 取得時刻 `captureUs` の時点で選ばれていた段を返す。分からなければ null。 */
+function selectedAt(timeline: readonly ObservedArrived[], captureUs: number): number | null {
+  let chosen: number | null = null;
+  for (const entry of timeline) {
+    if (entry.captureUs > captureUs) {
+      break;
+    }
+    chosen = entry.spatialId;
+  }
+  if (chosen !== null) {
+    return chosen;
+  }
+  // その時刻より前に到着が無い（測定の先頭）。最初に到着した段を使う。
+  const first = timeline[0];
+  return first === undefined ? null : first.spatialId;
+}
+
+/** 最も近い取得時刻の音声を選ぶ。無音（DTX）は対にしない。 */
+function nearestAudio(sentAudio: readonly ObservedSentAudio[], captureUs: number): number | null {
+  let best: number | null = null;
+  let bestDistance = Number.MAX_SAFE_INTEGER;
+  for (const entry of sentAudio) {
+    if (entry.silent) {
+      continue;
+    }
+    const distance = Math.abs(entry.captureUs - captureUs);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = entry.captureUs;
+    }
+  }
+  return best;
+}
+
+/**
+ * 観測を判定の形へ組み直す。
+ *
+ * @param run 観測
+ * @param audioPairWindowUs 映像と対にする音声の許容距離（マイクロ秒）。これより離れた
+ *   音声しか無い映像は「対が無い」として判定から外す。既定は 1 フレーム分に相当する
+ *   100 ms とする（15 fps でも 60 fps でも 1 枚は入る）。
+ */
+export function buildDegradeRecord(run: ObservedRun, audioPairWindowUs = 100_000): BuiltRecord {
+  const timeline = selectionTimeline(run.arrived);
+
+  // 1. 判定の対象にする送信ユニットを選ぶ（購読者が選んだ段のみ）。
+  const sent: DegradeSent[] = [];
+  const indexByCapture = new Map<number, number>();
+  for (const unit of run.sentVideo) {
+    const selected = selectedAt(timeline, unit.captureUs);
+    if (selected === null || unit.spatialId !== selected) {
+      continue;
+    }
+    // **段は 0 に潰す。** 段ごとの上下は `switches` で別に報告する。潰さないと
+    // 「最上位の空間層は落ちてよい」という許容が働き、選ばれた段の欠落を見逃す。
+    sent.push({
+      frameIndex: unit.frameIndex,
+      temporalId: unit.temporalId,
+      isKey: unit.isKey,
+      atMs: unit.atMs,
+      spatialId: 0,
+    });
+    indexByCapture.set(unit.captureUs, unit.frameIndex);
+  }
+
+  // 2. ワイヤの到着を frameIndex へ写す。
+  const arrivedIndexes: number[] = [];
+  for (const entry of run.arrived) {
+    const frameIndex = indexByCapture.get(entry.captureUs);
+    if (frameIndex !== undefined) {
+      arrivedIndexes.push(frameIndex);
+    }
+  }
+
+  // 3. 提示できたフレーム。段は復号へ渡した記録から引く。
+  const received: DegradeReceived[] = [];
+  const presentedVideo: DegradePresentedVideo[] = [];
+  const decodedByCapture = new Map<number, ObservedDecoded>();
+  for (const entry of run.decoded) {
+    if (!decodedByCapture.has(entry.captureUs)) {
+      decodedByCapture.set(entry.captureUs, entry);
+    }
+  }
+  // 4. 音声の対応付け。**送信側の取得時刻で決める。**
+  const audioKeyByFrame = new Map<number, number>();
+  for (const unit of run.sentVideo) {
+    const frameIndex = indexByCapture.get(unit.captureUs);
+    if (frameIndex === undefined) {
+      continue;
+    }
+    const key = nearestAudio(run.sentAudio, unit.captureUs);
+    if (key === null || Math.abs(key - unit.captureUs) > audioPairWindowUs) {
+      continue;
+    }
+    audioKeyByFrame.set(frameIndex, key);
+  }
+
+  // 5. 再生した音声の取得時刻の集合。末尾を切る基準にも使う。
+  const playedByCapture = new Map<number, number>();
+  for (const entry of run.playedAudio) {
+    const existing = playedByCapture.get(entry.captureUs);
+    if (existing === undefined || entry.atMs < existing) {
+      playedByCapture.set(entry.captureUs, entry.atMs);
+    }
+  }
+  let lastPlayedCaptureUs = -1;
+  for (const captureUs of playedByCapture.keys()) {
+    if (captureUs > lastPlayedCaptureUs) {
+      lastPlayedCaptureUs = captureUs;
+    }
+  }
+
+  let droppedForNoAudio = 0;
+  for (const entry of run.received) {
+    const frameIndex = indexByCapture.get(entry.captureUs);
+    if (frameIndex === undefined) {
+      continue;
+    }
+    const decoded = decodedByCapture.get(entry.captureUs);
+    received.push({
+      frameIndex,
+      spatialId: 0,
+      temporalId: decoded === undefined ? 0 : decoded.temporalId,
+      isKey: decoded !== undefined && decoded.isKey,
+      sha256: entry.sha256,
+      atMs: entry.atMs,
+    });
+    // 判定 D-1 の対象は「対の音声が送られており、かつその音声より前の映像」に限る。
+    const audioKey = audioKeyByFrame.get(frameIndex);
+    if (audioKey === undefined) {
+      droppedForNoAudio += 1;
+      continue;
+    }
+    if (entry.captureUs > lastPlayedCaptureUs) {
+      // まだ経路に音声が残っている。切る。
+      droppedForNoAudio += 1;
+      continue;
+    }
+    presentedVideo.push({ frameIndex, atMs: entry.atMs });
+  }
+
+  const playedAudio: DegradePlayedAudio[] = [];
+  for (const frame of presentedVideo) {
+    const audioKey = audioKeyByFrame.get(frame.frameIndex);
+    if (audioKey === undefined) {
+      continue;
+    }
+    const atMs = playedByCapture.get(audioKey);
+    if (atMs === undefined) {
+      // 送ったのに再生されていない。**これは違反として残す**（音声は破棄禁止）。
+      continue;
+    }
+    playedAudio.push({ frameIndex: frame.frameIndex, atMs });
+  }
+
+  // 6. 段の切替。
+  const switches: LayerSwitch[] = [];
+  let previous: number | null = null;
+  for (const entry of run.decoded) {
+    if (previous !== null && entry.spatialId !== previous) {
+      switches.push({ atMs: entry.atMs, from: previous, to: entry.spatialId, up: entry.spatialId > previous });
+    }
+    previous = entry.spatialId;
+  }
+
+  const fatal: string[] = [];
+  const transient: string[] = [];
+  for (const closure of run.closures) {
+    const text = `${closure.label} ${closure.role} code=${String(closure.code)}`;
+    if (isFatalClosure(closure.code)) {
+      fatal.push(text);
+      continue;
+    }
+    transient.push(text);
+  }
+
+  return {
+    record: {
+      sent,
+      received,
+      playedAudio,
+      presentedVideo,
+      lastSentAtMs: run.lastSentAtMs,
+      keyframeRequests: run.keyframeRequests,
+      closures: fatal,
+      arrived: arrivedIndexes,
+    },
+    switches,
+    judgedSent: sent.length,
+    droppedForNoAudio,
+    transientClosures: transient,
+  };
+}

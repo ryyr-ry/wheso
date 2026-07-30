@@ -453,17 +453,31 @@ export async function joinWith(
   // 参加者ごとの表示寸法の申告を受信部屋へ写すための中継。参加後に配線する。
   let sendVideoReceive: (text: string) => void = () => undefined;
 
-  const hello = JSON.stringify({
-    t: "hello",
-    protocolVersion: PROTOCOL_VERSION,
-    token,
-    senderId,
-    capabilities: {
-      decodeAv1: deps.capability.encodeAv1,
-      encodeAv1: deps.capability.encodeAv1,
-      platform: "browser",
-    },
-  });
+  /**
+   * `hello` の本文。**接続のたびに作り直す。**
+   *
+   * 参加トークンの有効期間は 60 秒である（auth.md 3.3）。本文を 1 度だけ作って使い回すと、
+   * 60 秒より後に起きた再接続は**期限切れのトークンで `hello` を送る**ことになり、
+   * `E_AUTH`（クローズコード 4020）で拒否される。`E_AUTH` は自動再接続の対象外
+   * （`errors.json` の `autoReconnect: false`）であるため、**その部屋は二度と戻らない**。
+   * 会議が 1 分を超えれば必ず起きる。実測: 劣化の器（60 秒）で受信部屋と音声部屋が
+   * 4020 で落ち、以後 1 枚も届かなかった。
+   *
+   * したがってトークンは送る直前に取り直す。既定は参加 URL の断片であり（更新されない）、
+   * 応用が `tokenProvider` を渡せば短命のトークンを供給し続けられる（sdk-api.md 2 節）。
+   */
+  const helloText = (): string =>
+    JSON.stringify({
+      t: "hello",
+      protocolVersion: PROTOCOL_VERSION,
+      token: options.tokenProvider === undefined ? target.value.token : options.tokenProvider(),
+      senderId,
+      capabilities: {
+        decodeAv1: deps.capability.encodeAv1,
+        encodeAv1: deps.capability.encodeAv1,
+        platform: "browser",
+      },
+    });
 
   // はしごを源から導出する（ADR-0026）。**源より大きい段を作らない。**
   // 再接続のたびに送り直すため、本文を作る関数として持つ。
@@ -561,7 +575,7 @@ export async function joinWith(
       openSocket: (): LinkSocket | null => deps.openSocket(url_, role),
       now: deps.now,
       scheduleAt: deps.scheduleAt,
-      helloText: (): string => hello,
+      helloText: (): string => helloText(),
       announceText: (): string => (role === "vs" ? announceText() : ""),
       subscribeText: (): string => subscribeTextFor(role),
       onMedia: (bytes): void => {

@@ -148,7 +148,19 @@ jobs:
         env:
           PARTYKIT_TOKEN: ${{ secrets.PARTYKIT_TOKEN }}
           PARTYKIT_LOGIN: ${{ secrets.PARTYKIT_LOGIN }}
-        run: npm run deploy:test
+          WHESO_LIVE_HOST: ${{ secrets.WHESO_LIVE_HOST }}
+        run: |
+          # **配備先は試験する相手から導く。** 企画名を別に持つと、片方だけを書き換えた
+          # ときに「A へ配備して B を試験する」状態になる。名前が定まらなければ配備しない
+          # （設定ファイルの既定へ落ちると、同じ帳場の無関係な企画を上書きする）。
+          if [ -z "$WHESO_LIVE_HOST" ]; then
+            echo "WHESO_LIVE_HOST が無い。配備先が定まらないため配備しない"
+            exit 1
+          fi
+          WHESO_PARTYKIT_PROJECT="${WHESO_LIVE_HOST%%.*}"
+          export WHESO_PARTYKIT_PROJECT
+          echo "配備先の企画: $WHESO_PARTYKIT_PROJECT"
+          npm run deploy:test
       - id: mark
         run: echo "deployed=yes" >> "$GITHUB_OUTPUT"
 
@@ -201,7 +213,10 @@ jobs:
       - name: root で tc を触れることを確認する
         run: sudo -n tc qdisc show dev lo
       - name: 劣化下の記録と判定
-        run: node --test --test-force-exit --test-name-pattern='^${{ matrix.profile }}:' tests/e2e/degrade.test.ts
+        # **器は SDK 経由である**（F-10）。生の WebSocket の器は `ack` を返さないため、
+        # 購読単位の送信窓（ADR-0025）を入れた後は `ACK_TIMEOUT_MS` で切断される
+        # （実測: 9 本すべてが code=4034 で落ちた）。判定するのは製品の判断である。
+        run: node --test --test-force-exit --test-name-pattern='SDK 経由 ${{ matrix.profile }}:' tests/e2e/degrade-sdk.test.ts
 
   # ── 段 B（疎通）: 5 言語が実環境へ実データを流す。言語ごとに並列 ──
   transport:

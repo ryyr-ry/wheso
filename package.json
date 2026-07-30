@@ -25,6 +25,7 @@
     "test:e2e": "node --test --test-force-exit \"tests/e2e/media.test.ts\"",
     "test:e2e:sdk": "node --test --test-force-exit \"tests/e2e/sdk-media.test.ts\"",
     "test:degrade": "node --test --test-force-exit \"tests/e2e/degrade.test.ts\"",
+    "test:degrade:sdk": "node --test --test-force-exit \"tests/e2e/degrade-sdk.test.ts\"",
     "test:endurance": "node --test --test-force-exit \"tests/e2e/endurance.test.ts\"",
     "test:transport": "node tools/transport-suite.ts all",
     "test:rust": "cargo test --manifest-path sdks/rust/Cargo.toml",
@@ -32,7 +33,7 @@
     "test:dart": "bash sdks/dart/run-tests.sh",
     "test:kotlin": "bash sdks/kotlin/run-tests.sh",
     "test:swift": "bash sdks/swift/run-tests.sh",
-    "deploy:test": "partykit deploy --var WHESO_NODE_KEY=wheso-dev-node-key-not-a-secret --var WHESO_TOKEN_KEY=wheso-dev-token-key-not-a-secret"
+    "deploy:test": "partykit deploy --name \"$WHESO_PARTYKIT_PROJECT\" --var WHESO_NODE_KEY=wheso-dev-node-key-not-a-secret --var WHESO_TOKEN_KEY=wheso-dev-token-key-not-a-secret"
   },
   "devDependencies": {
     "@types/node": "24.3.0",

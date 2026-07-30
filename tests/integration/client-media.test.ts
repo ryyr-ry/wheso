@@ -316,6 +316,18 @@ interface Party_ {
   readonly videoAtMs: { readonly frameIndex: number; readonly atMs: number }[];
   readonly audioAtMs: { readonly frameIndex: number; readonly atMs: number }[];
   readonly participants: () => readonly string[];
+  /**
+   * 受信側から要求されたキーフレームを 1 度だけ受け取る（要求が無ければ false）。
+   *
+   * **なぜ試験がこれを持つか。** 実物の取得の端（`media/browser-capture.ts`）は
+   * `keyframeRequest` を受けると次のフレームをキーフレームにする。器がこれを無視すると、
+   * 購読が中継ノードへ届く前に送った 1 枚目のキーフレームが捨てられた場合、復号器は
+   * キーフレームを永久に待ち、映像は 1 枚も出ない（実測: 公開 CI で 42 通が届いたのに
+   * 復号は 0 枚。往復が長い環境では購読の登録が遅れるため常に起きる）。
+   * 器が実物と同じ応答をすることで、要求が `vr → 受信ノード → 中継ノード → 送信ノード → vs`
+   * を通って戻ることも同時に確かめられる。
+   */
+  readonly takeKeyframeRequest: () => boolean;
   readonly close: () => void;
 }
 
@@ -332,6 +344,8 @@ async function joinParty(userId: string): Promise<Party_> {
     },
   });
   const audioAtMs: { readonly frameIndex: number; readonly atMs: number }[] = [];
+  // 受信側からのキーフレーム要求。実物の端と同じく「次のフレームを key にする」で応える。
+  let keyframeWanted = false;
   const capture: CaptureDeps = {
     bindCapture: (next): void => {
       output = next;
@@ -340,7 +354,9 @@ async function joinParty(userId: string): Promise<Party_> {
     startCapture: async () => ({ source: null, video: false, audio: false }),
     configureVideo: (): void => undefined,
     configureAudio: (): void => undefined,
-    requestKeyframe: (): void => undefined,
+    requestKeyframe: (): void => {
+      keyframeWanted = true;
+    },
     setVideoEnabled: (): void => undefined,
     setAudioEnabled: (): void => undefined,
     encodeQueueSize: (): number => 0,
@@ -406,6 +422,13 @@ async function joinParty(userId: string): Promise<Party_> {
     videoAtMs,
     audioAtMs,
     participants: (): readonly string[] => joined.value.meeting.participants.map((entry) => entry.id),
+    takeKeyframeRequest: (): boolean => {
+      if (!keyframeWanted) {
+        return false;
+      }
+      keyframeWanted = false;
+      return true;
+    },
     close: (): void => joined.value.meeting.leave(),
   };
 }
@@ -520,13 +543,17 @@ test("実データが SDK 経由で 5 ノードを通り、1 バイトも変わ�
    * **暖機**。経路（送信ノード → 中継ノード）の確立は背後で進む（F-046）。整うまでの数枚は
    * 捨てられる（`NodeLink` は `nodeHelloAck` の前の媒体を捨てる。中継ノードが認証前の媒体を
    * 破棄するためである）。暖機の枚数は判定に含めない。**整った後の欠落は 1 枚も許さない。**
+   *
+   * **枚数で切らずに「復号できた」で切る。** 1 枚目のキーフレームが購読の登録より前に
+   * 送られて捨てられると、復号器はキーフレームを待ち続ける。復号側の要求
+   * （`takeKeyframeRequest`）に応じ、応じても届かない場合に備えて定期的にも key を送る。
    */
-  for (let index = 0; index < 30; index += 1) {
+  for (let index = 0; index < 90 && b.decoded.length === 0; index += 1) {
     output.onVideo({
       spatialId: 0,
       temporalId: 0,
       temporalLayers: 3,
-      isKey: index === 0,
+      isKey: index % 8 === 0 || a.takeKeyframeRequest(),
       captureTimestampUs: BigInt(Date.now()) * 1000n,
       payload: new Uint8Array([0xaa, 0xbb, 0xcc]),
     });
@@ -726,14 +753,17 @@ test("**A/V 同期が規範の許容に収まる**（判定 D-1 に実測を与�
   assert.ok(output !== null, "A の取得の出力が繋がっている");
 
   // 暖機。経路が整うまでの数枚は捨てられる（NodeLink が受理前の媒体を捨てる）。
-  for (let index = 0; index < 12; index += 1) {
+  // **復号できるまで送り続ける。** 枚数で切ると、1 枚目のキーフレームが購読の登録より
+  // 前に捨てられた場合に復号器がキーフレームを待ち続けて先へ進めない。
+  // 暖機の番号は 200 以上であり、判定からは除かれる。
+  for (let index = 0; index < 48 && b.decoded.length === 0; index += 1) {
     output.onVideo({
       spatialId: 0,
       temporalId: 0,
       temporalLayers: 3,
-      isKey: index === 0,
+      isKey: index % 8 === 0 || a.takeKeyframeRequest(),
       captureTimestampUs: BigInt(Date.now()) * 1000n,
-      payload: new Uint8Array([200 + index, 0xee]),
+      payload: new Uint8Array([200 + (index % 50), 0xee]),
     });
     await new Promise((resolve) => setTimeout(resolve, VIDEO_FRAME_INTERVAL_MS));
   }
@@ -794,6 +824,11 @@ test("**A/V 同期が規範の許容に収まる**（判定 D-1 に実測を与�
     `映像と音声が 20 組以上そろう`,
   );
 
+  // **経路に残っているものを数え切る。** 送り終えた直後に判定すると、まだ飛んでいる
+  // 音声が「再生されていない」と読まれる（実測: 公開 CI で frameIndex 22 の音声が
+  // 判定の後に届き、偽の違反になった）。増えなくなるまで待つ。
+  await settled(() => b.audioAtMs.length + b.videoAtMs.length);
+
   // 記録を判定関数の形へ直す。暖機（200 以上）は除く。
   const playedAudio = b.audioAtMs
     .filter((entry) => entry.frameIndex < PAIR_COUNT && entry.frameIndex >= 0)
@@ -812,8 +847,19 @@ test("**A/V 同期が規範の許容に収まる**（判定 D-1 に実測を与�
     (least, entry) => (entry.frameIndex < least ? entry.frameIndex : least),
     Number.MAX_SAFE_INTEGER,
   );
+  // **末尾も内容で切る。** 最後に再生された音声の番号より後の映像は、対応する音声が
+  // まだ経路にある。時刻で切ると門でずれた分を取り違えるため、番号で切る。
+  const lastAudioIndex = playedAudio.reduce(
+    (most, entry) => (entry.frameIndex > most ? entry.frameIndex : most),
+    -1,
+  );
   const presentedVideo = b.videoAtMs
-    .filter((entry) => entry.frameIndex < PAIR_COUNT && entry.frameIndex > firstAudioIndex)
+    .filter(
+      (entry) =>
+        entry.frameIndex < PAIR_COUNT &&
+        entry.frameIndex > firstAudioIndex &&
+        entry.frameIndex <= lastAudioIndex,
+    )
     .map((entry) => ({ frameIndex: entry.frameIndex, atMs: entry.atMs }));
 
   assert.ok(presentedVideo.length > 0, "映像の提示の記録がある");

@@ -463,6 +463,96 @@ test("参加は不正な URL とトークンで失敗を返す（例外を投げ
   assert.equal(badToken.ok, false);
 });
 
+test("**再接続の hello は取り直したトークンを載せる**（60 秒で期限が切れる）", async () => {
+  // 参加トークンの有効期間は 60 秒である（auth.md 3.3）。本文を 1 度だけ作って
+  // 使い回すと、1 分を超えた会議での再接続が `E_AUTH`（4020）で拒否され、
+  // 自動再接続の対象外であるためその部屋は二度と戻らない。
+  const helloTexts: string[] = [];
+  // 呼び戻しの中で代入すると型が never へ絞られるため入れ物に持つ。
+  const wires: { close: ((code: number) => void) | null; open: (() => void) | null } = {
+    close: null,
+    open: null,
+  };
+  let issued = 0;
+  // 再接続は待ち時間を置いてから行う（後退。`state-machines.md` 1 節）。
+  // 待ちを手で進められるようにして、再接続そのものを試験の中で起こす。
+  const pending: (() => void)[] = [];
+  const deps = {
+    openSocket: (_url: string, role: string): JoinSocket => ({
+      send: (text: string): void => {
+        if (role === "ctl" && text.includes('"t":"hello"')) {
+          helloTexts.push(text);
+        }
+      },
+      sendBinary: (): void => undefined,
+      close: (): void => undefined,
+      onText: (): void => undefined,
+      onBinary: (): void => undefined,
+      onOpen: (handler: () => void): void => {
+        if (role === "ctl") {
+          wires.open = handler;
+        }
+        handler();
+      },
+      onClose: (handler: (code: number) => void): void => {
+        if (role === "ctl") {
+          wires.close = handler;
+        }
+      },
+      bufferedBytes: (): number => 0,
+    }),
+    createSink: (): FrameSink => sink(),
+    bindOutput: (): void => undefined,
+    capability: { hardwareAv1For4K60: false, encodeAv1: true, mobile: false, charging: true },
+    source: { width: 1920, height: 1080, framerate: 30 },
+    now: (): number => T0,
+    scheduleAt: (_atMs: number, fire: () => void): (() => void) => {
+      pending.push(fire);
+      return (): void => undefined;
+    },
+    setPeriodic: (): (() => void) => (): void => undefined,
+    media: NO_MEDIA,
+    capture: NO_CAPTURE,
+  };
+
+  const first = fakeToken(MEETING_ID, USER_ID);
+  const joined = await joinWith(`https://example.test/j/${MEETING_ID}#${first}`, deps, {
+    // 応用が短命のトークンを供給し続ける形（sdk-api.md 2 節）。
+    // **有効なトークンでなければならない**（入口は主張を読む）。毎回違う本文にするため
+    // 署名の部分だけを変える（署名の検証はノードが行う）。
+    tokenProvider: (): string => {
+      issued += 1;
+      return `${first}${String(issued)}`;
+    },
+  });
+  assert.equal(joined.ok, true);
+  if (!joined.ok) {
+    return;
+  }
+  assert.equal(helloTexts.length, 1, "参加で 1 度 hello を送る");
+  assert.ok(helloTexts[0]?.includes(first), "供給されたトークンを使う");
+  const issuedForFirstHello = issued;
+  assert.ok(issuedForFirstHello >= 2, "**本文を作るときに取り直す**（参加時の 1 回だけではない）");
+
+  // 切れたことを伝え、後退の待ちを進める。**2 度目の hello は新しいトークンでなければ
+  // ならない。** 器は開いた瞬間に確立を伝えるため、開き直せば hello が出る。
+  const close = wires.close;
+  assert.ok(close !== null, "閉鎖の口が配線されている");
+  if (close === null) {
+    return;
+  }
+  close(1006);
+  // 待ちに入った再接続を進める（1 段で足りる）。
+  const queued = [...pending];
+  pending.length = 0;
+  for (const fire of queued) {
+    fire();
+  }
+  assert.equal(helloTexts.length, 2, "再接続で hello を送り直す");
+  assert.notEqual(helloTexts[0], helloTexts[1], "**同じ本文を送り回さない**（期限切れになる）");
+  assert.ok(issued > issuedForFirstHello, "再接続でもトークンを取り直す");
+});
+
 test("**接続を開けなくても参加は失敗しない。リンクが再接続を待つ**", () => {
   // 一時的に開けないことは頻繁に起きる（回線の瞬断、ノードの起動待ち）。
   // ここで参加そのものを失敗させると、利用者は入り直すことになる。
