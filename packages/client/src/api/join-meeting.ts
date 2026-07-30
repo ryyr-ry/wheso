@@ -26,12 +26,14 @@ import {
   handleReportTimer,
   noteDecodeError,
   noteFramerate,
+  noteTemporalLayers,
   noteRouteChange,
   qualitySnapshot,
   receivedSpatialId,
   releaseSenderState,
   type PipelineDeps,
 } from "./receive-pipeline.ts";
+import { noteGap } from "../media/decoder-pool.ts";
 import { readClaimsUnverified } from "@wheso/core/src/auth.ts";
 import {
   CHANNEL_AUDIO,
@@ -602,6 +604,31 @@ export async function joinWith(
         for (const clock of pipeline.playout.clocks) {
           pipeline = noteRouteChange(pipeline, clock.senderId);
         }
+        if (role !== "vr") {
+          return;
+        }
+        // **経路が変わった時点で参照連鎖は切れている。**
+        //
+        // 切り替えや張り直しの最中に経路にあったユニットは失われる。飛びを**見つけてから**
+        // 要求すると、次のユニットが届くまで何もできず、その間の差分を閉じた連鎖のまま
+        // 復号器へ渡してしまう（実測: 段 E で復号の失敗が 2 件、連鎖切れが 199 件）。
+        // 経路の変化は自分で分かるのだから、その場でキーフレームを待ち、要求も出す。
+        // 受入条件 E-1 は復旧時の要求を許している。
+        for (const entry of [...wanted.values()]) {
+          if (entry.channel !== CHANNEL_VIDEO && entry.channel !== CHANNEL_SCREEN_VIDEO) {
+            continue;
+          }
+          const gapResult = noteGap(pipeline.decoders, entry.senderId, entry.channel);
+          pipeline = { ...pipeline, decoders: gapResult.state };
+          sendVideoReceive(
+            JSON.stringify({
+              t: "keyframeRequest",
+              senderId: entry.senderId,
+              channel: entry.channel,
+              spatialId: entry.maxSpatialId,
+            }),
+          );
+        }
       },
       usesStandby: receiving,
     });
@@ -660,6 +687,9 @@ export async function joinWith(
         const top = entry.rungs[entry.rungs.length - 1];
         if (top !== undefined) {
           pipeline = noteFramerate(pipeline, entry.senderId, top.framerate);
+          // 破棄可否（`computeDiscardable`）に時間層の数が要る。申告が無いと、期限を
+          // 過ぎたユニットを捨てたときに参照連鎖が切れたか決められない。
+          pipeline = noteTemporalLayers(pipeline, entry.senderId, top.temporalLayers);
         }
       }
     },
@@ -851,6 +881,8 @@ export interface CatalogRungView {
   readonly width: number;
   readonly height: number;
   readonly framerate: number;
+  /** 時間層の数。申告が無ければ 0（破棄可否を決められないという意味である）。 */
+  readonly temporalLayers: number;
 }
 
 /** カタログの 1 件。 */
@@ -1028,7 +1060,15 @@ function parseCatalog(entries: readonly unknown[]): readonly CatalogEntryView[] 
       if (!isInteger(spatialId) || !isInteger(width) || !isInteger(height) || !isInteger(framerate)) {
         continue;
       }
-      parsed.push({ spatialId, width, height, framerate });
+      // 時間層の数は無い実装もあり得る。無ければ 0 とし、破棄可否は「不可」に倒す。
+      const layers = item["temporalLayers"];
+      parsed.push({
+        spatialId,
+        width,
+        height,
+        framerate,
+        temporalLayers: isInteger(layers) ? layers : 0,
+      });
     }
     if (parsed.length === 0) {
       continue;

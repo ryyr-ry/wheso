@@ -13,7 +13,7 @@
  * 型で守れない部分は実行時に検査する（型定義を信用しない。AGENTS 5.4 の 3）。
  */
 
-import { A_VOICE, OPUS_FRAME_MS } from "@wheso/core/src/generated/constants.ts";
+import { A_VOICE, AUDIO_JITTER_MAX_PACKETS, OPUS_FRAME_MS } from "@wheso/core/src/generated/constants.ts";
 import type { DecodeInput, PipelineDeps } from "../api/receive-pipeline.ts";
 import { createPresentGate } from "../sync/present-gate.ts";
 
@@ -316,12 +316,34 @@ function createAudioSink(): AudioSink {
     Reflect.set(target, name, value);
   }
 
+  /**
+   * 先へ予約してよい上限（秒）。音声のジッタバッファの深さと同じにする
+   * （`AUDIO_JITTER_MAX_PACKETS` × `OPUS_FRAME_MS`）。
+   */
+  const maxAheadSeconds = (AUDIO_JITTER_MAX_PACKETS * OPUS_FRAME_MS) / 1000;
+
   function scheduleAt(senderId: number): number {
     const now = readProperty(context, "currentTime");
     const current = typeof now === "number" ? now : 0;
     const planned = nextAt.get(senderId);
     if (planned === undefined || planned < current) {
       // 初回、または遅れた。**音声は待たせない。** 直ちに鳴らす位置へ置き直す。
+      return current;
+    }
+    if (planned - current > maxAheadSeconds) {
+      // **写像は作り直さない。** 作り直すと、以後の映像の予定が毎回無効になり、
+      // 「予定が遠すぎる」判断と噛み合って連鎖切れを量産する（実測: 段 E で連鎖切れが
+      // 18 件 → 87 件、提示が 2,084 枚 → 1,496 枚に悪化した）。捨てるのは高々
+      // ジッタバッファの深さ 1 個ぶんであり、写像の誤差はその範囲に収まる。
+      // **溜まった分を捨てて現在へ戻す**（ADR-0028 の再同期）。
+      //
+      // 束ねて届く音声を隙間なく後ろへ繋ぐだけだと、切断からの復旧などで一度に届いた
+      // ぶんが未来へ積み上がり、再生が**恒久的に**遅れる。実測（段 E）: 音声が映像より
+      // 4.6 秒遅れ、提示の門が「予定が遠すぎる」と判断して映像を先に出したため、
+      // 判定 D-1 が p99 4,655 ms で不合格になった。
+      //
+      // 積み上がった音声は再生期限を過ぎており、鳴らせば以後ずっと遅れる。捨てるのは
+      // 輻輳による破棄ではなく、ジッタバッファの深さを守るための追い付きである。
       return current;
     }
     return planned;

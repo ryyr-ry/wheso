@@ -21,6 +21,7 @@
 import { decodeMediaMessage, type Unit } from "@wheso/core/src/wire.ts";
 import { CHANNEL_AUDIO, CHANNEL_SCREEN_AUDIO, FLAG_KEY } from "@wheso/core/src/generated/wire-layout.ts";
 import {
+  AV_RESYNC_GAP_MS,
   DELAY_TREND_DEGRADE_DEN,
   DELAY_TREND_DEGRADE_NUM,
   OPUS_FRAME_MS,
@@ -111,6 +112,13 @@ interface SenderObservation {
   readonly lastAudioAtMs: number;
   /** その送信者の映像の fps の推定（申告が無い間は 0）。 */
   readonly framerate: number;
+  /**
+   * 申告された時間層の数（カタログから取り込む）。0 なら未申告。
+   *
+   * **破棄可否の判定に必要である**（`computeDiscardable`）。申告が無いと、期限を過ぎた
+   * ユニットを捨てたときに参照連鎖が切れたかどうかを決められない。
+   */
+  readonly temporalLayers: number;
   /**
    * 直近に受け取った音声の sequenceNumber。欠落の計数に使う。
    * 音声は破棄禁止であるため、欠落は経路の異常を意味する（congestion.md 5 節）。
@@ -224,6 +232,7 @@ function observationOf(state: PipelineState, senderId: number): SenderObservatio
     lastVideoAtMs: 0,
     lastAudioAtMs: 0,
     framerate: 0,
+    temporalLayers: 0,
     lastAudioSeq: 0,
     lastVideoSpatialId: -1,
     lastVideoSeq: [],
@@ -368,6 +377,12 @@ function handleVideoUnit(
   next = { ...next, skewSamplesMs: appendSample(next.skewSamplesMs, presentation.skewMs, true) };
   if (presentation.decision === "discard") {
     // **期限を過ぎた映像は捨てる。遅らせて出さない。** 結果は fps の低下である。
+    //
+    // ここで参照連鎖を切ってキーフレームを要求してはならない。規範の閾値
+    // （`AV_SKEW_AUDIO_LEAD_MAX_MS` = 22 ms）は狭く、揺れのある回線では破棄が頻繁に
+    // 起きる。要求を出すと「遅れて届いたキーフレームも捨てる」を繰り返して**生きた
+    // ままの停止**になる（実測: 段 E で連鎖切れ 513 件・要求 37 山・提示 71 枚）。
+    // 参照の欠けた差分は `noteGap`（連番の飛び）と復号の失敗の側で拾う。
     return {
       ...next,
       discardedVideo: next.discardedVideo + 1,
@@ -431,6 +446,33 @@ function handleVideoUnit(
     flags: unit.flags,
   });
   next = { ...next, decoders: pool.state };
+
+  // **予定が遠すぎるなら写像が古い。** 作り直して、この枠は捨てる。
+  //
+  // `skewMs` は音声の再生位置から作る（ADR-0028 の写像 M）。切り替えや復旧の直後には
+  // 音声の位置が飛ぶため、映像の予定が数秒先になることがある。以前は「待たずに直ちに
+  // 出す」ことで映像を止めない選択をしていたが、それは**音声より数秒早い映像を出す**
+  // ことであり、判定 D-1 に反する（実測: 段 E で 8.2 秒ずれた組が出た）。写像を作り直せば
+  // 次の音声（20 ms ごと）で正しい予定が作れるため、捨てるのは高々数枚である。
+  //
+  // 閾値は `AV_RESYNC_GAP_MS`（規範がクロックの不連続と見なす間隔）を使う。
+  // 予定は `now − skew` であるから、待ち時間は `−skew` である。
+  const plannedWaitMs = -presentation.skewMs;
+  if (plannedWaitMs > AV_RESYNC_GAP_MS) {
+    // 捨てるのだから**参照連鎖は切れる**。キーフレームを待ち、要求も出す（規範 1.4 と
+    // 同じ扱い）。待たせないと、次の差分を参照の無いまま復号器へ渡してしまう
+    // （実測: 判定 A-2 が「963 の参照先 962 が無い」で赤になった）。
+    const rebuilt = noteRouteChange(next, senderId);
+    const gapResult = noteGap(rebuilt.decoders, senderId, channel);
+    deps.sendReceiveControl(
+      JSON.stringify({ t: "keyframeRequest", senderId, channel, spatialId: unit.spatialId }),
+    );
+    return {
+      ...rebuilt,
+      decoders: gapResult.state,
+      reporter: recordVideoDrop(rebuilt.reporter),
+    };
+  }
 
   const input: DecodeInput = {
     senderId,
@@ -561,6 +603,21 @@ function appendSample(
 export function noteFramerate(state: PipelineState, senderId: number, framerate: number): PipelineState {
   const observation = observationOf(state, senderId);
   return replaceObservation(state, { ...observation, framerate });
+}
+
+/**
+ * 申告された時間層の数を控える（カタログから）。
+ *
+ * **破棄可否（`computeDiscardable`）に必要である。** 申告が無いと、期限を過ぎたユニットを
+ * 捨てたときに参照連鎖が切れたかどうかを決められず、参照の欠けた差分を復号器へ渡してしまう。
+ */
+export function noteTemporalLayers(
+  state: PipelineState,
+  senderId: number,
+  temporalLayers: number,
+): PipelineState {
+  const observation = observationOf(state, senderId);
+  return replaceObservation(state, { ...observation, temporalLayers });
 }
 
 /** 送信者の退出。復号器と再生クロックを解放する。 */

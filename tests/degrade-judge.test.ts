@@ -381,18 +381,34 @@ test("D-1: 記録が無ければ判定しない（**合格ではなく未判定�
   );
 });
 
-test("D-1: 単発の外れ値と定常のずれを区別して報告する", () => {
+test("**D-1 は p99 で判定する**（単発の外れ値では落ちない。受入条件 4.4）", () => {
+  // 許容の根拠は ITU-R BT.1359-0 の知覚の閾値であり（F-043）、規範は受入の判定を p99 と
+  // 定めている。1 度の予定の乱れで走行全体を不合格にすると、実装の欠陥と実行環境の揺れを
+  // 区別できない。**外れ値は最大値として報告に残す。**
   const record = syncedRecord(100, 0);
-  // 1 件だけ大きくずらす。最大値では落ちるが、p99 の報告は別に出る。
   const presented = [...(record.presentedVideo ?? [])];
   const first = presented[0];
   assert.ok(first !== undefined);
   presented[0] = { frameIndex: first.frameIndex, atMs: first.atMs + 500 };
-  const violations = judgeAvSkew({ ...record, presentedVideo: presented }, 22, 30);
-  assert.ok(violations.some((v) => v.detail.includes("音声が先行しすぎている")), "最大値で落ちる");
+  const single = judgeAvSkew({ ...record, presentedVideo: presented }, 22, 30);
+  assert.deepEqual(single, [], "100 組のうち 1 件の外れ値では落ちない");
+
+  // 2 % がずれていれば p99 が許容を超える（定常のずれである）。
+  const many = [...(record.presentedVideo ?? [])];
+  for (let index = 0; index < 3; index += 1) {
+    const entry = many[index];
+    if (entry !== undefined) {
+      many[index] = { frameIndex: entry.frameIndex, atMs: entry.atMs + 500 };
+    }
+  }
+  const violations = judgeAvSkew({ ...record, presentedVideo: many }, 22, 30);
   assert.ok(
-    !violations.some((v) => v.detail.includes("p99")),
-    "1 件の外れ値では p99 の違反は出さない",
+    violations.some((entry) => entry.detail.includes("音声が先行しすぎている")),
+    JSON.stringify(violations),
+  );
+  assert.ok(
+    violations.some((entry) => entry.detail.includes("p99") && entry.detail.includes("最大 500")),
+    "報告に p99 と最大値の両方を出す",
   );
 });
 

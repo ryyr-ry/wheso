@@ -310,21 +310,29 @@ export function buildLadderAnnounce(channel: number, rungs: readonly SendRung[])
  * 申告する fps。**送信側が実際に出せる値だけを申告する。**
  *
  * 送出は取得したフレームを間引いて作る。間引きは整数でしかできないため、実際に出る fps は
- * `源 ÷ k`（k は整数）である。代表点の fps をそのまま申告すると、源が代表点の整数倍でない
- * 装置では**間隔が不均等**になる（源 20 fps から 15 fps を作ると 50 / 50 / 100 ms の
- * 繰り返しになる）。中継ノードの送信窓は「申告 fps × `SEND_WINDOW_MS`」の枚数しか許さない
- * ため、2 枚が 100 ms に固まると窓が閉じ、破棄不可のユニットまで落ちる（実測: 劣化が無い
- * 40 秒で送信ノード 5 件・中継ノード 6 件。F-073）。
+ * `源 ÷ k`（k は 1 以上の整数）である。代表点の fps をそのまま申告すると、源が代表点の
+ * 整数倍でない装置では**間隔が不均等**になる（源 20 fps から 15 fps を作ると
+ * 50 / 50 / 100 ms の繰り返しになる。F-073）。
  *
- *   k        = ceil(源 ÷ 代表点)      間引きの間隔（1 以上の整数）
- *   実際     = 源 ÷ k                  均等に出せる fps（分数になり得る）
- *   申告     = ceil(実際)              **切り上げる**（窓を小さく見せない）
+ * ```
+ * k    = max(1, floor(源 ÷ 代表点))   間引きの間隔
+ * 申告 = floor(源 ÷ k)                実際に出せる fps（切り捨てる）
+ * ```
  *
- * 例: 源 30 → 代表点 15 なら k=2、実際 15、申告 15（変わらない）。
- *     源 20 → 代表点 15 なら k=2、実際 10、申告 10。
- *     源 25 → 代表点 15 なら k=2、実際 12.5、申告 13。
+ * 源 30・代表点 15 なら k=2 で申告 15。源 20・代表点 15 なら **k=1 で申告 20**
+ * （間引かない）。源 25・代表点 15 なら k=1 で申告 25。
  *
- * **整数演算のみで計算する**（ADR-0017）。分数は切り上げの形で扱う。
+ * **なぜ切り上げず切り捨てるか**（ADR-0052。ADR-0051 を置き換える）。切り上げると
+ * k が大きくなり、申告 fps が代表点より**下がる**（源 20 → 申告 10）。すると
+ * 中継ノードの送信窓（`SEND_WINDOW_MS` × 申告 fps）が 2 枚に縮む一方、ack の間隔は
+ * 媒体の間隔（100 ms）で決まるため、窓の更新が 2 回しか入らず 1 度の遅れで閉じる
+ * （規範 `congestion.md` 2 節は 4 回の更新を前提に 200 ms を定めている。F-078・F-079）。
+ * 切り捨てれば k=1 となり、間引きが無くなって間隔は完全に均等になり、窓は 4 枚、
+ * ack は 50 ms 間隔になる。**規範の前提が成り立つ。**
+ *
+ * ビットレートは段の `targetBitrate` のまま符号化器へ渡す。fps を上げても**ワイヤの
+ * ビットレートは申告どおりに保たれる**（F-077 で実測。誤差 ±10 %）。1 枚あたりの
+ * 情報量が減るだけである。
  */
 export function declaredFramerate(sourceFramerate: number, candidateFramerate: number): number {
   if (sourceFramerate <= 0 || candidateFramerate <= 0) {
@@ -334,8 +342,9 @@ export function declaredFramerate(sourceFramerate: number, candidateFramerate: n
     // 源が代表点以下なら間引かない。源をそのまま申告する（拡大しない。ADR-0026）。
     return sourceFramerate;
   }
-  // k = ceil(源 ÷ 代表点)
-  const k = Math.trunc((sourceFramerate + candidateFramerate - 1) / candidateFramerate);
-  // 申告 = ceil(源 ÷ k)
-  return Math.trunc((sourceFramerate + k - 1) / k);
+  // k = floor(源 ÷ 代表点)（1 以上）。**切り上げてはならない**（ADR-0052 の理由）。
+  const k = Math.trunc(sourceFramerate / candidateFramerate);
+  const step = k < 1 ? 1 : k;
+  // 申告 = floor(源 ÷ k)。切り捨てる（実際に出る値を上回って申告しない）。
+  return Math.trunc(sourceFramerate / step);
 }

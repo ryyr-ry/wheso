@@ -44,17 +44,24 @@ function source(width: number, height: number, framerate: number): SourceSpec {
   return { width, height, framerate };
 }
 
-test("**申告する fps は「源 ÷ 整数」に丸める**（間引きは整数でしかできない。ADR-0051）", () => {
+test("**申告する fps は「源 ÷ 整数」に丸め、間引きの間隔は切り捨てる**（ADR-0052）", () => {
   // 源が代表点の整数倍でないと、代表点の fps を申告しても均等に出せない。実測（F-073）:
   // 源 20 fps から 15 fps を作ると 50 / 50 / 100 ms の繰り返しになり、2 枚が 100 ms に
   // 固まって送信窓（申告 fps × SEND_WINDOW_MS ぶんの枚数）を閉じ、破棄不可まで落ちた。
+  //
+  // **間引きの間隔は切り捨てる**（ADR-0052 が ADR-0051 を置き換える）。切り上げると申告が
+  // 代表点より下がり（源 20 → 10）、窓が 2 枚に縮む一方で ack の間隔は媒体の間隔（100 ms）で
+  // 決まるため、規範が前提とする「窓あたり 4 回の ack」が 2 回になる（F-078・F-079）。
+  // 切り捨てれば間引きが無くなり（k=1）、間隔は完全に均等で、窓は 4 枚、ack は 50 ms になる。
   assert.equal(declaredFramerate(30, 15), 15, "整数倍ならそのまま（30 ÷ 2）");
   assert.equal(declaredFramerate(60, 15), 15, "60 ÷ 4");
   assert.equal(declaredFramerate(60, 30), 30, "60 ÷ 2");
   assert.equal(declaredFramerate(30, 30), 30, "間引かない");
-  assert.equal(declaredFramerate(20, 15), 10, "**20 ÷ 2 = 10**（15 は均等に作れない）");
-  assert.equal(declaredFramerate(25, 15), 13, "25 ÷ 2 = 12.5 → 切り上げる（窓を小さく見せない）");
-  assert.equal(declaredFramerate(24, 15), 12, "24 ÷ 2");
+  assert.equal(declaredFramerate(20, 15), 20, "**間引かない**（20 ÷ 1。代表点を上回って申告する）");
+  assert.equal(declaredFramerate(25, 15), 25, "25 ÷ 1");
+  assert.equal(declaredFramerate(24, 15), 24, "24 ÷ 1");
+  assert.equal(declaredFramerate(50, 15), 16, "50 ÷ 3 = 16.67 → 切り捨てる（出せる値を上回らない）");
+  assert.equal(declaredFramerate(45, 15), 15, "45 ÷ 3");
   // 源が代表点以下なら源をそのまま申告する（拡大しない。ADR-0026）。
   assert.equal(declaredFramerate(10, 15), 10);
   assert.equal(declaredFramerate(15, 15), 15);

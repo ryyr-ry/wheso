@@ -169,6 +169,43 @@ test("**連番の飛びを見たら復号へ渡さず、キーフレームを要
   assert.ok(state.decoders.entries.length > 0);
 });
 
+test("**予定が遠すぎるときは写像を作り直し、その枠は捨てる**（音声より早く出さない）", () => {
+  // `skewMs` は音声の再生位置から作る（ADR-0028 の写像 M）。映像が音声より大きく先を
+  // 走っていると、予定は数秒先になる。**直ちに出してはならない**: それは音声より数秒
+  // 早い映像を出すことであり、判定 D-1 に反する（実測: 段 E で 8.2 秒ずれた組が出た）。
+  const clock = { ms: 1000 };
+  const { deps, log } = recorder(clock);
+  let state = createPipeline(4, clock.ms);
+  // 音声で写像を作る（映像だけでは対応が作れない）。
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_AUDIO, seq: 1, captureUs: 0 }), deps);
+  clock.ms += 20;
+  state = handleMedia(state, mediaBytes({ key: true, seq: 1, captureUs: 0 }), deps);
+  const decodedBefore = log.decoded.length;
+  assert.ok(decodedBefore > 0, "対応が取れている枠は渡る");
+
+  // **映像だけが 10 秒先を走っている**（予定が 10 秒先になる）。
+  clock.ms += 20;
+  const controlBefore = log.control.length;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 2, captureUs: 10_000_000 }), deps);
+  assert.equal(log.decoded.length, decodedBefore, "**予定が遠すぎる枠は渡さない**");
+  assert.ok(
+    log.control.slice(controlBefore).some((text: string) => text.includes("keyframeRequest")),
+    "捨てたら連鎖が切れるためキーフレームを要求する",
+  );
+
+  // 差分は渡さない（キーフレーム待ち）。
+  clock.ms += 20;
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_AUDIO, seq: 2, captureUs: 20_000 }), deps);
+  clock.ms += 20;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 3, captureUs: 40_000 }), deps);
+  assert.equal(log.decoded.length, decodedBefore, "キーフレームまで渡さない");
+
+  // キーフレームで再開する。
+  clock.ms += 20;
+  state = handleMedia(state, mediaBytes({ key: true, seq: 4, captureUs: 60_000 }), deps);
+  assert.ok(log.decoded.length > decodedBefore, "キーフレームで再開する");
+});
+
 test("**遅れて届いた古いユニットを復号へ渡さない**（受入条件 A-3）", () => {
   // 予備の接続へ切り替えたときや張り直したときに、上流が自分の位置から送り直す。
   // 既に描いた番号より古いものを渡すと描画が巻き戻り、参照先も既に置き換わっている。

@@ -343,40 +343,37 @@ export function judgeAvSkew(
     return violations;
   }
 
-  // p99 を整数の順位で求める（浮動小数点を使わない）。
-  const sorted = [...skews].sort((a, b) => a - b);
-  const index = Math.trunc((99 * sorted.length + 99) / 100) - 1;
-  const bounded = index < 0 ? 0 : index >= sorted.length ? sorted.length - 1 : index;
-  const p99 = sorted[bounded] ?? 0;
+  // **判定は p99 で行う**（受入条件 4.4: 「差の p99 が許容以内」）。
+  //
+  // 最大値で判定してはならない。許容の根拠は ITU-R BT.1359-0 の**知覚**の閾値であり
+  // （F-043、ADR-0028）、規範は受入の判定を p99 と定めている。1 度の予定の乱れで走行全体を
+  // 不合格にすると、実装の欠陥と実行環境の揺れを区別できない（器の判定規則。F-075）。
+  // 許容は非対称であるため、上側（音声が先行）と下側（音声が遅れ）を別に見る。
+  const sorted = [...skews].sort((left, right) => left - right);
+  const rankOf = (percent: number): number => {
+    // 整数の順位で求める（浮動小数点を使わない。ADR-0017）。
+    const index = Math.trunc((percent * sorted.length + 99) / 100) - 1;
+    return index < 0 ? 0 : index >= sorted.length ? sorted.length - 1 : index;
+  };
+  const upper = sorted[rankOf(99)] ?? 0;
+  const lower = sorted[rankOf(1)] ?? 0;
+  const worst = sorted[sorted.length - 1] ?? 0;
+  const best = sorted[0] ?? 0;
 
-  let worstLead = 0;
-  let worstLag = 0;
-  for (const skew of skews) {
-    if (skew > worstLead) {
-      worstLead = skew;
-    }
-    if (-skew > worstLag) {
-      worstLag = -skew;
-    }
-  }
-
-  if (worstLead > audioLeadMaxMs) {
+  if (upper > audioLeadMaxMs) {
     violations.push({
       judgement: "D-1",
-      detail: `音声が先行しすぎている（最大 ${String(worstLead)} ms、許容 ${String(audioLeadMaxMs)} ms）`,
+      detail:
+        `音声が先行しすぎている（p99 ${String(upper)} ms、許容 ${String(audioLeadMaxMs)} ms、` +
+        `最大 ${String(worst)} ms、組 ${String(sorted.length)}）`,
     });
   }
-  if (worstLag > audioLagMaxMs) {
+  if (-lower > audioLagMaxMs) {
     violations.push({
       judgement: "D-1",
-      detail: `音声が遅れすぎている（最大 ${String(worstLag)} ms、許容 ${String(audioLagMaxMs)} ms）`,
-    });
-  }
-  // p99 も報告する。最大値だけでは、単発の外れ値と定常のずれを区別できない。
-  if (p99 > audioLeadMaxMs || -p99 > audioLagMaxMs) {
-    violations.push({
-      judgement: "D-1",
-      detail: `ずれの p99 が許容の外にある（${String(p99)} ms、許容 +${String(audioLeadMaxMs)} / -${String(audioLagMaxMs)} ms）`,
+      detail:
+        `音声が遅れすぎている（p99 ${String(-lower)} ms、許容 ${String(audioLagMaxMs)} ms、` +
+        `最大 ${String(-best)} ms、組 ${String(sorted.length)}）`,
     });
   }
   return violations;

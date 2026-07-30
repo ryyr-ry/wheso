@@ -44,8 +44,10 @@ import { DEV_NODE_KEY } from "../support/live-env.ts";
 import { judgeAll, judgeAvSkew } from "../support/degrade-judge.ts";
 import { IMPAIRMENT_MAX_GAP_WITH_OUTAGE_MS } from "../../packages/core/src/generated/impairment.ts";
 import {
+  AUDIO_JITTER_MAX_PACKETS,
   AV_SKEW_AUDIO_LAG_MAX_MS,
   AV_SKEW_AUDIO_LEAD_MAX_MS,
+  OPUS_FRAME_MS,
 } from "../../packages/core/src/generated/constants.ts";
 
 /** 利用者 ID は部屋名の文法に従う（16 進 32 文字。room-naming.md 1 節）。 */
@@ -443,7 +445,12 @@ test("**段 E: 再デプロイと切断を挟んでも送受信が続き、自�
   // 現れる**（実測: 再デプロイ直後の 1 組だけで D-1 が赤になった）。復旧に要した時間は
   // 切断について測っているため、再デプロイ側は同じ幅を使う（どちらも全ノードの作り直しで
   // ある）。3 秒はクロックの作り直しが落ち着くまでの余裕である（ADR-0028）。
-  const settleMs = recoveredAfterMs + 3000;
+  // 中断の窓は「中断が始まってから提示が戻るまで」である。**外側へ広げるのは対の距離の
+  // ぶんだけにする。** 復旧に要した時間を前後へ足すと、100 秒の走行のうち 70 秒が判定の
+  // 対象から外れ、D-1 が 18 組で決まってしまう（実測）。映像 1 枚に対応する音声は音声の
+  // ジッタバッファの深さ（`AUDIO_JITTER_MAX_PACKETS` × `OPUS_FRAME_MS`）より後に鳴ることはない。
+  const pairingPadMs = AUDIO_JITTER_MAX_PACKETS * OPUS_FRAME_MS;
+  const settleMs = recoveredAfterMs;
   const interruptions: readonly { readonly from: number; readonly to: number }[] = [
     { from: redeployAtMs, to: redeployDoneAtMs + settleMs },
     { from: dropDoneAtMs, to: dropDoneAtMs + settleMs },
@@ -453,14 +460,30 @@ test("**段 E: 再デプロイと切断を挟んでも送受信が続き、自�
   // 現れる**（実測: 中断の境目で frameIndex 321〜330 の 10 組が「音声が無い」と読まれた）。
   // 判定するのは映像の側だけを間引き、対応先の音声は全部残す。境目の組も外れるように、
   // 映像の窓は前後へ `settleMs` ぶん広げる。
+  // **対のどちらかが中断の中にあれば、その組は測らない。**
+  //
+  // 余白を足して逃げてはならない。切断の直前に描いた映像の音声は、経路に残っていた
+  // ぶんが復旧後に鳴ることがある（実測: 映像の 8.6 秒後に音声が鳴った 1 組で D-1 が
+  // 赤になった）。ずれの大きさは中断の長さそのものであり、同期の欠陥ではない。
+  // 対応は frameIndex で取れるのだから、**両側の時刻**を見て組ごとに外す。
+  const audioAtByFrame = new Map<number, number>();
+  for (const entry of built.record.playedAudio ?? []) {
+    const existing = audioAtByFrame.get(entry.frameIndex);
+    if (existing === undefined || entry.atMs < existing) {
+      audioAtByFrame.set(entry.frameIndex, entry.atMs);
+    }
+  }
+  const insideInterruption = (atMs: number): boolean =>
+    interruptions.some((window) => atMs >= window.from - pairingPadMs && atMs <= window.to + pairingPadMs);
   const syncRecord = {
     ...built.record,
-    presentedVideo: (built.record.presentedVideo ?? []).filter(
-      (entry) =>
-        !interruptions.some(
-          (window) => entry.atMs >= window.from - settleMs && entry.atMs <= window.to + settleMs,
-        ),
-    ),
+    presentedVideo: (built.record.presentedVideo ?? []).filter((entry) => {
+      if (insideInterruption(entry.atMs)) {
+        return false;
+      }
+      const audioAt = audioAtByFrame.get(entry.frameIndex);
+      return audioAt === undefined || !insideInterruption(audioAt);
+    }),
   };
   const skew = judgeAvSkew(syncRecord, AV_SKEW_AUDIO_LEAD_MAX_MS, AV_SKEW_AUDIO_LAG_MAX_MS);
   assert.deepEqual(
