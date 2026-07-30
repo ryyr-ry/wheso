@@ -40,6 +40,7 @@ import {
 } from "@wheso/core/src/playout.ts";
 import {
   decideDecode,
+  noteGap,
   initialDecoderPool,
   markDecodeFailure,
   releaseSender,
@@ -116,6 +117,14 @@ interface SenderObservation {
   readonly lastAudioSeq: number;
   /** 直近に復号へ渡した映像の段。`receivedProfile` の呼び名に使う。 */
   readonly lastVideoSpatialId: number;
+  /**
+   * 直近に受け取った映像の sequenceNumber（段ごと）。
+   *
+   * **連番の飛びは「上流が意図的に捨てた」ことを意味する。** TCP 上では経路で欠落しない
+   * （F-024）。飛びを見たら参照連鎖が切れているため、復号器へ渡さずキーフレームを待つ
+   * （ADR-0049）。段ごとに持つのは、段が変わると連番の空間も変わるためである。
+   */
+  readonly lastVideoSeq: readonly { readonly spatialId: number; readonly seq: number }[];
   /**
    * 片道遅延の基準（マイクロ秒）。チャネルごとに持つ。
    *
@@ -205,6 +214,7 @@ function observationOf(state: PipelineState, senderId: number): SenderObservatio
     framerate: 0,
     lastAudioSeq: 0,
     lastVideoSpatialId: -1,
+    lastVideoSeq: [],
     delayBaselineUs: [],
   };
 }
@@ -357,6 +367,32 @@ function handleVideoUnit(
     next = { ...next, heldVideo: next.heldVideo + 1 };
   }
 
+  // **連番の飛びを見たら参照連鎖が切れている**（ADR-0049）。
+  //
+  // TCP 上では経路で欠落しない（F-024）。したがって飛びは上流が意図的に捨てたことを意味し、
+  // その後の差分は参照が欠けている。渡すと `Decoding error` になり、WebCodecs では復号器が
+  // 閉じる（ADR-0047）。渡さずにキーフレームを待ち、要求する。
+  const seenSeq = observationOf(next, senderId).lastVideoSeq.find(
+    (entry) => entry.spatialId === unit.spatialId,
+  );
+  const missed = seenSeq !== undefined && unit.sequenceNumber > seenSeq.seq + 1;
+  next = replaceObservation(next, {
+    ...observationOf(next, senderId),
+    lastVideoSeq: rememberSeq(
+      observationOf(next, senderId).lastVideoSeq,
+      unit.spatialId,
+      unit.sequenceNumber,
+    ),
+  });
+  if (missed && (unit.flags & FLAG_KEY) === 0) {
+    const gapResult = noteGap(next.decoders, senderId, channel);
+    next = { ...next, decoders: gapResult.state, reporter: recordVideoDrop(next.reporter) };
+    deps.sendReceiveControl(
+      JSON.stringify({ t: "keyframeRequest", senderId, channel, spatialId: unit.spatialId }),
+    );
+    return next;
+  }
+
   // 復号の可否は decoder-pool の判断のみを使う（独自判断を書かない）。
   const pool = decideDecode(next.decoders, {
     senderId,
@@ -455,6 +491,21 @@ function normalizedDelay(
     ),
   });
   return { state: next, sampleUs: 0 };
+}
+
+/**
+ * 段ごとの連番の記録を更新する。段の昇順に保つ（反復順序が判断に影響しないようにする）。
+ * 後戻り（再送）では更新しない。上流は連番を単調増加で振る（wire-format.md 1.2）。
+ */
+function rememberSeq(
+  list: readonly { readonly spatialId: number; readonly seq: number }[],
+  spatialId: number,
+  seq: number,
+): readonly { readonly spatialId: number; readonly seq: number }[] {
+  const rest = list.filter((entry) => entry.spatialId !== spatialId);
+  const found = list.find((entry) => entry.spatialId === spatialId);
+  const kept = found !== undefined && found.seq > seq ? found.seq : seq;
+  return [...rest, { spatialId, seq: kept }].sort((a, b) => a.spatialId - b.spatialId);
 }
 
 function appendSample(

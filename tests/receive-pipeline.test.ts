@@ -134,6 +134,62 @@ test("段が変わると復号器を初期化してキーフレームを待つ",
   assert.equal(log.decoded.length, 1, "段の切替直後の差分は復号しない");
 });
 
+test("**連番の飛びを見たら復号へ渡さず、キーフレームを要求する**（ADR-0049）", () => {
+  // TCP 上では経路で欠落しない（F-024）。飛びは上流が意図的に捨てたことを意味し、
+  // その後の差分は参照が欠けている。渡すと復号器が閉じる（ADR-0047）。
+  const clock = { ms: 1000 };
+  const { deps, log } = recorder(clock);
+  let state = createPipeline(4, clock.ms);
+  state = handleMedia(state, mediaBytes({ key: true, seq: 1, captureUs: 0 }), deps);
+  assert.equal(log.decoded.length, 1, "キーフレームは復号される");
+
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 2, captureUs: 66_000 }), deps);
+  assert.equal(log.decoded.length, 2, "続きは復号される");
+
+  // 連番が 3 を飛ばして 4 になる（上流が 3 を捨てた）。
+  clock.ms += 66;
+  const before = log.control.length;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 4, captureUs: 132_000 }), deps);
+  assert.equal(log.decoded.length, 2, "**渡さない**");
+  assert.ok(
+    log.control.slice(before).some((text: string) => text.includes("keyframeRequest")),
+    "キーフレームを要求する",
+  );
+
+  // 以後の差分も渡さない（キーフレーム待ち）。
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 5, captureUs: 198_000 }), deps);
+  assert.equal(log.decoded.length, 2, "KEY まで渡さない");
+
+  // キーフレームが来たら再開する。
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: true, seq: 6, captureUs: 264_000 }), deps);
+  assert.equal(log.decoded.length, 3, "KEY で再開する");
+  assert.ok(state.decoders.entries.length > 0);
+});
+
+test("連番が飛んでいなければ何もしない（誤検知しない）", () => {
+  const clock = { ms: 1000 };
+  const { deps, log } = recorder(clock);
+  let state = createPipeline(4, clock.ms);
+  state = handleMedia(state, mediaBytes({ key: true, seq: 10, captureUs: 0 }), deps);
+  for (let index = 1; index <= 5; index += 1) {
+    clock.ms += 66;
+    state = handleMedia(
+      state,
+      mediaBytes({ key: false, seq: 10 + index, captureUs: index * 66_000 }),
+      deps,
+    );
+  }
+  assert.equal(log.decoded.length, 6, "連番が続く間は全部渡す");
+  assert.equal(
+    log.control.filter((text: string) => text.includes("keyframeRequest")).length,
+    0,
+    "要求は出さない",
+  );
+});
+
 test("**音声は決して捨てない**", () => {
   const clock = { ms: 1000 };
   const { deps, log } = recorder(clock);

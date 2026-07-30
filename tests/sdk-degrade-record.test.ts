@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { buildDegradeRecord, type ObservedRun } from "./support/sdk-degrade-record.ts";
+import { buildDegradeRecord, countRequestBursts, type ObservedRun } from "./support/sdk-degrade-record.ts";
 import { judgeAll, judgeAvSkew, judgeDrops } from "./support/degrade-judge.ts";
 
 const MS = 1000;
@@ -283,6 +283,19 @@ test("**整った後に音声が欠けたら違反として残る**（頭の切�
   const violations = judgeAvSkew(built.record, 22, 30);
   assert.equal(violations.length, 1, JSON.stringify(violations));
   assert.match(violations[0]?.detail ?? "", /対応する音声/);
+});
+
+test("**キーフレーム要求は山で数える**（待っている間の連投を 1 度と数える）", () => {
+  // 受信経路はキーフレーム待ちの間、届いたユニットごとに要求を作る（受信ノードが規範の
+  // 最小間隔で間引く）。通の数で数えると、1 度の連鎖切れで数十件の違反が出る。
+  const base = 100_000;
+  // 3 件の連投（66 ms 間隔）は 1 つの山である。
+  assert.equal(countRequestBursts([base, base + 66, base + 132]), 1);
+  // 最小間隔（500 ms）を超えて離れていれば別の山である。
+  assert.equal(countRequestBursts([base, base + 66, base + 900, base + 966]), 2);
+  assert.equal(countRequestBursts([]), 0);
+  // 並びが乱れていても時刻で数える。
+  assert.equal(countRequestBursts([base + 900, base, base + 66]), 2);
 });
 
 test("**戻れない閉鎖だけが失敗になる**（設計どおりの再接続を失敗と読まない）", () => {

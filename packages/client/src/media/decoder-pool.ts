@@ -148,8 +148,36 @@ export function decideDecode(state: DecoderPoolState, unit: DecodeUnit): Decoder
   return { state, actions: [{ kind: "decode", senderId: unit.senderId, channel: unit.channel }] };
 }
 
-/** 購読解除と退出。デコーダを破棄する（規則 1）。 */
-export function releaseSender(state: DecoderPoolState, senderId: number): DecoderPoolResult {
+/**
+ * 連番の飛びを知らせる（**参照連鎖が切れたことの検出**）。
+ *
+ * WebSocket は TCP 上にあり、経路で欠落は起きない（F-024）。したがって連番の飛びは
+ * **上流が意図的に捨てた**ことを意味する。規範 `wire-format.md` 1.4 は、順位 4・5 を捨てた
+ * 上流が次の KEY まで捨て続けキーフレームを要求することを求めるが、**要求が飛んでいる間に
+ * 届いた差分**は参照が欠けている。それを復号器へ渡すと `Decoding error` になり、
+ * WebCodecs では復号器が閉じる（ADR-0047）。
+ *
+ * したがって受け手も守る。飛びを見たらキーフレーム待ちに入れ、KEY まで渡さない。
+ * 実測（実環境・劣化なし・40 秒）: 復号の失敗が 2〜6 回起き、そのたびに復号器を作り直して
+ * キーフレームを待つため 1.4〜3 秒の停止が出た。渡さなければ停止は同じだが、復号器は
+ * 壊れない（作り直しの往復が消える）。
+ */
+export function noteGap(
+  state: DecoderPoolState,
+  senderId: number,
+  channel: number,
+): DecoderPoolResult {
+  const existing = find(state, senderId, channel);
+  if (existing === undefined || existing.awaitingKeyframe) {
+    return { state, actions: [] };
+  }
+  return {
+    state: replace(state, { ...existing, awaitingKeyframe: true }),
+    actions: [{ kind: "skip", reason: "awaitingKeyframe" }],
+  };
+}
+
+/** 購読解除と退出。デコーダを破棄する（規則 1）。 */export function releaseSender(state: DecoderPoolState, senderId: number): DecoderPoolResult {
   const removed = state.entries.filter((entry) => entry.senderId === senderId);
   if (removed.length === 0) {
     return { state, actions: [] };

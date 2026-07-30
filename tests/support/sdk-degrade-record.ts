@@ -23,6 +23,7 @@ import type {
   DegradeReceived,
 } from "./degrade-judge.ts";
 import { ERROR_DEFINITIONS } from "../../packages/core/src/generated/errors.ts";
+import { KEYFRAME_REQUEST_MIN_INTERVAL_MS } from "../../packages/core/src/generated/constants.ts";
 
 export interface ObservedSentVideo {
   readonly frameIndex: number;
@@ -184,6 +185,23 @@ export interface BuiltRecord {
   readonly chainBreaks: number;
   /** 戻れる閉鎖（設計どおりの再接続）。報告のみ。 */
   readonly transientClosures: readonly string[];
+}
+
+/**
+ * キーフレーム要求の山の数。規範の最小間隔（`KEYFRAME_REQUEST_MIN_INTERVAL_MS`）より
+ * 近い要求は 1 つと数える。受信ノードが間引く単位に合わせる。
+ */
+export function countRequestBursts(atMsList: readonly number[]): number {
+  const sorted = [...atMsList].sort((a, b) => a - b);
+  let bursts = 0;
+  let previous = -1;
+  for (const atMs of sorted) {
+    if (previous < 0 || atMs - previous >= KEYFRAME_REQUEST_MIN_INTERVAL_MS) {
+      bursts += 1;
+    }
+    previous = atMs;
+  }
+  return bursts;
 }
 
 /** 取得時刻の昇順で「そのとき購読者が受けていた段」を引ける表を作る。 */
@@ -405,7 +423,13 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
       playedAudio,
       presentedVideo,
       lastSentAtMs: run.lastSentAtMs,
-      keyframeRequests: run.keyframeRequestAtMs.length,
+      // **要求は「回」ではなく「山」で数える。**
+      //
+      // 受信経路はキーフレーム待ちの間、届いたユニットごとに要求を作る（受信ノードが
+      // `KEYFRAME_REQUEST_MIN_INTERVAL_MS` で間引く。`wire-format.md` 2.5）。したがって
+      // クライアントが出した通の数は「何度要求したか」ではない。規範の最小間隔より
+      // 近い要求は 1 つの山として数える。数えないと、1 度の連鎖切れで 47 件の違反が出る。
+      keyframeRequests: countRequestBursts(run.keyframeRequestAtMs),
       closures: fatal,
       arrived: arrivedIndexes,
     },
