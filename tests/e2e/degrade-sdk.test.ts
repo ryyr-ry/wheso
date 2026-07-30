@@ -207,6 +207,8 @@ interface ParticipantView {
   readonly encodedAudioCount: number;
   /** SDK 自身が観測した A/V のずれ（ミリ秒）。器の対応付けとの食い違いを見るため。 */
   readonly avSkewMs: number;
+  /** 音声の出入り（渡した数と鳴った数）。差は「落とした量」である（音声は破棄禁止）。 */
+  readonly audioIo: { readonly submitted: number; readonly played: number };
   /** 復号器の出入り。「届いたのに出ない」の原因を分けるために要る。 */
   readonly decoderIo: {
     readonly created: number;
@@ -282,6 +284,10 @@ function readParticipant(value: unknown): ParticipantView {
     encodedVideoCount: num(record["encodedVideoCount"]),
     encodedAudioCount: num(record["encodedAudioCount"]),
     avSkewMs: num(record["avSkewMs"]),
+    audioIo: {
+      submitted: num(asRecord(record["audioIo"])["submitted"]),
+      played: num(asRecord(record["audioIo"])["played"]),
+    },
     decoderIo: {
       created: num(asRecord(record["decoderIo"])["created"]),
       submitted: num(asRecord(record["decoderIo"])["submitted"]),
@@ -496,7 +502,8 @@ for (const profile of IMPAIRMENT_PROFILES) {
         ` / 提示 ${String(built.record.received.length)}` +
         ` / 音声（符号化 ${String(sender.encodedAudioCount)} / ワイヤ ${String(sender.run.sentAudio.length)}` +
         ` / 再生 ${String(receiver.run.playedAudio.length)}` +
-        ` / 隙間 送 ${String(audioSendGap)} ms・再生 ${String(audioPlayGap)} ms）` +
+        ` / 隙間 送 ${String(audioSendGap)} ms・再生 ${String(audioPlayGap)} ms` +
+        ` / 音声の復号 渡 ${String(receiver.audioIo.submitted)} 鳴 ${String(receiver.audioIo.played)}）` +
         ` / 対 ${String(built.record.playedAudio?.length ?? 0)}` +
         ` / 連鎖切れ ${String(built.chainBreaks)}` +
         ` / 段の切替 ${String(built.switches.length)}` +

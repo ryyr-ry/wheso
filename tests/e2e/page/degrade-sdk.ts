@@ -168,6 +168,8 @@ export interface SdkDegradeParticipant {
   /** 部屋の種別ごとの接続の開閉（`vr` / `ar` / `ctl` / `vs` / `as`）。 */
   readonly socketStats: readonly { readonly kind: string; readonly opened: number; readonly closed: number; readonly lastCode: number }[];
   /** 実際の復号器の出入り（生成・設定・投入・出力・失敗）。 */
+  /** 音声の出入り（渡した数と鳴った数）。 */
+  readonly audioIo: { readonly submitted: number; readonly played: number };
   readonly decoderIo: {
     readonly created: number;
     readonly configured: number;
@@ -398,6 +400,8 @@ interface Recorder {
   encodedVideoCount: number;
   encodedAudioCount: number;
   readonly decoderEvents: { configure: number; reset: number; close: number; error: number };
+  /** 音声の出入り。**渡した数と鳴った数の差が「落とした量」である**（音声は破棄禁止）。 */
+  readonly audioIo: { submitted: number; played: number };
   readonly sentAudio: SentAudio[];
   readonly received: ReceivedVideo[];
   readonly decoded: DecodedVideo[];
@@ -422,6 +426,7 @@ function newRecorder(label: string): Recorder {
     encodedVideoCount: 0,
     encodedAudioCount: 0,
     decoderEvents: { configure: 0, reset: 0, close: 0, error: 0 },
+    audioIo: { submitted: 0, played: 0 },
     sentAudio: [],
     received: [],
     decoded: [],
@@ -451,6 +456,7 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
         // （実測: 偽のずれ p99 1,976 ms。SDK 自身の観測は 129 ms であった）。
         onAudioScheduled: (senderId, captureUs, atMs): void => {
           void senderId;
+          recorder.audioIo.played += 1;
           recorder.playedAudio.push({ captureUs, atMs });
         },
         onFrame: (senderId, frame): void => {
@@ -525,8 +531,9 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
         base.media.decodeVideo(input);
       },
       enqueueAudio: (input: DecodeInput): void => {
-        // **ここでは記録しない。** 待ち行列へ入れた時刻でも予定時刻でもなく、
-        // `onAudioScheduled`（実際に鳴る時刻）で記録する。
+        // **時刻はここでは記録しない**（`onAudioScheduled` が実際に鳴る時刻を出す）。
+        // 数だけ数える。鳴った数との差が「音声を落とした量」である（音声は破棄禁止）。
+        recorder.audioIo.submitted += 1;
         base.media.enqueueAudio(input);
       },
     },
@@ -694,6 +701,7 @@ function snapshot(joined: Joined): SdkDegradeParticipant {
     encodedAudioCount: recorder.encodedAudioCount,
     decoderEvents: { ...recorder.decoderEvents },
     decoderIo: { ...decoderIo, messages: [...decoderMessages] },
+    audioIo: { ...joined.recorder.audioIo },
     socketStats: [...socketStats.entries()].map(([kind, value]) => ({ kind, ...value })),
     sentAudio: [...recorder.sentAudio],
     received: [...recorder.received],
@@ -721,6 +729,7 @@ const EMPTY: SdkDegradeParticipant = {
   encodedAudioCount: 0,
   decoderEvents: { configure: 0, reset: 0, close: 0, error: 0 },
   decoderIo: { created: 0, configured: 0, submitted: 0, output: 0, failed: 0, messages: [] },
+  audioIo: { submitted: 0, played: 0 },
   socketStats: [],
   sentAudio: [],
   received: [],

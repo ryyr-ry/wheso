@@ -405,8 +405,12 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
       droppedForNoAudio += 1;
       continue;
     }
-    if (entry.captureUs < firstPlayedCaptureUs) {
+    if (audioKey < firstPlayedCaptureUs || entry.captureUs < firstPlayedCaptureUs) {
       // **音声の経路が整う前の映像は D-1 の対象にしない。**
+      //
+      // 比べるのは**対になる音声の取得時刻**である。映像の取得時刻で比べると、対の音声が
+      // 確立前の区間にある組が残る（実測: 音声が確立するまでにワイヤへ出た 296 ユニットが
+      // 受信側へ届かず、その直後の frameIndex 142・143 が偽の違反になった）。
       //
       // 音声と映像は別の部屋（`ar` と `vr`）を通り、購読の確立も別である。映像が先に
       // 流れ始めた期間の映像に「対応する音声が無い」と言っても、それは同期の失敗では
