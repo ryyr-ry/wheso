@@ -11,10 +11,6 @@
 
 import {
   DELAY_TREND_WINDOW,
-  V_1080P30,
-  V_1080P60,
-  V_360P15,
-  V_4K60,
 } from "@wheso/core/src/generated/constants.ts";
 
 /** 能力探査の結果。ブラウザ API の呼び出し結果をそのまま入力にする。 */
@@ -32,83 +28,7 @@ export interface DeviceCapability {
 /** プロファイルの識別子。定数と対応する。 */
 export type ProfileId = "V_4K60" | "V_1080P60" | "V_1080P30" | "V_360P15" | "H264_1080P30" | "H264_360P15";
 
-/**
- * simulcast の構成を決める（sdk-api.md 2 節）。
- *
- *   1. ハードウェア AV1 で 4K60 が達成できる → { V_4K60, V_360P15 }
- *   2. AV1 が使える
- *        携帯かつ非充電 → { V_1080P30, V_360P15 }
- *        それ以外       → { V_1080P60, V_360P15 }
- *   3. AV1 が使えない  → { H.264 1080p30, H.264 360p15 }
- *
- * 実装はこの手順を変えてはならない。
- */
-export function selectProfiles(capability: DeviceCapability): readonly ProfileId[] {
-  if (capability.hardwareAv1For4K60) {
-    return ["V_4K60", "V_360P15"];
-  }
-  if (capability.encodeAv1) {
-    if (capability.mobile && !capability.charging) {
-      return ["V_1080P30", "V_360P15"];
-    }
-    return ["V_1080P60", "V_360P15"];
-  }
-  return ["H264_1080P30", "H264_360P15"];
-}
 
-/** プロファイル識別子から spatialId を引く。H.264 は単層であり 0 と 1 を割り当てる。 */
-export function spatialIdOf(profile: ProfileId): number {
-  switch (profile) {
-    case "V_4K60":
-      return V_4K60.spatialId;
-    case "V_1080P60":
-      return V_1080P60.spatialId;
-    case "V_1080P30":
-      return V_1080P30.spatialId;
-    case "V_360P15":
-      return V_360P15.spatialId;
-    case "H264_1080P30":
-      return V_1080P30.spatialId;
-    case "H264_360P15":
-      return V_360P15.spatialId;
-  }
-}
-
-/** プロファイル識別子から fps を引く。定数から取り、数値を書かない。 */
-export function framerateOf(profile: ProfileId): number {
-  switch (profile) {
-    case "V_4K60":
-      return V_4K60.framerate;
-    case "V_1080P60":
-      return V_1080P60.framerate;
-    case "V_1080P30":
-    case "H264_1080P30":
-      return V_1080P30.framerate;
-    case "V_360P15":
-    case "H264_360P15":
-      return V_360P15.framerate;
-  }
-}
-
-/**
- * プロファイル識別子から時間層数を引く。
- * H.264 は時間スケーラビリティを使えないため 1 層である（F-027）。
- */
-export function temporalLayersOf(profile: ProfileId): number {
-  switch (profile) {
-    case "V_4K60":
-      return V_4K60.temporalLayers;
-    case "V_1080P60":
-      return V_1080P60.temporalLayers;
-    case "V_1080P30":
-      return V_1080P30.temporalLayers;
-    case "V_360P15":
-      return V_360P15.temporalLayers;
-    case "H264_1080P30":
-    case "H264_360P15":
-      return 1;
-  }
-}
 
 /** 報告に載せる観測値。すべて整数である。 */export interface ReportInput {
   /** 下り帯域の推定（bits/sec）。 */
@@ -144,17 +64,4 @@ export function buildReport(input: ReportInput): string {
   });
 }
 
-/** streamAnnounce を作る（wire-format.md 2.3）。temporalLayers は DISCARDABLE の判定に必要である。 */
-export function buildStreamAnnounce(
-  streams: readonly { readonly channel: number; readonly profile: ProfileId; readonly framerate: number; readonly temporalLayers: number }[],
-): string {
-  return JSON.stringify({
-    t: "streamAnnounce",
-    streams: streams.map((stream) => ({
-      channel: stream.channel,
-      spatialId: spatialIdOf(stream.profile),
-      framerate: stream.framerate,
-      temporalLayers: stream.temporalLayers,
-    })),
-  });
-}
+

@@ -177,6 +177,13 @@
       "i18nKey": "error.room.full"
     },
     {
+      "name": "E_ACK_TIMEOUT",
+      "closeCode": 4034,
+      "recoverable": true,
+      "autoReconnect": true,
+      "i18nKey": "error.node.ackTimeout"
+    },
+    {
       "name": "E_EPOCH_STALE",
       "closeCode": 4040,
       "recoverable": true,

@@ -91,6 +91,8 @@ function generateWireTs(schema: Record<string, unknown>): string {
   const limits = readObject(schema, "limits");
   lines.push(`export const MAX_UNITS_PER_MESSAGE = ${readNumber(limits, "maxUnitsPerMessage")};`);
   lines.push(`export const MAX_MESSAGE_BYTES = ${readNumber(limits, "maxMessageBytes")};`);
+  lines.push(`export const MAX_SPATIAL_ID = ${readNumber(limits, "maxSpatialId")};`);
+  lines.push(`export const MAX_TEMPORAL_ID = ${readNumber(limits, "maxTemporalId")};`);
   lines.push(
     `export const DOCUMENTED_RECEIVE_LIMIT_BYTES = ${readNumber(limits, "documentedReceiveLimitBytes")};`,
   );
@@ -530,6 +532,8 @@ function generateWireRs(schema: Record<string, unknown>): string {
   lines.push(`pub const UNIT_HEADER_BYTES: usize = ${readNumber(unitHeader, "bytes")};`);
   lines.push(`pub const MAX_UNITS_PER_MESSAGE: u32 = ${readNumber(limits, "maxUnitsPerMessage")};`);
   lines.push(`pub const MAX_MESSAGE_BYTES: usize = ${readNumber(limits, "maxMessageBytes")};`);
+  lines.push(`pub const MAX_SPATIAL_ID: u8 = ${readNumber(limits, "maxSpatialId")};`);
+  lines.push(`pub const MAX_TEMPORAL_ID: u8 = ${readNumber(limits, "maxTemporalId")};`);
   lines.push("");
   for (const entries of Object.values(readObject(schema, "enums"))) {
     if (!Array.isArray(entries)) {
@@ -633,6 +637,8 @@ function generateWireHpp(schema: Record<string, unknown>): string {
   lines.push(`inline constexpr std::size_t UNIT_HEADER_BYTES = ${readNumber(unitHeader, "bytes")};`);
   lines.push(`inline constexpr std::size_t MAX_UNITS_PER_MESSAGE = ${readNumber(limits, "maxUnitsPerMessage")};`);
   lines.push(`inline constexpr std::size_t MAX_MESSAGE_BYTES = ${readNumber(limits, "maxMessageBytes")};`);
+  lines.push(`inline constexpr std::uint8_t MAX_SPATIAL_ID = ${readNumber(limits, "maxSpatialId")};`);
+  lines.push(`inline constexpr std::uint8_t MAX_TEMPORAL_ID = ${readNumber(limits, "maxTemporalId")};`);
   lines.push("");
   for (const entries of Object.values(readObject(schema, "enums"))) {
     if (!Array.isArray(entries)) {
@@ -749,6 +755,8 @@ function generateWireDart(schema: Record<string, unknown>): string {
   lines.push(`const int UNIT_HEADER_BYTES = ${readNumber(unitHeader, "bytes")};`);
   lines.push(`const int MAX_UNITS_PER_MESSAGE = ${readNumber(limits, "maxUnitsPerMessage")};`);
   lines.push(`const int MAX_MESSAGE_BYTES = ${readNumber(limits, "maxMessageBytes")};`);
+  lines.push(`const int MAX_SPATIAL_ID = ${readNumber(limits, "maxSpatialId")};`);
+  lines.push(`const int MAX_TEMPORAL_ID = ${readNumber(limits, "maxTemporalId")};`);
   lines.push("");
   for (const entries of Object.values(readObject(schema, "enums"))) {
     if (!Array.isArray(entries)) {
@@ -860,6 +868,8 @@ function generateWireKt(schema: Record<string, unknown>): string {
   lines.push(`public const val UNIT_HEADER_BYTES: Int = ${readNumber(unitHeader, "bytes")}`);
   lines.push(`public const val MAX_UNITS_PER_MESSAGE: Int = ${readNumber(limits, "maxUnitsPerMessage")}`);
   lines.push(`public const val MAX_MESSAGE_BYTES: Int = ${readNumber(limits, "maxMessageBytes")}`);
+  lines.push(`public const val MAX_SPATIAL_ID: Int = ${readNumber(limits, "maxSpatialId")}`);
+  lines.push(`public const val MAX_TEMPORAL_ID: Int = ${readNumber(limits, "maxTemporalId")}`);
   lines.push("");
   for (const entries of Object.values(readObject(schema, "enums"))) {
     if (!Array.isArray(entries)) {
@@ -971,6 +981,8 @@ function generateWireSwift(schema: Record<string, unknown>): string {
   lines.push(`    public static let UNIT_HEADER_BYTES: Int = ${readNumber(unitHeader, "bytes")}`);
   lines.push(`    public static let MAX_UNITS_PER_MESSAGE: Int = ${readNumber(limits, "maxUnitsPerMessage")}`);
   lines.push(`    public static let MAX_MESSAGE_BYTES: Int = ${readNumber(limits, "maxMessageBytes")}`);
+  lines.push(`    public static let MAX_SPATIAL_ID: Int = ${readNumber(limits, "maxSpatialId")}`);
+  lines.push(`    public static let MAX_TEMPORAL_ID: Int = ${readNumber(limits, "maxTemporalId")}`);
   lines.push("");
   for (const entries of Object.values(readObject(schema, "enums"))) {
     if (!Array.isArray(entries)) {

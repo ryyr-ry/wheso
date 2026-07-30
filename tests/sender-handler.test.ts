@@ -34,6 +34,7 @@ interface Log {
   readonly notified: string[];
   readonly scheduled: number[];
   readonly textToClient: string[];
+  readonly textToControl: string[];
 }
 
 function recorder(): { transport: SenderTransport; log: Log } {
@@ -46,8 +47,10 @@ function recorder(): { transport: SenderTransport; log: Log } {
     notified: [],
     scheduled: [],
     textToClient: [],
+    textToControl: [],
   };
   const transport: SenderTransport = {
+    noteDrop(): void {},
     sendToShard(peer, bytes) {
       log.toShard.push({ peer, length: bytes.length });
     },
@@ -65,6 +68,9 @@ function recorder(): { transport: SenderTransport; log: Log } {
     },
     closeClient(code) {
       log.closed.push(code);
+    },
+    sendTextToControl(text) {
+      log.textToControl.push(text);
     },
     notifyControl(code) {
       log.notified.push(code);
@@ -167,7 +173,11 @@ test("二重購読中は新旧の両方へ渡し、移行完了で旧を閉じ�
   assert.deepEqual(log.toShard.map((entry) => entry.peer), [1, 2], "新旧の両方へ渡す");
 
   state = handleNewEpochFrame(state, 120, transport);
-  assert.equal(log.textToShard.length, 1, "旧接続の購読を解除する");
+  // 件数ではなく内容で確かめる。件数はほかの中継（はしごの申告）でも増えるため、
+  // 件数で判定すると無関係な変更で壊れる。
+  const unsubscribes = log.textToShard.filter((entry) => entry.text.includes("\"subscribe\""));
+  assert.equal(unsubscribes.length, 1, "旧接続の購読を解除する");
+  assert.equal(unsubscribes[0]?.peer, 1, "解除の宛先は旧接続である");
   state = handleStaleBacklog(state, 0, 130, transport);
   assert.deepEqual(log.disconnected, [1], "旧接続を閉じる");
   assert.equal(state.core.phase, "STEADY");

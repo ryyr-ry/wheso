@@ -8,6 +8,7 @@
  */
 
 import {
+  MAX_UNEXPECTED_EVENTS,
   HEARTBEAT_TIMEOUT_MS,
   RECONNECT_BACKOFF_MS,
   STANDBY_SWAP_TIMEOUT_MS,
@@ -58,6 +59,13 @@ export type ConnectionCommand =
   | { readonly kind: "createSocket" }
   | { readonly kind: "sendHello" }
   | { readonly kind: "sendStreamAnnounce" }
+  /**
+   * 購読を送り直す。
+   *
+   * **購読は接続に紐づく。** 接続が切れると受信ノード側の購読が消えるため、再接続しても
+   * 映像が来ない（無音の黒画面）。`ACTIVE` へ入るすべての遷移で送り直す（ADR-0032）。
+   */
+  | { readonly kind: "sendSubscribe" }
   | { readonly kind: "sendReport" }
   | { readonly kind: "startStandby" }
   | { readonly kind: "swapToStandby" }
@@ -115,6 +123,7 @@ export function connectionStep(
       if (event.kind === "helloAck") {
         return moveTo({ ...state, attempts: 0 }, "ACTIVE", t, [
           { kind: "sendStreamAnnounce" },
+          { kind: "sendSubscribe" },
           { kind: "startStandby" },
         ]);
       }
@@ -187,6 +196,9 @@ export function connectionStep(
       if (event.kind === "standbyKeyframe") {
         return moveTo({ ...state, standbyReady: false }, "ACTIVE", t, [
           { kind: "closeSocket" },
+          // 予備接続には購読を送ってあるが、切替後に段が変わっている可能性がある。
+          // 送り直しは冪等であり、送らないと古い段のまま固定される。
+          { kind: "sendSubscribe" },
           { kind: "startStandby" },
           { kind: "warn", code: "W_STANDBY_SWAP" },
         ]);
@@ -267,7 +279,18 @@ function moveTo(
 /** 表に無いイベントは無視して記録する。 */
 function ignore(state: ConnectionState, event: ConnectionEvent): ConnectionStepResult {
   return {
-    state: { ...state, unexpectedEvents: [...state.unexpectedEvents, event.kind] },
+    state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, event.kind) },
     commands: [],
   };
+}
+
+/**
+ * 表に無いイベントの記録に 1 件加える。**上限を超えたら古い側を捨てる。**
+ * 上限が無いと記録が無制限に伸び、Durable Object の記憶（128 MB。F-006）を食う。
+ */
+function appendUnexpected(events: readonly string[], name: string): readonly string[] {
+  const appended = [...events, name];
+  return appended.length > MAX_UNEXPECTED_EVENTS
+    ? appended.slice(appended.length - MAX_UNEXPECTED_EVENTS)
+    : appended;
 }

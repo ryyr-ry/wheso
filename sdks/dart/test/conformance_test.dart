@@ -201,9 +201,9 @@ void main() {
     final flat = <int>[];
     final falling = <int>[];
     for (var index = 0; index < 20; index += 1) {
-      rising.add(10000 + index * 1000);
+      rising.add(10000 + index * 60000);
       flat.add(10000);
-      falling.add(30000 - index * 1000);
+      falling.add(1200000 - index * 60000);
     }
     expect(delaySlope(rising).numerator > 0, isTrue);
     expect(delaySlope(flat).numerator, equals(0));

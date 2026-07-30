@@ -24,15 +24,54 @@ import {
   type ReceiverTransport,
 } from "../packages/server/src/receiver-handler.ts";
 import { encodeMediaMessage } from "../packages/core/src/wire.ts";
-import { CHANNEL_VIDEO, FLAG_END_OF_FRAME, FLAG_KEY } from "../packages/core/src/generated/wire-layout.ts";
-import { V_4K60 } from "../packages/core/src/generated/constants.ts";
+import {
+  CHANNEL_VIDEO,
+  FLAG_END_OF_FRAME,
+  FLAG_KEY,
+  MAX_TEMPORAL_ID,
+} from "../packages/core/src/generated/wire-layout.ts";
+import { V_360P15, V_4K60 } from "../packages/core/src/generated/constants.ts";
 
 const BUDGET = Math.trunc((V_4K60.targetBitrate * 10) / (8 * 9)) + 1;
 
+/**
+ * はしごを与えて購読した状態を作る。
+ *
+ * **カタログが無いと段は 0 に留まる**（知らない相手へ高い段を要求しない。ADR-0027）。
+ * 段ごとの ack を検証するには、段が 2 個以上あるはしごが必要である。
+ */
 function subscribed(): ReceiverState {
-  return receiverStep(initialReceiverState(BUDGET), {
+  let state = stateWithBudget(BUDGET);
+  state = receiverStep(state, {
+    kind: "catalog",
+    entries: [
+      {
+        senderId: 7,
+        channel: CHANNEL_VIDEO,
+        rungs: [
+          {
+            sid: 0,
+            width: V_360P15.width,
+            height: V_360P15.height,
+            framerate: V_360P15.framerate,
+            temporalLayers: V_360P15.temporalLayers,
+            targetBitrate: V_360P15.targetBitrate,
+          },
+          {
+            sid: 1,
+            width: V_4K60.width,
+            height: V_4K60.height,
+            framerate: V_4K60.framerate,
+            temporalLayers: V_4K60.temporalLayers,
+            targetBitrate: V_4K60.targetBitrate,
+          },
+        ],
+      },
+    ],
+  }).state;
+  return receiverStep(state, {
     kind: "subscribe",
-    entries: [{ senderId: 7, channel: CHANNEL_VIDEO, maxSpatialId: V_4K60.spatialId, maxTemporalId: 7 }],
+    entries: [{ senderId: 7, channel: CHANNEL_VIDEO, maxSpatialId: 1, maxTemporalId: MAX_TEMPORAL_ID }],
   }).state;
 }
 
@@ -52,6 +91,16 @@ function receive(state: ReceiverState, seq: number, sid = 0): ReceiverState {
 
 /** 試験で使う論理時刻。伝送層は時刻を引数で受け取る（lint-policy.md 9 節）。 */
 const T0 = 1_000_000;
+
+/**
+ * 指定した下り帯域を持つ初期状態を作る。
+ *
+ * 初期状態は最低から始まる（参加直後に高い段を要求しないため）。試験で帯域を与えるには
+ * `budget` イベントを流す。これは goodput の観測に相当する（congestion.md 4.1）。
+ */
+function stateWithBudget(bytesPerSec: number): ReceiverState {
+  return receiverStep(initialReceiverState(), { kind: "budget", bytesPerSec }, 0).state;
+}
 
 test("受信した最大 sequenceNumber がタイマーで ack として出る", () => {
   let state = subscribed();
@@ -77,7 +126,7 @@ test("spatialId ごとに別の ack を返す（送信窓はストリーム単�
   let state = subscribed();
   state = receiverStep(state, { kind: "displaySize", senderId: 7, channel: CHANNEL_VIDEO, width: 3840 }).state;
   state = receive(state, 3, 0);
-  state = receive(state, 9, V_4K60.spatialId);
+  state = receive(state, 9, 1);
   const result = receiverStep(state, { kind: "timer" });
   const acks = result.commands.filter((command) => command.kind === "ack");
   assert.equal(acks.length, 2, "層ごとに返す");
@@ -115,7 +164,7 @@ test("伝送層は ack を上流へ制御メッセージとして送る", () => 
     },
   };
 
-  let state = createReceiverHandlerState(BUDGET, T0);
+  let state = createReceiverHandlerState(T0);
   state = handleClientText(
     state,
     JSON.stringify({

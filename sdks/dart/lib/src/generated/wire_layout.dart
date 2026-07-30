@@ -9,6 +9,8 @@ const int MESSAGE_HEADER_BYTES = 8;
 const int UNIT_HEADER_BYTES = 20;
 const int MAX_UNITS_PER_MESSAGE = 255;
 const int MAX_MESSAGE_BYTES = 16000000;
+const int MAX_SPATIAL_ID = 3;
+const int MAX_TEMPORAL_ID = 7;
 
 const int CHANNEL_VIDEO = 1;
 const int CHANNEL_AUDIO = 2;

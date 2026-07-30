@@ -343,14 +343,6 @@ export function computeDiscardable(
   return temporalId === temporalLayerCount - 1;
 }
 
-/** tier に対して転送すべきかを判定する。 */
-export function shouldForward(
-  unit: Pick<Unit, "spatialId" | "temporalId">,
-  maxSpatialId: number,
-  maxTemporalId: number,
-): boolean {
-  return unit.spatialId <= maxSpatialId && unit.temporalId <= maxTemporalId;
-}
 
 export function toHex(bytes: Uint8Array): string {
   let out = "";

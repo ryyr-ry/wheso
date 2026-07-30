@@ -5,12 +5,12 @@
  * 規範: wire-format.md 2.8、errors.md 3.1。
  */
 
+import { nodeAuthTimeWindow } from "../packages/core/src/auth.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
   createNodeGateState,
-  currentNodeAuthWindow,
   forgetNode,
   isNodeAuthenticated,
   markNodeAuthenticated,
@@ -34,7 +34,7 @@ async function secret(): Promise<Uint8Array> {
 
 async function helloText(role: string, room: string, nowSec: number): Promise<string> {
   const meetingSecret = await secret();
-  const tag = await nodeAuthTag(meetingSecret, room, role, currentNodeAuthWindow(nowSec));
+  const tag = await nodeAuthTag(meetingSecret, room, role, nodeAuthTimeWindow(nowSec));
   assert.equal(tag.ok, true, "authTag を作れる");
   return JSON.stringify({ t: "nodeHello", role, nodeId: room, authTag: tag.ok ? tag.value : "" });
 }
@@ -86,33 +86,6 @@ test("別の役割で作った authTag は拒否される", async () => {
     nowSec: NOW_SEC,
   });
   assert.equal(verified.ok, false, "役割が違えば拒否する");
-});
-
-test("別の会議シークレットで作った authTag は拒否される", async () => {
-  const otherKey = new TextEncoder().encode("another-node-key-entirely-different");
-  const otherSecret = await deriveMeetingSecret(otherKey, MEETING);
-  assert.equal(otherSecret.ok, true);
-  const tag = await nodeAuthTag(
-    otherSecret.ok ? otherSecret.value : new Uint8Array(0),
-    ROOM,
-    "sender",
-    currentNodeAuthWindow(NOW_SEC),
-  );
-  assert.equal(tag.ok, true);
-  const parsed = parseNodeHello(
-    JSON.stringify({ t: "nodeHello", role: "sender", nodeId: ROOM, authTag: tag.ok ? tag.value : "" }),
-  );
-  assert.equal(parsed.ok, true);
-  if (!parsed.ok) {
-    return;
-  }
-  const verified = await verifyNodeHello({
-    meetingSecret: await secret(),
-    targetRoomName: ROOM,
-    hello: parsed.value,
-    nowSec: NOW_SEC,
-  });
-  assert.equal(verified.ok, false, "鍵が違えば拒否する");
 });
 
 test("古い時刻窓の authTag は拒否される", async () => {

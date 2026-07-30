@@ -2,39 +2,58 @@
  * 受信ノード（receiver）の判断コア。
  *
  * sans-IO の純関数状態機械。時刻・乱数・浮動小数点・入出力・並行に触れない。
- * 規範: state-machines.md 2 節（購読と tier）、congestion.md 4.3（tier の選択）、
- * conformance.md 4 節（入力イベントと出力コマンド）。
+ * 規範: state-machines.md 2 節（購読と tier）、congestion.md 4.1・4.2・4.3、
+ *       conformance.md 4 節、ADR-0027（はしごの利用）、ADR-0029（狭帯域では音声を守る）。
  *
  * 画質の判断主体は受信側ユーザー部屋である。この責務を他へ移してはならない。
+ *
+ * 設計の要点は 4 つである。
+ *
+ * 1. **費用は送信者の申告ビットレートで見積もる。** 大域のプロファイル表を使ってはならない。
+ *    720p30 しか送れない端末を 25 Mbps で見積もると、予算の計算が実体と合わない（ADR-0027 の 2）。
+ * 2. **表示寸法が段の上限を決める。** 160 px のタイルが 4K を引いてはならない。
+ *    これが「サムネイルはサムネイルの費用で済む」を成立させる唯一の仕組みである。
+ * 3. **初期状態は常に最低である。** 参加直後に最上段を要求すると、細い回線では最初の
+ *    1 秒で詰まる。goodput が観測できてから AIMD で上げる（ADR-0028 の原則、congestion.md 6 節）。
+ * 4. **帯域が足りないときは映像を捨てて音声を守る。** 映像を維持すると破棄禁止の音声が
+ *    遅延し、会話が壊れる（ADR-0029）。
  */
 
 import {
+  MAX_UNEXPECTED_EVENTS,
+  AUDIO_ONLY_ENTER_BPS,
+  AUDIO_ONLY_EXIT_BPS,
+  MIN_VIABLE_BPS,
   RATE_HOLD_MS,
   RATE_PROBE_BPS,
   RATE_RECOVER_STREAK,
-  V_360P15,
-  V_4K60,
-  DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID,
   SHARD_TREND_ENTER_T2_DEN,
   SHARD_TREND_ENTER_T2_NUM,
   SHARD_TREND_EXIT_DEN,
   SHARD_TREND_EXIT_NUM,
 } from "./generated/constants.ts";
 import { WARNING_DEFINITIONS } from "./generated/errors.ts";
+import { CHANNEL_AUDIO, CHANNEL_SCREEN_AUDIO } from "./generated/wire-layout.ts";
+import { delaySlope, truncDiv, type Slope } from "./fixed.ts";
 
 /** 品質低下の警告。文言は利用側が国際化キーから作る（sdk-api.md 6 節）。 */
 const DEGRADED_WARNING: keyof typeof WARNING_DEFINITIONS = "W_DEGRADED";
-import { delaySlope, truncDiv, type Slope } from "./fixed.ts";
 
-/** (senderId, channel) ごとの購読状態（state-machines.md 2 節）。 */
-export type StreamPhase = "UNSUBSCRIBED" | "SUBSCRIBED" | "PAUSED";
+/**
+ * (senderId, channel) ごとの購読状態（state-machines.md 2 節）。
+ *
+ * `AUDIO_ONLY` は ADR-0029 で追加した。映像の購読を落として音声だけを維持する状態である。
+ * `PAUSED`（非表示）と区別する理由は、復帰の条件が違うことである。`PAUSED` は表示に戻れば
+ * 復帰し、`AUDIO_ONLY` は帯域が戻れば復帰する。
+ */
+export type StreamPhase = "UNSUBSCRIBED" | "SUBSCRIBED" | "PAUSED" | "AUDIO_ONLY";
 
 /** 1 本のストリームの状態。 */
 export interface StreamState {
   readonly senderId: number;
   readonly channel: number;
   readonly phase: StreamPhase;
-  /** 現在要求している最大 spatialId。 */
+  /** 現在要求している段番号（ADR-0026）。 */
   readonly spatialId: number;
   /** 現在要求している最大 temporalId。 */
   readonly temporalId: number;
@@ -42,12 +61,32 @@ export interface StreamState {
   readonly displayWidth: number;
 }
 
+/** カタログの 1 段。`streamCatalog` から取り込む（ADR-0027 の 1）。 */
+export interface CatalogRung {
+  readonly sid: number;
+  readonly width: number;
+  readonly height: number;
+  readonly framerate: number;
+  readonly temporalLayers: number;
+  readonly targetBitrate: number;
+}
+
+/** 送信者 1 人・1 チャネルのはしご。 */
+export interface CatalogLadder {
+  readonly senderId: number;
+  readonly channel: number;
+  /** sid の昇順で保持する。 */
+  readonly rungs: readonly CatalogRung[];
+}
+
 export interface ReceiverState {
   /** senderId, channel の昇順で保持する。反復順序が判断に影響するため決定的にする。 */
   readonly streams: readonly StreamState[];
+  /** 会議全体のはしご。senderId, channel の昇順で保持する。 */
+  readonly catalog: readonly CatalogLadder[];
   /** 受信者が表示中か。非表示なら購読を止める。 */
   readonly visible: boolean;
-  /** 下り帯域の目標値（bytes/sec）。budget イベントで更新する。 */
+  /** 下り帯域の目標値（bytes/sec）。report の goodput から更新する。 */
   readonly targetBytesPerSec: number;
   /** 発話中の送信者。最低保証の対象である。 */
   readonly activeSpeakerId: number | null;
@@ -55,6 +94,8 @@ export interface ReceiverState {
   readonly trend: Slope;
   /** 品質が最低保証を下回っているか。W_DEGRADED の通知に使う。 */
   readonly degraded: boolean;
+  /** 音声だけの状態か（ADR-0029）。 */
+  readonly audioOnly: boolean;
   /**
    * 次に減少の判定を行える時刻（AIMD。congestion.md 4.2）。
    * 劣化で減らした直後は RATE_HOLD_MS 待つ。待たないと 1 回の揺れで連続して落ちる。
@@ -66,8 +107,11 @@ export interface ReceiverState {
    */
   readonly recoverStreak: number;
   /**
-   * 目標ビットレートの上限（bytes/sec）。加算的増加はこれを超えない
-   * （規範: 現在のプロファイルの目標ビットレートを超えない）。
+   * 目標ビットレートの上限（bytes/sec）。
+   *
+   * **観測した goodput の最大値である。** 固定値にしてはならない。
+   * 参加直後は最低（MIN_VIABLE_BPS 相当）から始め、実際に届いた量に応じて上げる
+   * （congestion.md 4.1: goodput は下限としてのみ使う）。
    */
   readonly targetCeilingBytesPerSec: number;
   /** 表に無いイベントの記録。 */
@@ -75,7 +119,6 @@ export interface ReceiverState {
   /**
    * (senderId, channel, spatialId) ごとに受信した最大の sequenceNumber。
    * 送信側が送信窓を計算するために ack で返す（congestion.md 2 節）。
-   * senderId, channel, spatialId の昇順で保持する。
    */
   readonly received: readonly ReceivedMark[];
 }
@@ -100,9 +143,27 @@ export type ReceiverEvent =
   | { readonly kind: "leave"; readonly id: number }
   | { readonly kind: "visibility"; readonly visible: boolean }
   | { readonly kind: "budget"; readonly bytesPerSec: number }
+  | { readonly kind: "goodput"; readonly bytesPerSec: number }
   | { readonly kind: "activeSpeaker"; readonly id: number | null }
+  | { readonly kind: "catalog"; readonly entries: readonly CatalogLadder[] }
   | { readonly kind: "displaySize"; readonly senderId: number; readonly channel: number; readonly width: number }
   | { readonly kind: "report"; readonly delayUs: readonly number[] }
+  /**
+   * 購読者（クライアント）からのキーフレーム要求（ADR-0039）。
+   *
+   * 会議の途中で購読を張ると最初に届くのは差分フレームであり、復号器はキーフレームまで
+   * 何も出せない。以前はこの事象が無く、クライアントの要求は受信ノードで捨てられていた
+   * ため、**そのまま永久に何も表示されなかった**（F-053）。
+   *
+   * 間隔制限は出力コマンドの実行側が持つ（`rate-limit.ts`）。コアは要求をそのまま
+   * `keyframeRequest` コマンドに直す。
+   */
+  | {
+      readonly kind: "keyframeRequest";
+      readonly senderId: number;
+      readonly channel: number;
+      readonly spatialId: number;
+    }
   | {
       readonly kind: "media";
       readonly from: number;
@@ -118,7 +179,14 @@ export type ReceiverEvent =
   | { readonly kind: "timer" };
 
 export type ReceiverCommand =
-  | { readonly kind: "subscribeChange"; readonly to: number; readonly channel: number; readonly want: boolean; readonly maxSpatialId: number; readonly maxTemporalId: number }
+  | {
+      readonly kind: "subscribeChange";
+      readonly to: number;
+      readonly channel: number;
+      readonly want: boolean;
+      readonly maxSpatialId: number;
+      readonly maxTemporalId: number;
+    }
   | { readonly kind: "keyframeRequest"; readonly for: number; readonly channel: number; readonly spatialId: number }
   | { readonly kind: "setTier"; readonly for: number; readonly channel: number; readonly tier: number }
   | { readonly kind: "forward"; readonly to: readonly number[] }
@@ -140,24 +208,33 @@ export interface ReceiverStepResult {
 /** 受信者自身の識別子。転送先は常にこの 1 人である。 */
 export const RECEIVER_SELF_ID = 0;
 
-export function initialReceiverState(targetBytesPerSec: number): ReceiverState {
+/**
+ * 初期状態。
+ *
+ * **目標は最低から始める。** 引数を取らない理由は、初期値を呼び出し側に委ねると
+ * ノードの送出容量（280 MB/s）のような無関係な値を渡す誤りが起きることである
+ * （実際に起きた）。開始点は規範が定める最低の成立点である。
+ */
+export function initialReceiverState(): ReceiverState {
+  const floorBytes = truncDiv(MIN_VIABLE_BPS, 8);
+  const floor = floorBytes.ok ? floorBytes.value : 0;
   return {
     streams: [],
+    catalog: [],
     visible: true,
-    targetBytesPerSec,
+    targetBytesPerSec: floor,
     activeSpeakerId: null,
     trend: { numerator: 0, denominator: 1 },
     degraded: false,
+    audioOnly: false,
     rateHoldUntilMs: 0,
     recoverStreak: 0,
-    // 初めに与えられた値が上限である。回復してもこれを超えて要求しない。
-    targetCeilingBytesPerSec: targetBytesPerSec,
+    targetCeilingBytesPerSec: floor,
     unexpectedEvents: [],
     received: [],
   };
 }
 
-/** 純関数の状態遷移。 */
 /**
  * 純関数の状態遷移。
  *
@@ -173,13 +250,30 @@ export function receiverStep(state: ReceiverState, event: ReceiverEvent, t = 0):
     case "visibility":
       return handleVisibility(state, event.visible);
     case "budget":
-      return reallocate({ ...state, targetBytesPerSec: event.bytesPerSec });
+      return handleBudget(state, event.bytesPerSec);
+    case "goodput":
+      return handleGoodput(state, event.bytesPerSec);
     case "activeSpeaker":
       return reallocate({ ...state, activeSpeakerId: event.id });
+    case "catalog":
+      return handleCatalog(state, event.entries);
     case "displaySize":
       return handleDisplaySize(state, event.senderId, event.channel, event.width);
     case "report":
       return handleReport(state, event.delayUs, t);
+    case "keyframeRequest":
+      // 判断は無い。要求をコマンドへ直すだけである（間隔制限は実行側）。
+      return {
+        state,
+        commands: [
+          {
+            kind: "keyframeRequest",
+            for: event.senderId,
+            channel: event.channel,
+            spatialId: event.spatialId,
+          },
+        ],
+      };
     case "media":
       return handleMedia(state, event);
     case "timer":
@@ -198,34 +292,186 @@ export function receiverStep(state: ReceiverState, event: ReceiverEvent, t = 0):
   }
 }
 
+/* ------------------------------------------------------------------------- */
+/* 帯域とカタログ                                                            */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * 下り帯域の観測（goodput 由来。congestion.md 4.1）。
+ *
+ * goodput は**上限の推定には使わない**。送信側が帯域を使い切っていない場合、goodput は
+ * 利用可能帯域より小さくなる。上限として使うと品質が下がったまま戻らない。
+ * したがって観測値は「これまでに見た最大」として天井を押し上げるだけに使う。
+ */
+function handleBudget(state: ReceiverState, bytesPerSec: number): ReceiverStepResult {
+  const ceiling =
+    bytesPerSec > state.targetCeilingBytesPerSec ? bytesPerSec : state.targetCeilingBytesPerSec;
+  return reallocate({ ...state, targetBytesPerSec: bytesPerSec, targetCeilingBytesPerSec: ceiling });
+}
+
+/**
+ * 観測した goodput（congestion.md 4.1）。
+ *
+ * **これは目標の指定ではない。** goodput は「少なくともこれだけは通った」ことしか語らない。
+ * 送信側が帯域を使い切っていない間、goodput は利用可能帯域より小さい。目標へ代入すると、
+ * 映像が一瞬止まっただけで目標が 0 に近づき、`AUDIO_ONLY` へ落ちて**二度と映像に戻らない**
+ * （実測: 目標が 5 バイト/秒まで潰れ、映像の購読が解除された）。
+ *
+ * したがって goodput は**天井を押し上げ、目標を上げる方向にだけ**使う。下げるのは輻輳の
+ * 信号（遅延勾配）に対する AIMD だけである。
+ */
+function handleGoodput(state: ReceiverState, bytesPerSec: number): ReceiverStepResult {
+  if (bytesPerSec <= 0) {
+    return { state, commands: [] };
+  }
+  const ceiling =
+    bytesPerSec > state.targetCeilingBytesPerSec ? bytesPerSec : state.targetCeilingBytesPerSec;
+  const raised = bytesPerSec > state.targetBytesPerSec ? bytesPerSec : state.targetBytesPerSec;
+  const target = raised > ceiling ? ceiling : raised;
+  if (target === state.targetBytesPerSec && ceiling === state.targetCeilingBytesPerSec) {
+    return { state, commands: [] };
+  }
+  return reallocate({ ...state, targetBytesPerSec: target, targetCeilingBytesPerSec: ceiling });
+}
+
+function handleCatalog(state: ReceiverState, entries: readonly CatalogLadder[]): ReceiverStepResult {
+  const normalized = entries
+    .map((entry) => ({
+      senderId: entry.senderId,
+      channel: entry.channel,
+      rungs: [...entry.rungs].sort((a, b) => a.sid - b.sid),
+    }))
+    .sort((a, b) => (a.senderId !== b.senderId ? a.senderId - b.senderId : a.channel - b.channel));
+  // はしごが変わると段の上限と費用が変わるため、配分を作り直す。
+  return reallocate({ ...state, catalog: normalized });
+}
+
+function ladderOf(state: ReceiverState, senderId: number, channel: number): readonly CatalogRung[] {
+  const entry = state.catalog.find((item) => item.senderId === senderId && item.channel === channel);
+  return entry === undefined ? [] : entry.rungs;
+}
+
+/**
+ * 表示寸法から要求すべき段の上限を返す。
+ *
+ * 規則: **表示幅以上の幅を持つ最小の段**。無ければ最上段。未申告（0 以下）は最下段。
+ * カタログが無い相手は最下段に留める。知らない相手へ高い段を要求してはならない。
+ */
+function rungCapFor(state: ReceiverState, stream: StreamState): number {
+  const rungs = ladderOf(state, stream.senderId, stream.channel);
+  if (rungs.length === 0) {
+    return 0;
+  }
+  let lowest = rungs[0];
+  let top = rungs[0];
+  for (const rung of rungs) {
+    if (lowest === undefined || rung.sid < lowest.sid) {
+      lowest = rung;
+    }
+    if (top === undefined || rung.sid > top.sid) {
+      top = rung;
+    }
+  }
+  if (lowest === undefined || top === undefined) {
+    return 0;
+  }
+  if (stream.displayWidth <= 0) {
+    return lowest.sid;
+  }
+  let best: CatalogRung | undefined;
+  for (const rung of rungs) {
+    if (rung.width < stream.displayWidth) {
+      continue;
+    }
+    if (best === undefined || rung.width < best.width) {
+      best = rung;
+    }
+  }
+  return best === undefined ? top.sid : best.sid;
+}
+
+/** 段の費用（bits/sec）。申告が無ければ 0（費用不明なら予算を減らさない）。 */
+function costOf(state: ReceiverState, stream: StreamState, sid: number): number {
+  for (const rung of ladderOf(state, stream.senderId, stream.channel)) {
+    if (rung.sid === sid) {
+      return rung.targetBitrate;
+    }
+  }
+  return 0;
+}
+
+/** はしごの最下段。カタログが無ければ 0。 */
+function lowestRung(state: ReceiverState, stream: StreamState): number {
+  const rungs = ladderOf(state, stream.senderId, stream.channel);
+  let lowest = -1;
+  for (const rung of rungs) {
+    if (lowest < 0 || rung.sid < lowest) {
+      lowest = rung.sid;
+    }
+  }
+  return lowest < 0 ? 0 : lowest;
+}
+
+/** はしごの最上段。カタログが無ければ 0。 */
+function highestRung(state: ReceiverState, stream: StreamState): number {
+  const rungs = ladderOf(state, stream.senderId, stream.channel);
+  let top = -1;
+  for (const rung of rungs) {
+    if (rung.sid > top) {
+      top = rung.sid;
+    }
+  }
+  return top < 0 ? 0 : top;
+}
+
+function isAudio(channel: number): boolean {
+  return channel === CHANNEL_AUDIO || channel === CHANNEL_SCREEN_AUDIO;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 購読                                                                      */
+/* ------------------------------------------------------------------------- */
+
 /** 購読一覧の適用。表 1 行目と 2 行目に対応する。 */
 function handleSubscribe(state: ReceiverState, entries: readonly SubscribeEntry[]): ReceiverStepResult {
   const commands: ReceiverCommand[] = [];
   const kept: StreamState[] = [];
 
-  // 一覧に含まれるものを SUBSCRIBED にする。新規は購読要求とキーフレーム要求を出す。
   for (const entry of [...entries].sort(entryOrder)) {
     const existing = findStream(state, entry.senderId, entry.channel);
     if (existing === undefined || existing.phase === "UNSUBSCRIBED") {
+      // **最下段から始める。** 参加直後に要求の上限（`maxSpatialId`）を要求すると、
+      // 細い回線では最初の 1 秒で詰まる。段は goodput と表示寸法に応じて `reallocate` が
+      // 上げる（congestion.md 6 節、ADR-0028 の原則）。
+      const start = isAudio(entry.channel)
+        ? 0
+        : lowestRung(state, {
+            senderId: entry.senderId,
+            channel: entry.channel,
+            phase: "SUBSCRIBED",
+            spatialId: 0,
+            temporalId: 0,
+            displayWidth: 0,
+          });
       commands.push({
         kind: "subscribeChange",
         to: entry.senderId,
         channel: entry.channel,
         want: true,
-        maxSpatialId: entry.maxSpatialId,
+        maxSpatialId: start,
         maxTemporalId: entry.maxTemporalId,
       });
       commands.push({
         kind: "keyframeRequest",
         for: entry.senderId,
         channel: entry.channel,
-        spatialId: entry.maxSpatialId,
+        spatialId: start,
       });
       kept.push({
         senderId: entry.senderId,
         channel: entry.channel,
         phase: "SUBSCRIBED",
-        spatialId: entry.maxSpatialId,
+        spatialId: start,
         temporalId: entry.maxTemporalId,
         displayWidth: existing?.displayWidth ?? 0,
       });
@@ -261,9 +507,10 @@ function handleLeave(state: ReceiverState, id: number): ReceiverStepResult {
   if (streams.length === state.streams.length) {
     return { state, commands: [] };
   }
-  // 退出者の受信位置も除去する。残すと居ない相手へ ack を返し続ける。
+  // 退出者の受信位置とはしごも除去する。残すと居ない相手へ ack を返し続ける。
   const received = state.received.filter((mark) => mark.senderId !== id);
-  return reallocate({ ...state, streams, received });
+  const catalog = state.catalog.filter((entry) => entry.senderId !== id);
+  return reallocate({ ...state, streams, received, catalog });
 }
 
 /** 表示・非表示。表 7 行目と 8 行目に対応する。 */
@@ -320,7 +567,7 @@ function handleDisplaySize(
   const existing = findStream(state, senderId, channel);
   if (existing === undefined) {
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "displaySize"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "displaySize") },
       commands: [],
     };
   }
@@ -330,12 +577,12 @@ function handleDisplaySize(
   return reallocate({ ...state, streams });
 }
 
+/* ------------------------------------------------------------------------- */
+/* 報告と AIMD                                                               */
+/* ------------------------------------------------------------------------- */
+
 /**
- * 測定報告。勾配が劣化閾値を超えたら tier を 1 段下げ、回復閾値を下回ったら 1 段上げる
- * （constants.md 6 節）。比較は整数の交差乗算で行う。
- */
-/**
- * 遅延の報告に対する応答。**規範は 2 つの層を定めている。**
+ * 遅延の報告に対する応答。**規範は 2 つの層を定めている**（X-037）。
  *
  * 1. 状態機械（state-machines.md 3 節）: 遅延勾配が閾値を超えたら **tier を 1 段下げる**。
  *    回復したら 1 段上げる。これは即応の制御である。
@@ -343,8 +590,6 @@ function handleDisplaySize(
  *    回復が 3 回連続したら RATE_PROBE_BPS を加える。これは目標値の収束である。
  *
  * 両方を行う。tier は即応、target は収束であり、役割が違う。
- * target から tier を配分し直すのは budget イベント（外から目標が与えられたとき）に限る。
- * report で両方が tier を動かすと、どちらが効いたのか説明できなくなる。
  *
  * 0.85 は浮動小数点で計算しない。`target × 17 / 20` の整数演算とし、除算は切り捨てる
  * （congestion.md 4.1.1、ADR-0017）。9 言語で同じ値を出す必要がある。
@@ -354,11 +599,16 @@ function handleReport(
   delayUs: readonly number[],
   t: number,
 ): ReceiverStepResult {
+  // **標本が 2 個未満では勾配が定まらない。** 定まらない値で AIMD を動かすと、
+  // 媒体が止まっている間も「劣化している」と読み続けて目標が潰れる（実測）。
+  // 観測が無いことは輻輳の信号ではない。
+  if (delayUs.length < 2) {
+    return { state, commands: [] };
+  }
   const trend = delaySlope(delayUs);
   const degrading = trend.numerator * SHARD_TREND_ENTER_T2_DEN > SHARD_TREND_ENTER_T2_NUM * trend.denominator;
   const recovering = trend.numerator * SHARD_TREND_EXIT_DEN < SHARD_TREND_EXIT_NUM * trend.denominator;
 
-  // --- AIMD（congestion.md 4.2）。target を更新する ---
   let target = state.targetBytesPerSec;
   let holdUntil = state.rateHoldUntilMs;
   let streak = state.recoverStreak;
@@ -367,7 +617,17 @@ function handleReport(
     // 待ちの間は減らさない。1 回の揺れで連続して落とさないためである。
     if (t >= state.rateHoldUntilMs) {
       const reduced = truncDiv(target * 17, 20);
-      target = reduced.ok ? reduced.value : target;
+      const lowered = reduced.ok ? reduced.value : target;
+      // **予兆で最低成立点を割らない**（ADR-0040）。
+      //
+      // 遅延の勾配は「待ち行列が育っている」という**予兆**であり、実測した通過量では
+      // ない。予兆で `MIN_VIABLE_BPS` を割ると、初期状態がちょうどこの点にあるため
+      // 1 度の減少で `AUDIO_ONLY`（ADR-0029）へ落ち、映像が全部止まる。実測では
+      // 3 回に 1 回この経路に入った（F-054）。音声だけにするのは、**実測した予算**
+      // （`budget` 事象）が最低を下回ったときに限る。
+      const floorResult = truncDiv(MIN_VIABLE_BPS, 8);
+      const floor = floorResult.ok ? floorResult.value : 0;
+      target = lowered < floor ? floor : lowered;
       holdUntil = t + RATE_HOLD_MS;
     }
   } else if (recovering) {
@@ -375,7 +635,7 @@ function handleReport(
     if (streak >= RATE_RECOVER_STREAK) {
       const probeBytes = truncDiv(RATE_PROBE_BPS, 8);
       const raised = target + (probeBytes.ok ? probeBytes.value : 0);
-      // 上限（初めに与えられた目標）を超えない。
+      // 観測した goodput の最大を超えて要求しない（congestion.md 4.1）。
       target = raised > state.targetCeilingBytesPerSec ? state.targetCeilingBytesPerSec : raised;
       streak = 0;
     }
@@ -401,27 +661,31 @@ function handleReport(
   const commands: ReceiverCommand[] = [];
   const streams: StreamState[] = [];
   for (const stream of afterRate.streams) {
-    if (stream.phase !== "SUBSCRIBED") {
+    if (stream.phase !== "SUBSCRIBED" || isAudio(stream.channel)) {
+      // 音声には段が無い。輻輳でも音声の段を動かしてはならない。
       streams.push(stream);
       continue;
     }
+    const floor = lowestRung(afterRate, stream);
+    // 上限は「表示寸法から決まる段」と「はしごの最上段」の小さい方である。
+    // 勾配が回復しても、表示が小さいままなら上げてはならない。
+    const cap = rungCapFor(afterRate, stream);
     const raw = stream.spatialId + delta;
-    const nextSpatial = raw < 0 ? 0 : raw > V_4K60.spatialId ? V_4K60.spatialId : raw;
+    const nextSpatial = raw < floor ? floor : raw > cap ? cap : raw;
     if (nextSpatial === stream.spatialId) {
       streams.push(stream);
       continue;
     }
     streams.push({ ...stream, spatialId: nextSpatial });
     commands.push({ kind: "setTier", for: stream.senderId, channel: stream.channel, tier: nextSpatial });
-    // spatialId が変わる場合のみキーフレームを要求する（表 4 行目と 3 行目の違い）。
-    if (nextSpatial > stream.spatialId) {
-      commands.push({
-        kind: "keyframeRequest",
-        for: stream.senderId,
-        channel: stream.channel,
-        spatialId: nextSpatial,
-      });
-    }
+    // 段が変わるとエンコーダの別ストリームへ切り替わるためキーフレームが必要である。
+    // simulcast では下げる向きでも必要である（ADR-0027 の 4）。
+    commands.push({
+      kind: "keyframeRequest",
+      for: stream.senderId,
+      channel: stream.channel,
+      spatialId: nextSpatial,
+    });
   }
   return { state: { ...afterRate, streams }, commands };
 }
@@ -443,84 +707,166 @@ function handleMedia(
   return { state: markReceived(state, event), commands: [{ kind: "forward", to: [RECEIVER_SELF_ID] }] };
 }
 
+/* ------------------------------------------------------------------------- */
+/* 段の配分（congestion.md 4.3、ADR-0027、ADR-0029）                          */
+/* ------------------------------------------------------------------------- */
+
 /**
- * 帯域予算から tier を配分する（congestion.md 4.3）。
+ * 帯域予算から段を配分する。
  *
- *   budget = target × 9/10          ヘッダと制御の余裕を 10% 取る
- *   高品質の人数 = floor(budget / 高品質プロファイルのビットレート)
- *   残りはサムネイル
- *   いずれにも足りない場合は発話者 1 人のサムネイルのみ
+ * ```
+ * budget = target × 8 × 9/10          ヘッダと制御の余裕を 10% 取る
+ * budget < AUDIO_ONLY_ENTER_BPS       → 映像を落として音声だけにする（ADR-0029）
+ * それ以外                            → 発話者優先の順に、表示寸法の上限まで予算で買う
+ * ```
  *
- * 除算は整数で行い、切り捨てる。浮動小数点を使わない（ADR-0017）。
+ * 費用は**送信者の申告ビットレート**である（ADR-0027 の 2）。大域の定数を使わない。
+ * 除算は整数で行い、切り捨てる（ADR-0017）。
  */
 function reallocate(state: ReceiverState): ReceiverStepResult {
   const commands: ReceiverCommand[] = [];
-  // bytes/sec を bits/sec に直して比較する。8 倍は整数演算である。
-  // なぜ truncDiv を使うか: `/` は浮動小数点除算であり、言語間で丸めが一致しない。
-  // 整数除算（切り捨て）に限定する（ADR-0017）。
-  const budgetResult = truncDiv(state.targetBytesPerSec * 8 * 9, 10);
+  // 回線の速度（bits/sec）。8 倍は整数演算である。
+  const linkBps = state.targetBytesPerSec * 8;
+  // 段を買うための予算。ヘッダと制御の余裕を 10% 取る（congestion.md 4.3）。
+  const budgetResult = truncDiv(linkBps * 9, 10);
   const budgetBps = budgetResult.ok ? budgetResult.value : 0;
-  const highQualityResult = truncDiv(budgetBps, V_4K60.targetBitrate);
-  const highQualityCount = highQualityResult.ok ? highQualityResult.value : 0;
-  const thumbnailCost = V_360P15.targetBitrate;
 
-  const video = state.streams.filter((stream) => stream.phase === "SUBSCRIBED");
-  const ordered = [...video].sort((a, b) => priorityOrder(state, a, b));
+  // --- 音声だけの状態への出入り（ヒステリシス。ADR-0029 の 1） ---
+  //
+  // 判定は**回線の速度そのもの**で行う。10% を引いた予算で判定してはならない。
+  // `MIN_VIABLE_BPS` はヘッダを含めた実効レートとして導出されているため、
+  // 予算で判定すると余裕を二重に引くことになり、最低の成立点でも音声だけに落ちる
+  // （実際にそうなった。初期状態が常に AUDIO_ONLY になった）。
+  const audioOnly = state.audioOnly
+    ? linkBps < AUDIO_ONLY_EXIT_BPS
+    : linkBps < AUDIO_ONLY_ENTER_BPS;
 
-  const streams: StreamState[] = [];
-  let assignedHigh = 0;
+  if (audioOnly) {
+    const streams: StreamState[] = [];
+    for (const stream of state.streams) {
+      if (isAudio(stream.channel)) {
+        // 音声は維持する。**絶対に落としてはならない。**
+        streams.push(stream);
+        continue;
+      }
+      if (stream.phase === "SUBSCRIBED") {
+        commands.push({
+          kind: "subscribeChange",
+          to: stream.senderId,
+          channel: stream.channel,
+          want: false,
+          maxSpatialId: 0,
+          maxTemporalId: 0,
+        });
+        streams.push({ ...stream, phase: "AUDIO_ONLY" });
+        continue;
+      }
+      streams.push(stream);
+    }
+    if (!state.degraded) {
+      commands.push({ kind: "notify", code: DEGRADED_WARNING });
+    }
+    return {
+      state: { ...state, streams: streams.sort(streamOrder), audioOnly: true, degraded: true },
+      commands,
+    };
+  }
+
+  // --- 映像へ戻す（AUDIO_ONLY から復帰する） ---
+  const revived: StreamState[] = [];
+  for (const stream of state.streams) {
+    if (stream.phase === "AUDIO_ONLY") {
+      revived.push({ ...stream, phase: "SUBSCRIBED", spatialId: lowestRung(state, stream) });
+      commands.push({
+        kind: "subscribeChange",
+        to: stream.senderId,
+        channel: stream.channel,
+        want: true,
+        // 復帰は最下段から始める。高い段から始めると再び詰まる（congestion.md 6 節）。
+        maxSpatialId: lowestRung(state, stream),
+        maxTemporalId: stream.temporalId,
+      });
+      commands.push({
+        kind: "keyframeRequest",
+        for: stream.senderId,
+        channel: stream.channel,
+        spatialId: lowestRung(state, stream),
+      });
+      continue;
+    }
+    revived.push(stream);
+  }
+  const base: ReceiverState = { ...state, streams: revived, audioOnly: false };
+
+  // --- 予算で段を買う ---
+  const ordered = [...base.streams.filter((stream) => stream.phase === "SUBSCRIBED")].sort((a, b) =>
+    priorityOrder(base, a, b),
+  );
+  const assigned = new Map<string, number>();
   let remaining = budgetBps;
   let degraded = false;
 
-  for (const stream of state.streams) {
-    if (stream.phase !== "SUBSCRIBED") {
+  for (const stream of ordered) {
+    if (isAudio(stream.channel)) {
+      // 音声は段を持たない。費用は予算から引くが、段の選択は行わない。
+      remaining -= costOf(base, stream, 0);
+      continue;
+    }
+    const floor = lowestRung(base, stream);
+    const cap = rungCapFor(base, stream);
+    let chosen = floor;
+    // 上限から下へ降りて、予算に収まる最も高い段を選ぶ。
+    for (let sid = cap; sid >= floor; sid -= 1) {
+      const cost = costOf(base, stream, sid);
+      if (cost <= remaining) {
+        chosen = sid;
+        break;
+      }
+    }
+    const chosenCost = costOf(base, stream, chosen);
+    if (chosenCost > remaining) {
+      // 最下段さえ入らない。最低保証として最下段を維持し、警告する（congestion.md 4.3）。
+      degraded = true;
+    }
+    remaining -= chosenCost;
+    assigned.set(streamKey(stream), chosen);
+  }
+
+  const streams: StreamState[] = [];
+  for (const stream of base.streams) {
+    const next = assigned.get(streamKey(stream));
+    if (next === undefined || next === stream.spatialId) {
       streams.push(stream);
       continue;
     }
-    const rank = ordered.findIndex(
-      (candidate) => candidate.senderId === stream.senderId && candidate.channel === stream.channel,
-    );
-    let nextSpatial: number;
-    if (stream.displayWidth === 0) {
-      // 表示寸法の申告が無い相手は最低品質に留める（ADR-0015）。
-      nextSpatial = DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID;
-    } else if (assignedHigh < highQualityCount && rank < highQualityCount) {
-      nextSpatial = V_4K60.spatialId;
-      assignedHigh += 1;
-      remaining -= V_4K60.targetBitrate;
-    } else if (remaining >= thumbnailCost) {
-      nextSpatial = V_360P15.spatialId;
-      remaining -= thumbnailCost;
-    } else {
-      // 予算が尽きた。発話者のサムネイルのみを維持する（最低保証）。
-      nextSpatial = V_360P15.spatialId;
-      degraded = true;
-    }
-    if (nextSpatial !== stream.spatialId) {
-      commands.push({ kind: "setTier", for: stream.senderId, channel: stream.channel, tier: nextSpatial });
-      if (nextSpatial > stream.spatialId) {
-        // spatialId が上がる場合はエンコーダ出力が切り替わるためキーフレームが必要である。
-        commands.push({
-          kind: "keyframeRequest",
-          for: stream.senderId,
-          channel: stream.channel,
-          spatialId: nextSpatial,
-        });
-      }
-    }
-    streams.push({ ...stream, spatialId: nextSpatial });
+    commands.push({ kind: "setTier", for: stream.senderId, channel: stream.channel, tier: next });
+    commands.push({
+      kind: "keyframeRequest",
+      for: stream.senderId,
+      channel: stream.channel,
+      spatialId: next,
+    });
+    streams.push({ ...stream, spatialId: next });
   }
 
-  if (degraded && !state.degraded) {
-    // 最低保証（発話者のサムネイル 1 本と全員の音声）を下回った。利用側へ警告する。
+  if (degraded && !base.degraded) {
     commands.push({ kind: "notify", code: DEGRADED_WARNING });
   }
 
-  return { state: { ...state, streams: streams.sort(streamOrder), degraded }, commands };
+  return {
+    state: { ...base, streams: streams.sort(streamOrder), degraded },
+    commands,
+  };
 }
 
 /** 発話者を先に、次に senderId の昇順で並べる。順序は決定的でなければならない。 */
 function priorityOrder(state: ReceiverState, a: StreamState, b: StreamState): number {
+  // 音声を先に配分する。音声が最優先である（ADR-0029 の 4）。
+  const aAudio = isAudio(a.channel) ? 0 : 1;
+  const bAudio = isAudio(b.channel) ? 0 : 1;
+  if (aAudio !== bAudio) {
+    return aAudio - bAudio;
+  }
   const aSpeaker = state.activeSpeakerId === a.senderId ? 0 : 1;
   const bSpeaker = state.activeSpeakerId === b.senderId ? 0 : 1;
   if (aSpeaker !== bSpeaker) {
@@ -530,6 +876,10 @@ function priorityOrder(state: ReceiverState, a: StreamState, b: StreamState): nu
     return a.senderId - b.senderId;
   }
   return a.channel - b.channel;
+}
+
+function streamKey(stream: StreamState): string {
+  return `${String(stream.senderId)}:${String(stream.channel)}`;
 }
 
 /**
@@ -573,4 +923,18 @@ function findStream(state: ReceiverState, senderId: number, channel: number): St
   return state.streams.find((stream) => stream.senderId === senderId && stream.channel === channel);
 }
 
+/** 観測用。最上段を外から確かめられるようにする（試験のため）。 */
+export function highestRungOf(state: ReceiverState, senderId: number, channel: number): number {
+  return highestRung(state, { senderId, channel, phase: "SUBSCRIBED", spatialId: 0, temporalId: 0, displayWidth: 0 });
+}
 
+/**
+ * 表に無いイベントの記録に 1 件加える。**上限を超えたら古い側を捨てる。**
+ * 上限が無いと記録が無制限に伸び、Durable Object の記憶（128 MB。F-006）を食う。
+ */
+function appendUnexpected(events: readonly string[], name: string): readonly string[] {
+  const appended = [...events, name];
+  return appended.length > MAX_UNEXPECTED_EVENTS
+    ? appended.slice(appended.length - MAX_UNEXPECTED_EVENTS)
+    : appended;
+}

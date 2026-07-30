@@ -1,338 +1,363 @@
 /**
- * shard-core の検証。
+ * 中継ノードの判断コアの中核的な保証を検証する。
  *
- * - tier 超過ユニットが転送されないこと
- * - 破棄順位が spec/vectors/drop-order.json の全件と一致すること
- * - 同じ入力列に対して 2 回実行すると同じ出力列が出ること（決定性）
- * - 状態遷移が state-machines.md 3 節の表に無い遷移を行わないこと
+ * 検証する保証は 6 つである。いずれも「これが無いと悪い回線で壊れる」ものである。
+ *
+ *   1. 購読者へ渡すのは**ちょうど 1 段**である（ADR-0027）
+ *   2. はしごが縮んでも黒画面にならない（安全弁）
+ *   3. 送信窓が閉じると破棄され、ack で開く（congestion.md 2 節）
+ *   4. 破棄禁止のユニット（KEY・音声）は窓が閉じていても渡る
+ *   5. ack が途絶えた購読だけが止まり、他は巻き込まれない（congestion.md 7 節）
+ *   6. ノード全体の予算超過は通知するが**転送を止めない**（ADR-0025 の 5）
+ *
+ * 加えてチャネルの分離と決定性を確かめる。
  */
-import { describe, it } from "node:test";
-import { strict as assert } from "node:assert";
-import { readFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
 
 import {
-  step,
+  chosenRungOf,
   initialState,
+  step,
+  type LadderRung,
+  type ShardCommand,
   type ShardEvent,
-  type MediaEvent,
-  type CongestionState,
+  type ShardState,
 } from "../packages/core/src/shard-core.ts";
-
-import { dropPriority } from "../packages/core/src/wire.ts";
-
 import {
-  FLAG_KEY,
-  FLAG_DISCARDABLE,
-  CHANNEL_VIDEO,
+  ACK_TIMEOUT_MS,
+  NODE_MAX_OUT_BYTES_PER_SEC,
+  SEND_WINDOW_MS,
+  V_1080P30,
+  V_360P15,
+  V_4K60,
+} from "../packages/core/src/generated/constants.ts";
+import {
   CHANNEL_AUDIO,
+  CHANNEL_VIDEO,
+  FLAG_DISCARDABLE,
+  FLAG_END_OF_FRAME,
+  FLAG_KEY,
+  MAX_TEMPORAL_ID,
 } from "../packages/core/src/generated/wire-layout.ts";
+import { ERROR_DEFINITIONS } from "../packages/core/src/generated/errors.ts";
 
-import { NODE_MAX_OUT_BYTES_PER_SEC } from "../packages/core/src/generated/constants.ts";
+const SENDER = 1;
+const A = 2;
+const B = 3;
 
-const thisDir = dirname(fileURLToPath(import.meta.url));
-const vectorsPath = join(thisDir, "..", "spec", "vectors", "drop-order.json");
+/** 3 段のはしご。段番号は密に詰める（ADR-0026）。 */
+const RUNGS: readonly LadderRung[] = [
+  {
+    sid: 0,
+    width: V_360P15.width,
+    height: V_360P15.height,
+    framerate: V_360P15.framerate,
+    temporalLayers: V_360P15.temporalLayers,
+    targetBitrate: V_360P15.targetBitrate,
+  },
+  {
+    sid: 1,
+    width: V_1080P30.width,
+    height: V_1080P30.height,
+    framerate: V_1080P30.framerate,
+    temporalLayers: V_1080P30.temporalLayers,
+    targetBitrate: V_1080P30.targetBitrate,
+  },
+  {
+    sid: 2,
+    width: V_4K60.width,
+    height: V_4K60.height,
+    framerate: V_4K60.framerate,
+    temporalLayers: V_4K60.temporalLayers,
+    targetBitrate: V_4K60.targetBitrate,
+  },
+];
 
-// --- テスト: tier 超過ユニットが転送されない ---
-
-describe("shard-core: tier フィルタリング", () => {
-  it("spatialId が tier 以下のユニットのみ転送される", () => {
-    const t = 1000;
-    let state = initialState(t);
-
-    // 参加者 10（送信者）と 20（受信者）を追加
-    const joinResult1 = step(state, { kind: "join", id: 10 }, t);
-    state = joinResult1.state;
-    const joinResult2 = step(state, { kind: "join", id: 20 }, t);
-    state = joinResult2.state;
-
-    // 受信者 20 が送信者 10 を購読、maxSpatialId=1（tier=1）
-    const subResult = step(state, {
-      kind: "subscribe",
-      from: 20,
-      to: 10,
-      want: true,
-      maxSpatialId: 1,
-    }, t);
-    state = subResult.state;
-
-    // spatialId=0 のユニット → 転送される
-    const media0: MediaEvent = {
-      kind: "media",
-      from: 10,
-      ch: CHANNEL_VIDEO,
-      sid: 0,
-      tid: 0,
-      key: true,
-      bytes: 5000,
-      flags: FLAG_KEY,
-    };
-    const result0 = step(state, media0, t + 1);
-    state = result0.state;
-    assert.equal(result0.commands.length, 1);
-    const cmd0 = result0.commands[0];
-    assert.ok(cmd0 !== undefined);
-    assert.equal(cmd0.kind, "forward");
-    if (cmd0.kind === "forward") {
-      assert.deepEqual(cmd0.to, [20]);
-    }
-
-    // spatialId=1 のユニット → 転送される（tier と等しい）
-    const media1: MediaEvent = {
-      kind: "media",
-      from: 10,
-      ch: CHANNEL_VIDEO,
-      sid: 1,
-      tid: 0,
-      key: true,
-      bytes: 5000,
-      flags: FLAG_KEY,
-    };
-    const result1 = step(state, media1, t + 2);
-    state = result1.state;
-    assert.equal(result1.commands.length, 1);
-    const cmd1 = result1.commands[0];
-    assert.ok(cmd1 !== undefined);
-    assert.equal(cmd1.kind, "forward");
-
-    // spatialId=2 のユニット → tier 超過、転送されない
-    const media2: MediaEvent = {
-      kind: "media",
-      from: 10,
-      ch: CHANNEL_VIDEO,
-      sid: 2,
-      tid: 0,
-      key: true,
-      bytes: 5000,
-      flags: FLAG_KEY,
-    };
-    const result2 = step(state, media2, t + 3);
-    // 転送先が無いためコマンドが出ない
-    assert.equal(result2.commands.length, 0);
-
-    // spatialId=3 のユニット → tier 超過、転送されない
-    const media3: MediaEvent = {
-      kind: "media",
-      from: 10,
-      ch: CHANNEL_VIDEO,
-      sid: 3,
-      tid: 0,
-      key: true,
-      bytes: 5000,
-      flags: FLAG_KEY,
-    };
-    const result3 = step(state, media3, t + 4);
-    assert.equal(result3.commands.length, 0);
-  });
-
-  it("複数の受信者で tier が異なる場合、各自の tier に応じて転送される", () => {
-    const t = 2000;
-    let state = initialState(t);
-
-    // 送信者 1、受信者 2（tier=0）、受信者 3（tier=2）
-    state = step(state, { kind: "join", id: 1 }, t).state;
-    state = step(state, { kind: "join", id: 2 }, t).state;
-    state = step(state, { kind: "join", id: 3 }, t).state;
-
-    state = step(state, { kind: "subscribe", from: 2, to: 1, want: true, maxSpatialId: 0 }, t).state;
-    state = step(state, { kind: "subscribe", from: 3, to: 1, want: true, maxSpatialId: 2 }, t).state;
-
-    // spatialId=0 → 受信者 2 と 3 の両方
-    const r0 = step(state, {
-      kind: "media", from: 1, ch: CHANNEL_VIDEO, sid: 0, tid: 0, key: true, bytes: 1000, flags: FLAG_KEY,
-    }, t + 1);
-    state = r0.state;
-    const fwd0 = r0.commands[0];
-    assert.ok(fwd0 !== undefined);
-    assert.equal(fwd0.kind, "forward");
-    if (fwd0.kind === "forward") {
-      assert.deepEqual(fwd0.to, [2, 3]);
-    }
-
-    // spatialId=1 → 受信者 3 のみ（2 は tier=0）
-    const r1 = step(state, {
-      kind: "media", from: 1, ch: CHANNEL_VIDEO, sid: 1, tid: 0, key: true, bytes: 1000, flags: FLAG_KEY,
-    }, t + 2);
-    state = r1.state;
-    const fwd1 = r1.commands[0];
-    assert.ok(fwd1 !== undefined);
-    assert.equal(fwd1.kind, "forward");
-    if (fwd1.kind === "forward") {
-      assert.deepEqual(fwd1.to, [3]);
-    }
-
-    // spatialId=3 → 誰にも転送されない（3 の tier=2）
-    const r3 = step(state, {
-      kind: "media", from: 1, ch: CHANNEL_VIDEO, sid: 3, tid: 0, key: true, bytes: 1000, flags: FLAG_KEY,
-    }, t + 3);
-    assert.equal(r3.commands.length, 0);
-  });
-});
-
-// --- テスト: 破棄順位が drop-order.json と一致する ---
-
-interface DropOrderVector {
-  readonly name: string;
-  readonly channel: number;
-  readonly flags: number;
-  readonly expectedPriority: number | null;
+function announce(rungs: readonly LadderRung[]): ShardEvent {
+  return { kind: "streamAnnounce", from: SENDER, ch: CHANNEL_VIDEO, rungs };
 }
 
-function isDropOrderVector(v: unknown): v is DropOrderVector {
-  if (typeof v !== "object" || v === null) return false;
-  const obj: Record<string, unknown> = { ...v };
-  return (
-    typeof obj["name"] === "string" &&
-    typeof obj["channel"] === "number" &&
-    typeof obj["flags"] === "number" &&
-    (typeof obj["expectedPriority"] === "number" || obj["expectedPriority"] === null)
+function subscribe(from: number, tier: number, ch = CHANNEL_VIDEO): ShardEvent {
+  return {
+    kind: "subscribe",
+    from,
+    to: SENDER,
+    ch,
+    want: true,
+    maxSpatialId: tier,
+    maxTemporalId: MAX_TEMPORAL_ID,
+  };
+}
+
+function media(sid: number, seq: number, options: { key?: boolean; tid?: number; ch?: number; bytes?: number } = {}): ShardEvent {
+  const key = options.key ?? false;
+  const tid = options.tid ?? 0;
+  const discardable = !key && tid >= 2;
+  return {
+    kind: "media",
+    from: SENDER,
+    ch: options.ch ?? CHANNEL_VIDEO,
+    sid,
+    tid,
+    key,
+    bytes: options.bytes ?? 1000,
+    flags: FLAG_END_OF_FRAME | (key ? FLAG_KEY : 0) | (discardable ? FLAG_DISCARDABLE : 0),
+    seq,
+  };
+}
+
+function ack(from: number, sid: number, highestSeq: number, ch = CHANNEL_VIDEO): ShardEvent {
+  return { kind: "ack", from, to: SENDER, ch, sid, highestSeq };
+}
+
+/** 出力コマンドから forward の宛先を取り出す。無ければ null。 */
+function forwardTargets(commands: readonly ShardCommand[]): readonly number[] | null {
+  for (const command of commands) {
+    if (command.kind === "forward") {
+      return command.to;
+    }
+  }
+  return null;
+}
+
+function dropCount(commands: readonly ShardCommand[]): number {
+  let total = 0;
+  for (const command of commands) {
+    if (command.kind === "drop") {
+      total += command.count;
+    }
+  }
+  return total;
+}
+
+/** 参加者とはしごと購読を用意する。 */
+function setup(tiers: readonly { readonly id: number; readonly tier: number }[]): ShardState {
+  let state = initialState(0);
+  state = step(state, { kind: "join", id: SENDER }, 0).state;
+  for (const entry of tiers) {
+    state = step(state, { kind: "join", id: entry.id }, 0).state;
+  }
+  state = step(state, announce(RUNGS), 0).state;
+  for (const entry of tiers) {
+    state = step(state, subscribe(entry.id, entry.tier), 0).state;
+  }
+  return state;
+}
+
+/* ------------------------------------------------------------------------- */
+
+test("購読者へ渡すのはちょうど 1 段である（simulcast の段は独立している）", () => {
+  // A は最上段（2）を、B は中段（1）を要求する。
+  const state = setup([
+    { id: A, tier: 2 },
+    { id: B, tier: 1 },
+  ]);
+  assert.equal(chosenRungOf(state, A, SENDER, CHANNEL_VIDEO), 2);
+  assert.equal(chosenRungOf(state, B, SENDER, CHANNEL_VIDEO), 1);
+
+  // 段 0 は誰にも渡らない（`spatialId <= tier` なら A と B の両方へ渡ってしまう）。
+  assert.equal(forwardTargets(step(state, media(0, 1), 10).commands), null);
+  // 段 1 は B だけへ渡る。
+  assert.deepEqual(forwardTargets(step(state, media(1, 1), 10).commands), [B]);
+  // 段 2 は A だけへ渡る。
+  assert.deepEqual(forwardTargets(step(state, media(2, 1), 10).commands), [A]);
+});
+
+test("最上段より高い段を要求しても、存在する最上段が渡る", () => {
+  const state = setup([{ id: A, tier: 3 }]);
+  assert.equal(chosenRungOf(state, A, SENDER, CHANNEL_VIDEO), 2);
+  assert.deepEqual(forwardTargets(step(state, media(2, 1), 10).commands), [A]);
+});
+
+test("はしごが縮んでも黒画面にならない（存在する段から選ぶ）", () => {
+  let state = setup([{ id: A, tier: 2 }]);
+  // 発熱で段を 1 本に減らした。
+  state = step(state, announce(RUNGS.slice(0, 1)), 10).state;
+  assert.equal(chosenRungOf(state, A, SENDER, CHANNEL_VIDEO), 0);
+  assert.deepEqual(forwardTargets(step(state, media(0, 1), 20).commands), [A]);
+});
+
+test("チャネルは分離される（映像の購読で音声を転送しない）", () => {
+  let state = initialState(0);
+  state = step(state, { kind: "join", id: SENDER }, 0).state;
+  state = step(state, { kind: "join", id: A }, 0).state;
+  state = step(state, announce(RUNGS), 0).state;
+  // 映像のみ購読する。
+  state = step(state, subscribe(A, 0), 0).state;
+  assert.deepEqual(forwardTargets(step(state, media(0, 1), 10).commands), [A]);
+  // 音声は購読していないため渡らない。
+  assert.equal(forwardTargets(step(state, media(0, 1, { ch: CHANNEL_AUDIO }), 10).commands), null);
+});
+
+test("送信窓が閉じると破棄され、ack で再び開く（congestion.md 2 節）", () => {
+  // 最下段は 15 fps。SEND_WINDOW_MS（200 ms）は 3 フレームに相当する。
+  const framesInWindow = Math.trunc((SEND_WINDOW_MS * V_360P15.framerate) / 1000);
+  let state = setup([{ id: A, tier: 0 }]);
+  let t = 10;
+  let forwarded = 0;
+  let dropped = 0;
+  for (let i = 1; i <= framesInWindow + 4; i += 1) {
+    // 破棄可能なユニット（最上位の時間層）を送る。窓が閉じたら破棄される。
+    const result = step(state, media(0, i, { tid: 2 }), t);
+    state = result.state;
+    if (forwardTargets(result.commands) !== null) {
+      forwarded += 1;
+    }
+    dropped += dropCount(result.commands);
+    t += 5;
+  }
+  // 窓の分だけ渡り、その先は破棄される。
+  assert.ok(forwarded >= 1, `少なくとも 1 枚は渡る（実際 ${String(forwarded)}）`);
+  assert.ok(dropped >= 1, `窓が閉じて破棄が起きる（実際 ${String(dropped)}）`);
+
+  // ack を返すと窓が開き、再び渡る。
+  state = step(state, ack(A, 0, framesInWindow + 4), t).state;
+  const after = step(state, media(0, framesInWindow + 5, { tid: 2 }), t + 5);
+  assert.deepEqual(forwardTargets(after.commands), [A]);
+});
+
+test("破棄禁止のユニットは窓が閉じていても渡る（KEY と音声）", () => {
+  let state = setup([{ id: A, tier: 0 }]);
+  state = step(state, subscribe(A, 0, CHANNEL_AUDIO), 0).state;
+  let t = 10;
+  // 窓を確実に閉じる。
+  for (let i = 1; i <= 20; i += 1) {
+    state = step(state, media(0, i, { tid: 2 }), t).state;
+    t += 5;
+  }
+  // KEY は渡る。
+  assert.deepEqual(forwardTargets(step(state, media(0, 100, { key: true }), t).commands), [A]);
+  // 音声は渡る。
+  assert.deepEqual(
+    forwardTargets(step(state, media(0, 100, { ch: CHANNEL_AUDIO }), t).commands),
+    [A],
   );
-}
-
-describe("shard-core: 破棄順位", () => {
-  it("drop-order.json の全件と一致する", async () => {
-    const content = await readFile(vectorsPath, "utf8");
-    const parsed: unknown = JSON.parse(content);
-    assert.ok(Array.isArray(parsed), "drop-order.json は配列であること");
-
-    for (const entry of parsed) {
-      assert.ok(isDropOrderVector(entry), `不正なベクタ: ${JSON.stringify(entry)}`);
-      const actual = dropPriority(entry.channel, entry.flags);
-      assert.equal(
-        actual,
-        entry.expectedPriority,
-        `${entry.name}: expected=${entry.expectedPriority}, actual=${actual}`,
-      );
-    }
-  });
 });
 
-// --- テスト: 決定性 ---
-
-describe("shard-core: 決定性", () => {
-  it("同じ入力列に対して 2 回実行すると同じ出力列が出る", () => {
-    const events: Array<{ event: ShardEvent; t: number }> = [
-      { event: { kind: "join", id: 1 }, t: 100 },
-      { event: { kind: "join", id: 2 }, t: 100 },
-      { event: { kind: "join", id: 3 }, t: 100 },
-      { event: { kind: "subscribe", from: 2, to: 1, want: true, maxSpatialId: 2 }, t: 100 },
-      { event: { kind: "subscribe", from: 3, to: 1, want: true, maxSpatialId: 1 }, t: 100 },
-      { event: { kind: "media", from: 1, ch: CHANNEL_VIDEO, sid: 0, tid: 0, key: true, bytes: 2000, flags: FLAG_KEY }, t: 200 },
-      { event: { kind: "media", from: 1, ch: CHANNEL_VIDEO, sid: 1, tid: 1, key: false, bytes: 1500, flags: FLAG_DISCARDABLE }, t: 201 },
-      { event: { kind: "media", from: 1, ch: CHANNEL_VIDEO, sid: 2, tid: 0, key: false, bytes: 3000, flags: 0 }, t: 202 },
-      { event: { kind: "media", from: 1, ch: CHANNEL_AUDIO, sid: 0, tid: 0, key: false, bytes: 80, flags: 0 }, t: 203 },
-      { event: { kind: "budget", bytesPerSec: 100000000 }, t: 300 },
-      { event: { kind: "leave", id: 3 }, t: 400 },
-      { event: { kind: "media", from: 1, ch: CHANNEL_VIDEO, sid: 0, tid: 0, key: true, bytes: 2000, flags: FLAG_KEY }, t: 500 },
-    ];
-
-    function runOnce(): string[] {
-      let state = initialState(0);
-      const outputs: string[] = [];
-      for (const { event, t } of events) {
-        const result = step(state, event, t);
-        state = result.state;
-        outputs.push(JSON.stringify(result.commands));
-      }
-      return outputs;
-    }
-
-    const run1 = runOnce();
-    const run2 = runOnce();
-
-    assert.equal(run1.length, run2.length);
-    for (let i = 0; i < run1.length; i += 1) {
-      const r1 = run1[i];
-      const r2 = run2[i];
-      assert.ok(r1 !== undefined);
-      assert.ok(r2 !== undefined);
-      assert.equal(r1, r2, `出力列のインデックス ${i} が不一致`);
-    }
-  });
+test("段が違う ack は適用されない（段ごとに seq の空間が独立している）", () => {
+  let state = setup([{ id: A, tier: 0 }]);
+  let t = 10;
+  for (let i = 1; i <= 20; i += 1) {
+    state = step(state, media(0, i, { tid: 2 }), t).state;
+    t += 5;
+  }
+  // 段 1 への ack を送る。渡しているのは段 0 であるため適用されない。
+  const wrong = step(state, ack(A, 1, 100), t);
+  assert.deepEqual(wrong.commands, []);
+  // 窓は閉じたままである。
+  assert.equal(forwardTargets(step(wrong.state, media(0, 21, { tid: 2 }), t + 5).commands), null);
+  // 正しい段の ack なら開く。
+  const right = step(state, ack(A, 0, 20), t);
+  assert.deepEqual(forwardTargets(step(right.state, media(0, 21, { tid: 2 }), t + 5).commands), [A]);
 });
 
-// --- テスト: 状態遷移が表に無い遷移を行わない ---
+test("ack が途絶えた購読だけが止まり、他の購読は巻き込まれない", () => {
+  let state = setup([
+    { id: A, tier: 0 },
+    { id: B, tier: 0 },
+  ]);
+  // 1 枚渡す。両方が未確認を持つ。
+  state = step(state, media(0, 1, { key: true }), 10).state;
+  // B だけが ack を返す。
+  state = step(state, ack(B, 0, 1), 20).state;
+  // ACK_TIMEOUT_MS を跨いでタイマーを打つ。
+  const timer = step(state, { kind: "timer" }, 20 + ACK_TIMEOUT_MS + 1);
+  state = timer.state;
+  const disconnects = timer.commands.filter((c) => c.kind === "disconnect");
+  assert.equal(disconnects.length, 1, "止まるのは ack を返さなかった 1 本だけである");
+  assert.deepEqual(disconnects[0], { kind: "disconnect", peer: A });
 
-// state-machines.md 3 節の有効な遷移を定義する
-const VALID_TRANSITIONS: ReadonlyMap<CongestionState, ReadonlySet<CongestionState>> = new Map([
-  ["NORMAL", new Set<CongestionState>(["NORMAL", "SHEDDING_T2"])],
-  ["SHEDDING_T2", new Set<CongestionState>(["SHEDDING_T2", "NORMAL", "SHEDDING_T1"])],
-  ["SHEDDING_T1", new Set<CongestionState>(["SHEDDING_T1", "SHEDDING_T2", "SHEDDING_SPATIAL"])],
-  ["SHEDDING_SPATIAL", new Set<CongestionState>(["SHEDDING_SPATIAL", "SHEDDING_T1", "KEY_ONLY"])],
-  ["KEY_ONLY", new Set<CongestionState>(["KEY_ONLY", "SHEDDING_SPATIAL"])],
-]);
+  // 以後、A へは渡らず B へは渡る。
+  const after = step(state, media(0, 2, { key: true }), 20 + ACK_TIMEOUT_MS + 10);
+  assert.deepEqual(forwardTargets(after.commands), [B]);
 
-describe("shard-core: 状態遷移の合法性", () => {
-  it("輻輳状態の遷移が表に存在するもののみ", () => {
-    // 様々な予算条件で遷移を発生させ、全てが合法であることを検証する
+  // 購読を張り直すと復帰する（再接続の経路）。
+  const resubscribed = step(after.state, subscribe(A, 0), 20 + ACK_TIMEOUT_MS + 20);
+  const revived = step(resubscribed.state, media(0, 3, { key: true }), 20 + ACK_TIMEOUT_MS + 30);
+  assert.deepEqual(forwardTargets(revived.commands), [A, B]);
+});
+
+test("何も渡していない購読は ack 待ちで止められない", () => {
+  const state = setup([{ id: A, tier: 0 }]);
+  const timer = step(state, { kind: "timer" }, ACK_TIMEOUT_MS * 3);
+  assert.equal(
+    timer.commands.filter((c) => c.kind === "disconnect").length,
+    0,
+    "返すべき ack が無い相手を切ってはならない",
+  );
+});
+
+test("ノード全体の予算超過は通知するが転送を止めない", () => {
+  let state = setup([{ id: A, tier: 0 }]);
+  // 予算を極端に絞る。
+  state = step(state, { kind: "budget", bytesPerSec: 1000 }, 10).state;
+  const result = step(state, media(0, 1, { key: true, bytes: 500000 }), 20);
+  // 転送は行われる。
+  assert.deepEqual(forwardTargets(result.commands), [A]);
+  // 通知も出る。
+  const notify = result.commands.filter((c) => c.kind === "notify");
+  assert.equal(notify.length, 1);
+  assert.deepEqual(notify[0], { kind: "notify", code: ERROR_DEFINITIONS.E_NODE_OVERLOADED.closeCode });
+  // 同じ窓では繰り返し通知しない。
+  const again = step(result.state, media(0, 2, { key: true, bytes: 500000 }), 30);
+  assert.equal(again.commands.filter((c) => c.kind === "notify").length, 0);
+});
+
+test("退出すると購読・はしご・勾配・指令の記録がすべて消える", () => {
+  let state = setup([{ id: A, tier: 2 }]);
+  state = step(state, { kind: "report", from: A, delayUs: [1, 2, 3] }, 10).state;
+  assert.equal(state.subscriptions.length, 1);
+  assert.equal(state.trends.length, 1);
+  assert.equal(state.ladders.length, 1);
+
+  state = step(state, { kind: "leave", id: A }, 20).state;
+  assert.equal(state.subscriptions.length, 0);
+  assert.equal(state.trends.length, 0);
+  assert.ok(!state.participants.includes(A));
+
+  state = step(state, { kind: "leave", id: SENDER }, 30).state;
+  assert.equal(state.ladders.length, 0);
+  assert.equal(state.encoderTiers.length, 0);
+});
+
+test("同じ入力列に対して 2 回実行すると同じ出力列が出る", () => {
+  const events: readonly { readonly event: ShardEvent; readonly t: number }[] = [
+    { event: { kind: "join", id: SENDER }, t: 0 },
+    { event: { kind: "join", id: A }, t: 1 },
+    { event: { kind: "join", id: B }, t: 2 },
+    { event: announce(RUNGS), t: 3 },
+    { event: subscribe(A, 2), t: 4 },
+    { event: subscribe(B, 0), t: 5 },
+    { event: media(2, 1, { key: true }), t: 10 },
+    { event: media(0, 1, { key: true }), t: 11 },
+    { event: ack(A, 2, 1), t: 12 },
+    { event: { kind: "report", from: B, delayUs: [1, 2, 3, 4] }, t: 13 },
+    { event: { kind: "timer" }, t: 1000 },
+  ];
+
+  function run(): string {
     let state = initialState(0);
-
-    // 参加者と購読を作り、大量のメディアで負荷を上げる
-    state = step(state, { kind: "join", id: 1 }, 0).state;
-    state = step(state, { kind: "join", id: 2 }, 0).state;
-    state = step(state, { kind: "subscribe", from: 2, to: 1, want: true, maxSpatialId: 3 }, 0).state;
-
-    const transitions: Array<{ from: CongestionState; to: CongestionState }> = [];
-    let t = 100;
-
-    // 予算を非常に小さくして負荷超過を誘発する
-    const budgetResult = step(state, { kind: "budget", bytesPerSec: 100 }, t);
-    state = budgetResult.state;
-
-    // 多数のメディアイベントを送って状態遷移を発生させる
-    for (let i = 0; i < 200; i += 1) {
-      t += 600; // ヒステリシスを超える
-      const media: MediaEvent = {
-        kind: "media",
-        from: 1,
-        ch: CHANNEL_VIDEO,
-        sid: 0,
-        tid: 0,
-        key: false,
-        bytes: 50000,
-        flags: 0,
-      };
-      const result = step(state, media, t);
+    const out: ShardCommand[] = [];
+    for (const entry of events) {
+      const result = step(state, entry.event, entry.t);
       state = result.state;
-
-      // 予算イベントで遷移を評価
-      const budgetEval = step(state, { kind: "budget", bytesPerSec: 100 }, t + 1);
-      if (budgetEval.state.congestion !== state.congestion) {
-        transitions.push({ from: state.congestion, to: budgetEval.state.congestion });
-      }
-      state = budgetEval.state;
+      out.push(...result.commands);
     }
+    return JSON.stringify(out);
+  }
 
-    // 予算を大きくして回復させる
-    for (let i = 0; i < 100; i += 1) {
-      t += 600;
-      const budgetEval = step(state, { kind: "budget", bytesPerSec: NODE_MAX_OUT_BYTES_PER_SEC * 10 }, t);
-      if (budgetEval.state.congestion !== state.congestion) {
-        transitions.push({ from: state.congestion, to: budgetEval.state.congestion });
-      }
-      state = budgetEval.state;
-    }
+  assert.equal(run(), run());
+});
 
-    // 全ての遷移が合法であることを検証
-    for (const tr of transitions) {
-      const validSet = VALID_TRANSITIONS.get(tr.from);
-      assert.ok(validSet !== undefined, `未知の状態: ${tr.from}`);
-      assert.ok(
-        validSet.has(tr.to),
-        `不正な遷移: ${tr.from} → ${tr.to}（許可: ${[...validSet].join(", ")}）`,
-      );
-    }
-  });
+test("表に無いイベント（link）は無視して記録される", () => {
+  const state = initialState(0);
+  const result = step(state, { kind: "link", peer: 1, state: "down" }, 10);
+  assert.deepEqual(result.commands, []);
+  assert.deepEqual(result.state.unexpectedEvents, ["link"]);
+});
 
-  it("表に無いイベント（link）は無視して記録される", () => {
-    const t = 1000;
-    let state = initialState(t);
-
-    const result = step(state, { kind: "link", peer: 5, state: "up" }, t);
-    assert.equal(result.commands.length, 0);
-    assert.ok(result.state.unexpectedEvents.length > 0);
-    const lastEvent = result.state.unexpectedEvents[result.state.unexpectedEvents.length - 1];
-    assert.equal(lastEvent, "link");
-  });
+test("初期の帯域予算はノードの送出容量である", () => {
+  assert.equal(initialState(0).budgetBytesPerSec, NODE_MAX_OUT_BYTES_PER_SEC);
 });

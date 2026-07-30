@@ -1,6 +1,6 @@
 // 受信ノード（receiver）の判断コア（Kotlin）。
 //
-// 規範: state-machines.md 2 節（購読と tier）、congestion.md 4.3（tier の選択）。
+// 規範: state-machines.md 2 節（購読と tier）、congestion.md 4.1〜4.3、ADR-0027〜0029。
 // TypeScript の参照実装（packages/core/src/receiver-core.ts）と**同一の出力**を返さなければ
 // ならない。照合は凍結トレース（spec/vectors/trace-receiver.jsonl）で行う。
 // 相違した場合はベクタではなく実装を直す（ADR-0012）。
@@ -8,7 +8,12 @@
 // sans-IO。時刻・乱数・浮動小数点・入出力に触れない。除算は整数の切り捨てのみを使う。
 package dev.wheso
 
-import dev.wheso.generated.DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID
+import dev.wheso.generated.MAX_UNEXPECTED_EVENTS
+import dev.wheso.generated.AUDIO_ONLY_ENTER_BPS
+import dev.wheso.generated.AUDIO_ONLY_EXIT_BPS
+import dev.wheso.generated.CHANNEL_AUDIO
+import dev.wheso.generated.CHANNEL_SCREEN_AUDIO
+import dev.wheso.generated.MIN_VIABLE_BPS
 import dev.wheso.generated.RATE_HOLD_MS
 import dev.wheso.generated.RATE_PROBE_BPS
 import dev.wheso.generated.RATE_RECOVER_STREAK
@@ -16,10 +21,6 @@ import dev.wheso.generated.SHARD_TREND_ENTER_T2_DEN
 import dev.wheso.generated.SHARD_TREND_ENTER_T2_NUM
 import dev.wheso.generated.SHARD_TREND_EXIT_DEN
 import dev.wheso.generated.SHARD_TREND_EXIT_NUM
-import dev.wheso.generated.V_360P15_SPATIAL_ID
-import dev.wheso.generated.V_360P15_TARGET_BITRATE
-import dev.wheso.generated.V_4K60_SPATIAL_ID
-import dev.wheso.generated.V_4K60_TARGET_BITRATE
 
 /** 品質低下の警告。文言は利用側が国際化キーから作る（sdk-api.md 6 節）。 */
 private const val DEGRADED_WARNING: String = "W_DEGRADED"
@@ -28,19 +29,33 @@ private const val DEGRADED_WARNING: String = "W_DEGRADED"
 public const val RECEIVER_SELF_ID: Long = 0L
 
 /** (senderId, channel) ごとの購読状態（state-machines.md 2 節）。 */
-public enum class StreamPhase { UNSUBSCRIBED, SUBSCRIBED, PAUSED }
+public enum class StreamPhase { UNSUBSCRIBED, SUBSCRIBED, PAUSED, AUDIO_ONLY }
 
 /** 1 本のストリームの状態。 */
 public data class StreamState(
     val senderId: Long,
     val channel: Long,
     val phase: StreamPhase,
-    /** 現在要求している最大 spatialId。 */
     val spatialId: Long,
-    /** 現在要求している最大 temporalId。 */
     val temporalId: Long,
-    /** 利用側が申告した表示寸法（論理画素）。未申告は 0。 */
     val displayWidth: Long,
+)
+
+/** カタログの 1 段。streamCatalog から取り込む（ADR-0027 の 1）。 */
+public data class CatalogRung(
+    val sid: Long,
+    val width: Long,
+    val height: Long,
+    val framerate: Long,
+    val temporalLayers: Long,
+    val targetBitrate: Long,
+)
+
+/** 送信者 1 人・1 チャネルのはしご。 */
+public data class CatalogLadder(
+    val senderId: Long,
+    val channel: Long,
+    val rungs: List<CatalogRung>,
 )
 
 /** 受信済みの位置。ack の内容になる。 */
@@ -52,22 +67,19 @@ public data class ReceivedMark(
 )
 
 public data class ReceiverState(
-    /** senderId, channel の昇順で保持する。反復順序が判断に影響するため決定的にする。 */
     val streams: List<StreamState>,
+    val catalog: List<CatalogLadder>,
     val visible: Boolean,
     val targetBytesPerSec: Long,
     val activeSpeakerId: Long?,
     val trend: Slope,
     val degraded: Boolean,
-    val unexpectedEvents: List<String>,
-    /** senderId, channel, spatialId の昇順で保持する。 */
-    val received: List<ReceivedMark>,
-    /** 次に減少の判定を行える時刻（AIMD。congestion 4.2）。 */
+    val audioOnly: Boolean,
     val rateHoldUntilMs: Long,
-    /** 回復判定が連続した回数。規範は 3 回連続で加算的増加を許す。 */
     val recoverStreak: Long,
-    /** 目標ビットレートの上限（bytes/sec）。加算的増加はこれを超えない。 */
     val targetCeilingBytesPerSec: Long,
+    val unexpectedEvents: List<String>,
+    val received: List<ReceivedMark>,
 )
 
 public data class SubscribeEntry(
@@ -80,27 +92,26 @@ public data class SubscribeEntry(
 /** 入力イベント。 */
 public sealed interface ReceiverEvent {
     public data class SubscribeList(val entries: List<SubscribeEntry>) : ReceiverEvent
-
     public data class Leave(val id: Long) : ReceiverEvent
-
     public data class Visibility(val visible: Boolean) : ReceiverEvent
-
     public data class Budget(val bytesPerSec: Long) : ReceiverEvent
 
+    /** 観測した goodput。**目標を下げない**（congestion.md 4.1）。 */
+    public data class Goodput(val bytesPerSec: Long) : ReceiverEvent
     public data class ActiveSpeaker(val id: Long?) : ReceiverEvent
-
+    public data class Catalog(val entries: List<CatalogLadder>) : ReceiverEvent
     public data class DisplaySize(val senderId: Long, val channel: Long, val width: Long) : ReceiverEvent
-
     public data class Report(val delayUs: List<Long>) : ReceiverEvent
-
     public data class Media(
         val from: Long,
         val ch: Long,
         val sid: Long,
         val tid: Long,
-        /** 受信した sequenceNumber。ack の算出に使う。既定は 0（不明）。 */
         val seq: Long,
     ) : ReceiverEvent
+
+    /// 購読者からのキーフレーム要求（ADR-0039）。状態は変えない。
+    public data class KeyframeRequest(val senderId: Long, val channel: Long, val spatialId: Long) : ReceiverEvent
 
     public object Timer : ReceiverEvent
 }
@@ -114,18 +125,11 @@ public sealed interface ReceiverCommand {
         val maxSpatialId: Long,
         val maxTemporalId: Long,
     ) : ReceiverCommand
-
-    public data class KeyframeRequest(val targetId: Long, val channel: Long, val spatialId: Long) :
-        ReceiverCommand
-
+    public data class KeyframeRequest(val targetId: Long, val channel: Long, val spatialId: Long) : ReceiverCommand
     public data class SetTier(val targetId: Long, val channel: Long, val tier: Long) : ReceiverCommand
-
     public data class Forward(val to: List<Long>) : ReceiverCommand
-
     public data class Drop(val priority: Long, val count: Long) : ReceiverCommand
-
     public data class Notify(val code: String) : ReceiverCommand
-
     public data class Ack(
         val senderId: Long,
         val channel: Long,
@@ -136,38 +140,53 @@ public sealed interface ReceiverCommand {
 
 public data class ReceiverStepResult(val state: ReceiverState, val commands: List<ReceiverCommand>)
 
-public fun initialReceiverState(targetBytesPerSec: Long): ReceiverState = ReceiverState(
-    streams = emptyList(),
-    visible = true,
-    targetBytesPerSec = targetBytesPerSec,
-    activeSpeakerId = null,
-    trend = Slope(0L, 1L),
-    degraded = false,
-    unexpectedEvents = emptyList(),
-    received = emptyList(),
-    rateHoldUntilMs = 0L,
-    recoverStreak = 0L,
-    // 初めに与えられた値が上限である。回復してもこれを超えて要求しない。
-    targetCeilingBytesPerSec = targetBytesPerSec,
-)
+/**
+ * 初期状態。目標は最低から始める。引数を取らない理由は呼び出し側に委ねると
+ * 無関係な値を渡す誤りが起きるためである。
+ */
+public fun initialReceiverState(): ReceiverState {
+    val floorResult = truncDiv(MIN_VIABLE_BPS, 8L)
+    val floor = if (floorResult is Outcome.Ok) floorResult.value else 0L
+    return ReceiverState(
+        streams = emptyList(),
+        catalog = emptyList(),
+        visible = true,
+        targetBytesPerSec = floor,
+        activeSpeakerId = null,
+        trend = Slope(0L, 1L),
+        degraded = false,
+        audioOnly = false,
+        rateHoldUntilMs = 0L,
+        recoverStreak = 0L,
+        targetCeilingBytesPerSec = floor,
+        unexpectedEvents = emptyList(),
+        received = emptyList(),
+    )
+}
 
 /** 純関数の状態遷移。時刻は AIMD の待ち（RATE_HOLD_MS）に使う。 */
 public fun receiverStep(state: ReceiverState, event: ReceiverEvent, t: Long = 0L): ReceiverStepResult = when (event) {
     is ReceiverEvent.SubscribeList -> handleSubscribeList(state, event.entries)
     is ReceiverEvent.Leave -> handleLeave(state, event.id)
     is ReceiverEvent.Visibility -> handleVisibility(state, event.visible)
-    is ReceiverEvent.Budget -> reallocate(state.copy(targetBytesPerSec = event.bytesPerSec))
+    is ReceiverEvent.Budget -> handleBudget(state, event.bytesPerSec)
+    is ReceiverEvent.Goodput -> handleGoodput(state, event.bytesPerSec)
     is ReceiverEvent.ActiveSpeaker -> reallocate(state.copy(activeSpeakerId = event.id))
+    is ReceiverEvent.Catalog -> handleCatalog(state, event.entries)
     is ReceiverEvent.DisplaySize -> handleDisplaySize(state, event.senderId, event.channel, event.width)
     is ReceiverEvent.Report -> handleReport(state, event.delayUs, t)
     is ReceiverEvent.Media -> handleMedia(state, event)
-    // ACK_INTERVAL_MS ごとに、受信済みの位置を ack として返す。
-    // 呼び出し側が周期を管理する（コアは時刻を持たない）。
+    is ReceiverEvent.KeyframeRequest -> ReceiverStepResult(
+        state,
+        listOf(ReceiverCommand.KeyframeRequest(event.senderId, event.channel, event.spatialId)),
+    )
     is ReceiverEvent.Timer -> ReceiverStepResult(
         state,
         state.received.map { ReceiverCommand.Ack(it.senderId, it.channel, it.spatialId, it.highestSeq) },
     )
 }
+
+// --- 内部ユーティリティ ---
 
 private val streamOrder = compareBy<StreamState>({ it.senderId }, { it.channel })
 private val entryOrder = compareBy<SubscribeEntry>({ it.senderId }, { it.channel })
@@ -175,62 +194,124 @@ private val entryOrder = compareBy<SubscribeEntry>({ it.senderId }, { it.channel
 private fun findStream(state: ReceiverState, senderId: Long, channel: Long): StreamState? =
     state.streams.firstOrNull { it.senderId == senderId && it.channel == channel }
 
-/** spatialId の範囲は最低品質から最高品質までである。 */
-private fun clampSpatial(value: Long): Long {
-    if (value < V_360P15_SPATIAL_ID) {
-        return V_360P15_SPATIAL_ID
-    }
-    if (value > V_4K60_SPATIAL_ID) {
-        return V_4K60_SPATIAL_ID
-    }
-    return value
+private fun isAudio(channel: Long): Boolean =
+    channel == CHANNEL_AUDIO.toLong() || channel == CHANNEL_SCREEN_AUDIO.toLong()
+
+private fun ladderOf(state: ReceiverState, senderId: Long, channel: Long): List<CatalogRung> {
+    val entry = state.catalog.firstOrNull { it.senderId == senderId && it.channel == channel }
+    return entry?.rungs ?: emptyList()
 }
 
-/** 購読一覧の適用。表 1 行目と 2 行目に対応する。 */
-private fun handleSubscribeList(
-    state: ReceiverState,
-    entries: List<SubscribeEntry>,
-): ReceiverStepResult {
+/** 表示寸法から要求すべき段の上限を返す。表示幅以上の幅を持つ最小の段。 */
+private fun rungCapFor(state: ReceiverState, stream: StreamState): Long {
+    val rungs = ladderOf(state, stream.senderId, stream.channel)
+    if (rungs.isEmpty()) return 0L
+    var lowest = rungs[0]
+    var top = rungs[0]
+    for (rung in rungs) {
+        if (rung.sid < lowest.sid) lowest = rung
+        if (rung.sid > top.sid) top = rung
+    }
+    if (stream.displayWidth <= 0L) return lowest.sid
+    var best: CatalogRung? = null
+    for (rung in rungs) {
+        if (rung.width < stream.displayWidth) continue
+        val current = best
+        if (current == null || rung.width < current.width) best = rung
+    }
+    return if (best == null) top.sid else best.sid
+}
+
+/** 段の費用（bits/sec）。申告が無ければ 0。 */
+private fun costOf(state: ReceiverState, stream: StreamState, sid: Long): Long {
+    for (rung in ladderOf(state, stream.senderId, stream.channel)) {
+        if (rung.sid == sid) return rung.targetBitrate
+    }
+    return 0L
+}
+
+/** はしごの最下段。カタログが無ければ 0。 */
+private fun lowestRung(state: ReceiverState, stream: StreamState): Long {
+    val rungs = ladderOf(state, stream.senderId, stream.channel)
+    var lowest = -1L
+    for (rung in rungs) {
+        if (lowest < 0L || rung.sid < lowest) lowest = rung.sid
+    }
+    return if (lowest < 0L) 0L else lowest
+}
+
+/** はしごの最上段。カタログが無ければ 0。 */
+private fun highestRung(state: ReceiverState, stream: StreamState): Long {
+    val rungs = ladderOf(state, stream.senderId, stream.channel)
+    var top = -1L
+    for (rung in rungs) {
+        if (rung.sid > top) top = rung.sid
+    }
+    return if (top < 0L) 0L else top
+}
+
+private fun streamKey(stream: StreamState): String = "${stream.senderId}:${stream.channel}"
+
+// --- handleBudget ---
+
+/** goodput の観測。天井を押し上げるだけに使う（congestion.md 4.1）。 */
+/** 観測した goodput。天井を押し上げ、目標を上げる方向にだけ使う（congestion.md 4.1）。 */
+private fun handleGoodput(state: ReceiverState, bytesPerSec: Long): ReceiverStepResult {
+    if (bytesPerSec <= 0L) return ReceiverStepResult(state, emptyList())
+    val ceiling = if (bytesPerSec > state.targetCeilingBytesPerSec) bytesPerSec else state.targetCeilingBytesPerSec
+    val raised = if (bytesPerSec > state.targetBytesPerSec) bytesPerSec else state.targetBytesPerSec
+    val target = if (raised > ceiling) ceiling else raised
+    if (target == state.targetBytesPerSec && ceiling == state.targetCeilingBytesPerSec) {
+        return ReceiverStepResult(state, emptyList())
+    }
+    return reallocate(state.copy(targetBytesPerSec = target, targetCeilingBytesPerSec = ceiling))
+}
+
+private fun handleBudget(state: ReceiverState, bytesPerSec: Long): ReceiverStepResult {
+    val ceiling = if (bytesPerSec > state.targetCeilingBytesPerSec) bytesPerSec else state.targetCeilingBytesPerSec
+    return reallocate(state.copy(targetBytesPerSec = bytesPerSec, targetCeilingBytesPerSec = ceiling))
+}
+
+// --- handleCatalog ---
+
+private fun handleCatalog(state: ReceiverState, entries: List<CatalogLadder>): ReceiverStepResult {
+    val normalized = entries
+        .map { CatalogLadder(it.senderId, it.channel, it.rungs.sortedBy { r -> r.sid }) }
+        .sortedWith(compareBy({ it.senderId }, { it.channel }))
+    return reallocate(state.copy(catalog = normalized))
+}
+
+// --- handleSubscribeList ---
+
+private fun handleSubscribeList(state: ReceiverState, entries: List<SubscribeEntry>): ReceiverStepResult {
     val commands = mutableListOf<ReceiverCommand>()
     val kept = mutableListOf<StreamState>()
 
     for (entry in entries.sortedWith(entryOrder)) {
         val existing = findStream(state, entry.senderId, entry.channel)
         if (existing == null || existing.phase == StreamPhase.UNSUBSCRIBED) {
-            commands.add(
-                ReceiverCommand.SubscribeChange(
-                    to = entry.senderId,
-                    channel = entry.channel,
-                    want = true,
-                    maxSpatialId = entry.maxSpatialId,
-                    maxTemporalId = entry.maxTemporalId,
-                ),
-            )
-            commands.add(
-                ReceiverCommand.KeyframeRequest(entry.senderId, entry.channel, entry.maxSpatialId),
-            )
-            kept.add(
-                StreamState(
-                    senderId = entry.senderId,
-                    channel = entry.channel,
-                    phase = StreamPhase.SUBSCRIBED,
-                    spatialId = entry.maxSpatialId,
-                    temporalId = entry.maxTemporalId,
-                    displayWidth = existing?.displayWidth ?: 0L,
-                ),
-            )
+            // 新規購読は最下段から始める（congestion.md 6 節、ADR-0028）。
+            val dummy = StreamState(entry.senderId, entry.channel, StreamPhase.SUBSCRIBED, 0L, 0L, 0L)
+            val start = if (isAudio(entry.channel)) 0L else lowestRung(state, dummy)
+            commands.add(ReceiverCommand.SubscribeChange(entry.senderId, entry.channel, true, start, entry.maxTemporalId))
+            commands.add(ReceiverCommand.KeyframeRequest(entry.senderId, entry.channel, start))
+            kept.add(StreamState(
+                senderId = entry.senderId,
+                channel = entry.channel,
+                phase = StreamPhase.SUBSCRIBED,
+                spatialId = start,
+                temporalId = entry.maxTemporalId,
+                displayWidth = existing?.displayWidth ?: 0L,
+            ))
             continue
         }
         kept.add(existing.copy(phase = StreamPhase.SUBSCRIBED))
     }
 
-    // 一覧から外れたものは購読解除する（表 2 行目）。
     for (stream in state.streams) {
         val stillWanted = entries.any { it.senderId == stream.senderId && it.channel == stream.channel }
         if (!stillWanted && stream.phase != StreamPhase.UNSUBSCRIBED) {
-            commands.add(
-                ReceiverCommand.SubscribeChange(stream.senderId, stream.channel, false, 0L, 0L),
-            )
+            commands.add(ReceiverCommand.SubscribeChange(stream.senderId, stream.channel, false, 0L, 0L))
         }
     }
 
@@ -238,44 +319,32 @@ private fun handleSubscribeList(
     return ReceiverStepResult(after.state, commands + after.commands)
 }
 
-/** 送信者の退出。表 6 行目に対応する。 */
+// --- handleLeave ---
+
 private fun handleLeave(state: ReceiverState, id: Long): ReceiverStepResult {
     val streams = state.streams.filterNot { it.senderId == id }
-    if (streams.size == state.streams.size) {
-        return ReceiverStepResult(state, emptyList())
-    }
-    // 退出者の受信位置も除去する。残すと居ない相手へ ack を返し続ける。
+    if (streams.size == state.streams.size) return ReceiverStepResult(state, emptyList())
+    // 退出者の受信位置とはしごも除去する。残すと居ない相手へ ack を返し続ける。
     val received = state.received.filterNot { it.senderId == id }
-    return reallocate(state.copy(streams = streams, received = received))
+    val catalog = state.catalog.filterNot { it.senderId == id }
+    return reallocate(state.copy(streams = streams, received = received, catalog = catalog))
 }
 
-/** 表示・非表示。表 7 行目と 8 行目に対応する。 */
+// --- handleVisibility ---
+
 private fun handleVisibility(state: ReceiverState, visible: Boolean): ReceiverStepResult {
-    if (visible == state.visible) {
-        return ReceiverStepResult(state, emptyList())
-    }
+    if (visible == state.visible) return ReceiverStepResult(state, emptyList())
     val commands = mutableListOf<ReceiverCommand>()
     val streams = mutableListOf<StreamState>()
     for (stream in state.streams) {
         if (!visible && stream.phase == StreamPhase.SUBSCRIBED) {
-            // 非表示では購読を解除するが、状態は保持する（PAUSED）。
             commands.add(ReceiverCommand.SubscribeChange(stream.senderId, stream.channel, false, 0L, 0L))
             streams.add(stream.copy(phase = StreamPhase.PAUSED))
             continue
         }
         if (visible && stream.phase == StreamPhase.PAUSED) {
-            commands.add(
-                ReceiverCommand.SubscribeChange(
-                    stream.senderId,
-                    stream.channel,
-                    true,
-                    stream.spatialId,
-                    stream.temporalId,
-                ),
-            )
-            commands.add(
-                ReceiverCommand.KeyframeRequest(stream.senderId, stream.channel, stream.spatialId),
-            )
+            commands.add(ReceiverCommand.SubscribeChange(stream.senderId, stream.channel, true, stream.spatialId, stream.temporalId))
+            commands.add(ReceiverCommand.KeyframeRequest(stream.senderId, stream.channel, stream.spatialId))
             streams.add(stream.copy(phase = StreamPhase.SUBSCRIBED))
             continue
         }
@@ -284,16 +353,12 @@ private fun handleVisibility(state: ReceiverState, visible: Boolean): ReceiverSt
     return ReceiverStepResult(state.copy(visible = visible, streams = streams), commands)
 }
 
-/** 表示寸法の申告。未申告の相手は最低品質に留める（ADR-0015）。 */
-private fun handleDisplaySize(
-    state: ReceiverState,
-    senderId: Long,
-    channel: Long,
-    width: Long,
-): ReceiverStepResult {
+// --- handleDisplaySize ---
+
+private fun handleDisplaySize(state: ReceiverState, senderId: Long, channel: Long, width: Long): ReceiverStepResult {
     if (findStream(state, senderId, channel) == null) {
         return ReceiverStepResult(
-            state.copy(unexpectedEvents = state.unexpectedEvents + "displaySize"),
+            state.copy(unexpectedEvents = appendUnexpected(state.unexpectedEvents, "displaySize")),
             emptyList(),
         )
     }
@@ -303,34 +368,27 @@ private fun handleDisplaySize(
     return reallocate(state.copy(streams = streams))
 }
 
-/** 測定報告。勾配が劣化閾値を超えたら tier を 1 段下げ、回復閾値を下回ったら 1 段上げる。 */
-/**
- * 測定報告。規範は 2 つの層を定めている。
- *
- * 1. 状態機械（state-machines 3 節）: 勾配が閾値を超えたら tier を 1 段下げる
- * 2. 輻輳制御（congestion 4.2 の AIMD）: target を劣化時に 0.85 倍し、回復が 3 回
- *    連続したら RATE_PROBE_BPS を加える（上限を超えない）
- *
- * 0.85 は浮動小数点で計算しない。target * 17 / 20 の整数演算とし切り捨てる。
- */
+// --- handleReport ---
+
 private fun handleReport(state: ReceiverState, delayUs: List<Long>, t: Long): ReceiverStepResult {
+    // 標本が 2 個未満では勾配が定まらない。定まらない値で AIMD を動かしてはならない。
+    if (delayUs.size < 2) return ReceiverStepResult(state, emptyList())
     val trend = delaySlope(delayUs)
-    val degrading = trend.numerator * SHARD_TREND_ENTER_T2_DEN >
-        SHARD_TREND_ENTER_T2_NUM * trend.denominator
+    val degrading = trend.numerator * SHARD_TREND_ENTER_T2_DEN > SHARD_TREND_ENTER_T2_NUM * trend.denominator
     val recovering = trend.numerator * SHARD_TREND_EXIT_DEN < SHARD_TREND_EXIT_NUM * trend.denominator
 
-    // --- AIMD。target を更新する ---
     var target = state.targetBytesPerSec
     var holdUntil = state.rateHoldUntilMs
     var streak = state.recoverStreak
     if (degrading) {
         streak = 0L
-        // 待ちの間は減らさない。1 回の揺れで連続して落とさないためである。
         if (t >= state.rateHoldUntilMs) {
             val reduced = truncDiv(target * 17L, 20L)
-            if (reduced is Outcome.Ok) {
-                target = reduced.value
-            }
+            val lowered = if (reduced is Outcome.Ok) reduced.value else target
+            // 予兆で最低成立点を割らない（ADR-0040）
+            val floorResult = truncDiv(MIN_VIABLE_BPS, 8L)
+            val floor = if (floorResult is Outcome.Ok) floorResult.value else 0L
+            target = if (lowered < floor) floor else lowered
             holdUntil = t + RATE_HOLD_MS
         }
     } else if (recovering) {
@@ -345,50 +403,47 @@ private fun handleReport(state: ReceiverState, delayUs: List<Long>, t: Long): Re
         streak = 0L
     }
 
+    val afterRate = state.copy(
+        trend = trend,
+        targetBytesPerSec = target,
+        rateHoldUntilMs = holdUntil,
+        recoverStreak = streak,
+    )
+
     if (!degrading && !recovering) {
-        return ReceiverStepResult(
-            state.copy(
-                trend = trend,
-                targetBytesPerSec = target,
-                rateHoldUntilMs = holdUntil,
-                recoverStreak = streak,
-            ),
-            emptyList(),
-        )
+        return ReceiverStepResult(afterRate, emptyList())
     }
+
     val delta = if (degrading) -1L else 1L
     val commands = mutableListOf<ReceiverCommand>()
     val streams = mutableListOf<StreamState>()
-    for (stream in state.streams) {
-        if (stream.phase != StreamPhase.SUBSCRIBED) {
+    for (stream in afterRate.streams) {
+        if (stream.phase != StreamPhase.SUBSCRIBED || isAudio(stream.channel)) {
             streams.add(stream)
             continue
         }
-        val nextSpatial = clampSpatial(stream.spatialId + delta)
+        val floor = lowestRung(afterRate, stream)
+        val cap = rungCapFor(afterRate, stream)
+        val raw = stream.spatialId + delta
+        val nextSpatial = when {
+            raw < floor -> floor
+            raw > cap -> cap
+            else -> raw
+        }
         if (nextSpatial == stream.spatialId) {
             streams.add(stream)
             continue
         }
         streams.add(stream.copy(spatialId = nextSpatial))
         commands.add(ReceiverCommand.SetTier(stream.senderId, stream.channel, nextSpatial))
-        // spatialId が変わる場合のみキーフレームを要求する（表 4 行目と 3 行目の違い）。
-        if (nextSpatial > stream.spatialId) {
-            commands.add(ReceiverCommand.KeyframeRequest(stream.senderId, stream.channel, nextSpatial))
-        }
+        // 段が変わるとエンコーダの別ストリームへ切り替わるためキーフレームが必要である（ADR-0027 の 4）。
+        commands.add(ReceiverCommand.KeyframeRequest(stream.senderId, stream.channel, nextSpatial))
     }
-    return ReceiverStepResult(
-        state.copy(
-            trend = trend,
-            streams = streams,
-            targetBytesPerSec = target,
-            rateHoldUntilMs = holdUntil,
-            recoverStreak = streak,
-        ),
-        commands,
-    )
+    return ReceiverStepResult(afterRate.copy(streams = streams), commands)
 }
 
-/** メディアの転送。要求 tier を超えるユニットは転送しない。 */
+// --- handleMedia ---
+
 private fun handleMedia(state: ReceiverState, event: ReceiverEvent.Media): ReceiverStepResult {
     val stream = findStream(state, event.from, event.ch)
     if (stream == null || stream.phase != StreamPhase.SUBSCRIBED) {
@@ -397,24 +452,18 @@ private fun handleMedia(state: ReceiverState, event: ReceiverEvent.Media): Recei
     if (event.sid > stream.spatialId || event.tid > stream.temporalId) {
         return ReceiverStepResult(state, listOf(ReceiverCommand.Drop(1L, 1L)))
     }
-    // 受信した位置を記録する。ack はタイマーでまとめて返す（congestion.md 2 節）。
     return ReceiverStepResult(
         markReceived(state, event),
         listOf(ReceiverCommand.Forward(listOf(RECEIVER_SELF_ID))),
     )
 }
 
-/** 受信した位置を更新する。後戻りする値では更新しない。 */
 private fun markReceived(state: ReceiverState, event: ReceiverEvent.Media): ReceiverState {
-    if (event.seq <= 0L) {
-        return state
-    }
+    if (event.seq <= 0L) return state
     val existing = state.received.firstOrNull {
         it.senderId == event.from && it.channel == event.ch && it.spatialId == event.sid
     }
-    if (existing != null && existing.highestSeq >= event.seq) {
-        return state
-    }
+    if (existing != null && existing.highestSeq >= event.seq) return state
     val merged = (
         state.received.filterNot {
             it.senderId == event.from && it.channel == event.ch && it.spatialId == event.sid
@@ -423,88 +472,137 @@ private fun markReceived(state: ReceiverState, event: ReceiverEvent.Media): Rece
     return state.copy(received = merged)
 }
 
-/** 発話者を先に、次に senderId の昇順で並べる。順序は決定的でなければならない。 */
-private fun priorityRank(state: ReceiverState, stream: StreamState): Triple<Int, Long, Long> {
-    val speaker = if (state.activeSpeakerId == stream.senderId) 0 else 1
-    return Triple(speaker, stream.senderId, stream.channel)
+// --- reallocate ---
+
+/** 発話者を先に、音声を最優先に、次に senderId の昇順で並べる。 */
+private fun priorityOrder(state: ReceiverState, a: StreamState, b: StreamState): Int {
+    val aAudio = if (isAudio(a.channel)) 0 else 1
+    val bAudio = if (isAudio(b.channel)) 0 else 1
+    if (aAudio != bAudio) return aAudio - bAudio
+    val aSpeaker = if (state.activeSpeakerId == a.senderId) 0 else 1
+    val bSpeaker = if (state.activeSpeakerId == b.senderId) 0 else 1
+    if (aSpeaker != bSpeaker) return aSpeaker - bSpeaker
+    if (a.senderId != b.senderId) return a.senderId.compareTo(b.senderId)
+    return a.channel.compareTo(b.channel)
 }
 
 /**
- * 帯域予算から tier を配分する（congestion.md 4.3）。
- * 除算は整数で行い、切り捨てる。浮動小数点を使わない（ADR-0017）。
+ * 帯域予算から段を配分する（congestion.md 4.3、ADR-0027、ADR-0029）。
+ * linkBps = target*8 で AUDIO_ONLY の判定を行い、段を買う予算は linkBps*9/10。
  */
 private fun reallocate(state: ReceiverState): ReceiverStepResult {
     val commands = mutableListOf<ReceiverCommand>()
-    val budgetOutcome = truncDiv(state.targetBytesPerSec * 8L * 9L, 10L)
-    val budgetBps = when (budgetOutcome) {
-        is Outcome.Ok -> budgetOutcome.value
-        is Outcome.Err -> 0L
-    }
-    val highOutcome = truncDiv(budgetBps, V_4K60_TARGET_BITRATE)
-    val highQualityCount = when (highOutcome) {
-        is Outcome.Ok -> highOutcome.value
-        is Outcome.Err -> 0L
-    }
-    val thumbnailCost = V_360P15_TARGET_BITRATE
+    // 回線の速度（bits/sec）。AUDIO_ONLY の判定はこの値そのもので行う（10% を引く前）。
+    val linkBps = state.targetBytesPerSec * 8L
+    val budgetResult = truncDiv(linkBps * 9L, 10L)
+    val budgetBps = if (budgetResult is Outcome.Ok) budgetResult.value else 0L
 
-    val ordered = state.streams
-        .filter { it.phase == StreamPhase.SUBSCRIBED }
-        .sortedWith(
-            compareBy(
-                { priorityRank(state, it).first },
-                { priorityRank(state, it).second },
-                { priorityRank(state, it).third },
-            ),
+    // --- 音声だけの状態への出入り（ヒステリシス。ADR-0029 の 1） ---
+    val audioOnly = if (state.audioOnly) {
+        linkBps < AUDIO_ONLY_EXIT_BPS
+    } else {
+        linkBps < AUDIO_ONLY_ENTER_BPS
+    }
+
+    if (audioOnly) {
+        val streams = mutableListOf<StreamState>()
+        for (stream in state.streams) {
+            if (isAudio(stream.channel)) {
+                streams.add(stream)
+                continue
+            }
+            if (stream.phase == StreamPhase.SUBSCRIBED) {
+                commands.add(ReceiverCommand.SubscribeChange(stream.senderId, stream.channel, false, 0L, 0L))
+                streams.add(stream.copy(phase = StreamPhase.AUDIO_ONLY))
+                continue
+            }
+            streams.add(stream)
+        }
+        if (!state.degraded) {
+            commands.add(ReceiverCommand.Notify(DEGRADED_WARNING))
+        }
+        return ReceiverStepResult(
+            state.copy(streams = streams.sortedWith(streamOrder), audioOnly = true, degraded = true),
+            commands,
         )
+    }
 
-    val streams = mutableListOf<StreamState>()
-    var assignedHigh = 0L
+    // --- 映像へ戻す（AUDIO_ONLY から復帰する） ---
+    val revived = mutableListOf<StreamState>()
+    for (stream in state.streams) {
+        if (stream.phase == StreamPhase.AUDIO_ONLY) {
+            val low = lowestRung(state, stream)
+            revived.add(stream.copy(phase = StreamPhase.SUBSCRIBED, spatialId = low))
+            commands.add(ReceiverCommand.SubscribeChange(stream.senderId, stream.channel, true, low, stream.temporalId))
+            commands.add(ReceiverCommand.KeyframeRequest(stream.senderId, stream.channel, low))
+            continue
+        }
+        revived.add(stream)
+    }
+    val base = state.copy(streams = revived, audioOnly = false)
+
+    // --- 予算で段を買う ---
+    val ordered = base.streams
+        .filter { it.phase == StreamPhase.SUBSCRIBED }
+        .sortedWith { a, b -> priorityOrder(base, a, b) }
+
+    val assigned = mutableMapOf<String, Long>()
     var remaining = budgetBps
     var degraded = false
 
-    for (stream in state.streams) {
-        if (stream.phase != StreamPhase.SUBSCRIBED) {
+    for (stream in ordered) {
+        if (isAudio(stream.channel)) {
+            remaining -= costOf(base, stream, 0L)
+            continue
+        }
+        val floor = lowestRung(base, stream)
+        val cap = rungCapFor(base, stream)
+        var chosen = floor
+        var sid = cap
+        while (sid >= floor) {
+            val cost = costOf(base, stream, sid)
+            if (cost <= remaining) {
+                chosen = sid
+                break
+            }
+            sid -= 1L
+        }
+        val chosenCost = costOf(base, stream, chosen)
+        if (chosenCost > remaining) {
+            degraded = true
+        }
+        remaining -= chosenCost
+        assigned[streamKey(stream)] = chosen
+    }
+
+    val streams = mutableListOf<StreamState>()
+    for (stream in base.streams) {
+        val next = assigned[streamKey(stream)]
+        if (next == null || next == stream.spatialId) {
             streams.add(stream)
             continue
         }
-        val rank = ordered.indexOfFirst {
-            it.senderId == stream.senderId && it.channel == stream.channel
-        }.toLong()
-        val nextSpatial: Long
-        if (stream.displayWidth == 0L) {
-            // 表示寸法の申告が無い相手は最低品質に留める（ADR-0015）。
-            nextSpatial = DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID
-        } else if (assignedHigh < highQualityCount && rank < highQualityCount) {
-            nextSpatial = V_4K60_SPATIAL_ID
-            assignedHigh += 1L
-            remaining -= V_4K60_TARGET_BITRATE
-        } else if (remaining >= thumbnailCost) {
-            nextSpatial = V_360P15_SPATIAL_ID
-            remaining -= thumbnailCost
-        } else {
-            // 予算が尽きた。発話者のサムネイルのみを維持する（最低保証）。
-            nextSpatial = V_360P15_SPATIAL_ID
-            degraded = true
-        }
-        if (nextSpatial != stream.spatialId) {
-            commands.add(ReceiverCommand.SetTier(stream.senderId, stream.channel, nextSpatial))
-            if (nextSpatial > stream.spatialId) {
-                // spatialId が上がる場合はエンコーダ出力が切り替わるためキーフレームが必要である。
-                commands.add(
-                    ReceiverCommand.KeyframeRequest(stream.senderId, stream.channel, nextSpatial),
-                )
-            }
-        }
-        streams.add(stream.copy(spatialId = nextSpatial))
+        commands.add(ReceiverCommand.SetTier(stream.senderId, stream.channel, next))
+        commands.add(ReceiverCommand.KeyframeRequest(stream.senderId, stream.channel, next))
+        streams.add(stream.copy(spatialId = next))
     }
 
-    if (degraded && !state.degraded) {
-        // 最低保証（発話者のサムネイル 1 本と全員の音声）を下回った。利用側へ警告する。
+    if (degraded && !base.degraded) {
         commands.add(ReceiverCommand.Notify(DEGRADED_WARNING))
     }
 
     return ReceiverStepResult(
-        state.copy(streams = streams.sortedWith(streamOrder), degraded = degraded),
+        base.copy(streams = streams.sortedWith(streamOrder), degraded = degraded),
         commands,
     )
+}
+
+/**
+ * 表に無いイベントの記録に 1 件加える。上限を超えたら古い側を捨てる（ADR-0034）。
+ * 上限が無いと記録が無制限に伸び、Durable Object の記憶（128 MB。F-006）を食う。
+ */
+private fun appendUnexpected(events: List<String>, name: String): List<String> {
+    val appended = events + name
+    val limit = MAX_UNEXPECTED_EVENTS.toInt()
+    return if (appended.size > limit) appended.subList(appended.size - limit, appended.size) else appended
 }

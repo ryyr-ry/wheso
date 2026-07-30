@@ -31,6 +31,7 @@ inline constexpr std::int64_t E_RATE_LIMIT_MESSAGES_CLOSE_CODE = 4030;
 inline constexpr std::int64_t E_RATE_LIMIT_CONNECT_CLOSE_CODE = 4031;
 inline constexpr std::int64_t E_NODE_OVERLOADED_CLOSE_CODE = 4032;
 inline constexpr std::int64_t E_ROOM_FULL_CLOSE_CODE = 4033;
+inline constexpr std::int64_t E_ACK_TIMEOUT_CLOSE_CODE = 4034;
 inline constexpr std::int64_t E_EPOCH_STALE_CLOSE_CODE = 4040;
 inline constexpr std::int64_t E_MEETING_ENDED_CLOSE_CODE = 4041;
 inline constexpr std::int64_t E_EVICTED_CLOSE_CODE = 4042;

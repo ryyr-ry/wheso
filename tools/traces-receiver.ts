@@ -14,20 +14,68 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  type CatalogRung,
   initialReceiverState,
   receiverStep,
   type ReceiverEvent,
 } from "../packages/core/src/receiver-core.ts";
-import { TRACE_FORMAT_VERSION, V_4K60 } from "../packages/core/src/generated/constants.ts";
-import { CHANNEL_AUDIO, CHANNEL_VIDEO } from "../packages/core/src/generated/wire-layout.ts";
+import {
+  AUDIO_ONLY_ENTER_BPS,
+  AUDIO_ONLY_EXIT_BPS,
+  TRACE_FORMAT_VERSION,
+  V_1080P30,
+  V_360P15,
+  V_4K60,
+} from "../packages/core/src/generated/constants.ts";
+import {
+  CHANNEL_AUDIO,
+  CHANNEL_VIDEO,
+  MAX_TEMPORAL_ID,
+} from "../packages/core/src/generated/wire-layout.ts";
 import { createPrng, next } from "../packages/core/src/prng.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
 const vectorPath = join(root, "spec", "vectors", "trace-receiver.jsonl");
 
-/** 初期予算（bytes/sec）。4K60 を 2 本賄える量から始める。 */
-const INITIAL_BUDGET_BYTES_PER_SEC = 7_000_000;
+/**
+ * 段の上限。はしごの段番号であり、大域のプロファイル表とは対応しない（ADR-0026）。
+ * 生成するはしごは 3 段（0・1・2）である。
+ */
+const TOP_RUNG = 2;
+
+/** 3 段のはしご。代表点を使う（Q-021 の測定が済むまで）。 */
+const THREE_RUNGS: readonly CatalogRung[] = [
+  {
+    sid: 0,
+    width: V_360P15.width,
+    height: V_360P15.height,
+    framerate: V_360P15.framerate,
+    temporalLayers: V_360P15.temporalLayers,
+    targetBitrate: V_360P15.targetBitrate,
+  },
+  {
+    sid: 1,
+    width: V_1080P30.width,
+    height: V_1080P30.height,
+    framerate: V_1080P30.framerate,
+    temporalLayers: V_1080P30.temporalLayers,
+    targetBitrate: V_1080P30.targetBitrate,
+  },
+  {
+    sid: 2,
+    width: V_4K60.width,
+    height: V_4K60.height,
+    framerate: V_4K60.framerate,
+    temporalLayers: V_4K60.temporalLayers,
+    targetBitrate: V_4K60.targetBitrate,
+  },
+];
+
+/** 2 段のはしご。段数が送信者ごとに違うことを記録する。 */
+const TWO_RUNGS: readonly CatalogRung[] = [THREE_RUNGS[0], THREE_RUNGS[1]].filter(
+  (rung): rung is CatalogRung => rung !== undefined,
+);
 
 /** 乱数から [lo, hi] の整数を返す。整数演算のみ。 */
 function randRange(output: bigint, lo: number, hi: number): number {
@@ -45,6 +93,21 @@ function randRange(output: bigint, lo: number, hi: number): number {
  *   購読の追加と削除、表示寸法の申告、発話者の交替、予算の増減、
  *   遅延勾配による tier の上下、非表示と再表示、送信者の退出、メディアの転送と破棄。
  */
+/**
+ * 予算（bytes/sec）を、`reallocate` の判定値が境界の指定した側に落ちるように作る。
+ *
+ * `reallocate` は回線速度 `target × 8` を閾値と比べる。したがって
+ * `target = floor(閾値 / 8) + offset` とすれば境界の直上・直下を作れる。
+ * 整数除算のみで計算する（ADR-0017）。
+ */
+function enterBytes(offset: number): number {
+  return Math.trunc(AUDIO_ONLY_ENTER_BPS / 8) + offset;
+}
+
+function exitBytes(offset: number): number {
+  return Math.trunc(AUDIO_ONLY_EXIT_BPS / 8) + offset;
+}
+
 function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverEvent[] {
   const prng = createPrng(seed);
   if (!prng.ok) {
@@ -65,14 +128,25 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
    */
   const nextSeq = new Map<number, number>();
 
+  // はしごを配る（ADR-0027）。**これが無いと受信ノードは費用も段も決められない。**
+  // 段は 3 段（640/1920/3840）。全員が同じはしごを持つ場合と、2 段しか持たない場合を混ぜる。
+  events.push({
+    kind: "catalog",
+    entries: senders.map((senderId, index) => ({
+      senderId,
+      channel: CHANNEL_VIDEO,
+      rungs: (index % 2 === 0 ? THREE_RUNGS : TWO_RUNGS).map((rung) => ({ ...rung })),
+    })),
+  });
+
   // 購読の確立
   events.push({
     kind: "subscribe",
     entries: senders.map((senderId) => ({
       senderId,
       channel: CHANNEL_VIDEO,
-      maxSpatialId: V_4K60.spatialId,
-      maxTemporalId: 7,
+      maxSpatialId: TOP_RUNG,
+      maxTemporalId: MAX_TEMPORAL_ID,
     })),
   });
 
@@ -85,8 +159,8 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
   // 増減どちらの条件も満たさない標本列。連続回数が切れることを記録するために使う。
   const flat: number[] = new Array<number>(20).fill(20_000);
   for (let i = 0; i < 20; i += 1) {
-    rising.push(10_000 + i * 1_000);
-    falling.push(30_000 - i * 1_000);
+    rising.push(10_000 + i * 60_000);
+    falling.push(1_200_000 - i * 60_000);
   }
 
   for (let i = 0; i < steps; i += 1) {
@@ -94,7 +168,7 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
     if (roll < 40) {
       const senderIndex = randRange(advance(), 0, senders.length - 1);
       const from = senders[senderIndex] ?? senders[0] ?? 11;
-      const sid = randRange(advance(), 0, V_4K60.spatialId);
+      const sid = randRange(advance(), 0, TOP_RUNG);
       const tid = randRange(advance(), 0, 2);
       const ch = roll < 34 ? CHANNEL_VIDEO : CHANNEL_AUDIO;
       // 番号は基本的に増やすが、一定の割合で後戻りさせる（順序の逆転で更新しないことを検証する）。
@@ -126,9 +200,25 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
       events.push({ kind: "report", delayUs: roll % 2 === 0 ? rising : falling });
       continue;
     }
+    if (roll < 58) {
+      // キーフレーム要求（ADR-0039）。段は 0〜2 を回す。
+      events.push({
+        kind: "keyframeRequest",
+        senderId: 11 + (roll % 2),
+        channel: CHANNEL_VIDEO,
+        spatialId: roll % 3,
+      });
+      continue;
+    }
     if (roll < 68) {
       const budget = randRange(advance(), 100_000, 12_000_000);
       events.push({ kind: "budget", bytesPerSec: budget });
+      continue;
+    }
+    if (roll < 72) {
+      // 観測した goodput。**目標を下げない**ことを覆う（congestion.md 4.1）。
+      const observed = randRange(advance(), 0, 4_000_000);
+      events.push({ kind: "goodput", bytesPerSec: observed });
       continue;
     }
     if (roll < 78) {
@@ -158,8 +248,8 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
         entries: senders.slice(0, count).map((senderId) => ({
           senderId,
           channel: CHANNEL_VIDEO,
-          maxSpatialId: V_4K60.spatialId,
-          maxTemporalId: 7,
+          maxSpatialId: TOP_RUNG,
+          maxTemporalId: MAX_TEMPORAL_ID,
         })),
       });
       continue;
@@ -191,6 +281,41 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
     events.push({ kind: "report", delayUs: falling });
   }
 
+  // --- 音声だけの状態（ADR-0029）を確実に通す段 ---
+  //
+  // 予算を AUDIO_ONLY_ENTER_BPS より下へ落とすと、映像の購読を落として音声だけになる。
+  // 予算を AUDIO_ONLY_EXIT_BPS より上へ戻すと、**最下段から**映像へ復帰する。
+  // 混合イベント列では境界をまたぐ組み合わせが偶然にしか起きないため、専用の段を作る。
+  events.push({
+    kind: "subscribe",
+    entries: [
+      { senderId: 11, channel: CHANNEL_VIDEO, maxSpatialId: TOP_RUNG, maxTemporalId: MAX_TEMPORAL_ID },
+      { senderId: 11, channel: CHANNEL_AUDIO, maxSpatialId: 0, maxTemporalId: 0 },
+    ],
+  });
+  // 入る境界のすぐ上（映像は維持される）。
+  events.push({ kind: "budget", bytesPerSec: enterBytes(1) });
+  // 入る境界のすぐ下（映像を落とす）。
+  events.push({ kind: "budget", bytesPerSec: enterBytes(-1) });
+  // 出る境界のすぐ下（まだ戻らない。ヒステリシス）。
+  events.push({ kind: "budget", bytesPerSec: exitBytes(-1) });
+  // 出る境界のすぐ上（最下段から戻る）。
+  events.push({ kind: "budget", bytesPerSec: exitBytes(1) });
+
+  // **goodput は目標を下げない。** 媒体が止まって goodput が 0 になっても
+  // `AUDIO_ONLY` へ落ちてはならない（実測でここが壊れていた）。
+  events.push({ kind: "goodput", bytesPerSec: 0 });
+  events.push({ kind: "goodput", bytesPerSec: 1 });
+  events.push({ kind: "goodput", bytesPerSec: enterBytes(-1) });
+  // 上げる方向には効く（天井を押し上げる）。
+  events.push({ kind: "goodput", bytesPerSec: 12_000_000 });
+  events.push({ kind: "report", delayUs: [0, -1_000, -2_000, -3_000, -4_000] });
+  events.push({ kind: "report", delayUs: [0, -1_000, -2_000, -3_000, -4_000] });
+  events.push({ kind: "report", delayUs: [0, -1_000, -2_000, -3_000, -4_000] });
+  // 標本が 1 個の報告は勾配が定まらないため無視される。
+  events.push({ kind: "report", delayUs: [5_000] });
+  events.push({ kind: "report", delayUs: [] });
+
   return events;
 }
 
@@ -200,7 +325,7 @@ function runTrace(seed: bigint, steps: number): readonly string[] {
   const lines: string[] = [
     JSON.stringify({ v: TRACE_FORMAT_VERSION, unit: "receiver", seed: Number(seed) }),
   ];
-  let state = initialReceiverState(INITIAL_BUDGET_BYTES_PER_SEC);
+  let state = initialReceiverState();
   let t = 0;
   for (const event of events) {
     lines.push(JSON.stringify({ t, in: event }));

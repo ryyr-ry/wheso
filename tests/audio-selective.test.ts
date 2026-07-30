@@ -15,13 +15,17 @@ import assert from "node:assert/strict";
 import { initialState, step, type ShardEvent, type ShardState } from "../packages/core/src/shard-core.ts";
 import {
   AUDIO_SELECTIVE_FORWARD_COUNT,
+  AUDIO_SELECTIVE_MIN_COUNT,
   AUDIO_SPEAKER_HOLD_MS,
+  SHEDDING_HYSTERESIS_MS,
 } from "../packages/core/src/generated/constants.ts";
 import {
   CHANNEL_AUDIO,
   CHANNEL_VIDEO,
   FLAG_ACTIVE_SPEAKER,
   FLAG_END_OF_FRAME,
+  MAX_SPATIAL_ID,
+  MAX_TEMPORAL_ID,
 } from "../packages/core/src/generated/wire-layout.ts";
 
 /** 参加者を入れ、全員が全員を購読している状態を作る。 */
@@ -31,12 +35,35 @@ function meetingWith(senderIds: readonly number[], subscriberId: number, t = 0):
     state = step(state, { kind: "join", id }, t).state;
   }
   for (const id of senderIds) {
-    state = step(state, { kind: "subscribe", from: subscriberId, to: id, want: true, maxSpatialId: 3 }, t).state;
+    // 音声と映像の両方を購読する。購読は (subscriberId, targetId, channel) で一意である。
+    state = step(
+      state,
+      { kind: "subscribe", from: subscriberId, to: id, ch: CHANNEL_AUDIO, want: true, maxSpatialId: 0, maxTemporalId: 0 },
+      t,
+    ).state;
+    state = step(
+      state,
+      {
+        kind: "subscribe",
+        from: subscriberId,
+        to: id,
+        ch: CHANNEL_VIDEO,
+        want: true,
+        maxSpatialId: MAX_SPATIAL_ID,
+        maxTemporalId: MAX_TEMPORAL_ID,
+      },
+      t,
+    ).state;
   }
   return state;
 }
 
+/** 送信者ごとの音声の sequenceNumber。同一ストリーム内で単調増加させる。 */
+const audioSeq = new Map<number, number>();
+
 function audioFrom(senderId: number, speaking: boolean): ShardEvent {
+  const seq = (audioSeq.get(senderId) ?? 0) + 1;
+  audioSeq.set(senderId, seq);
   return {
     kind: "media",
     from: senderId,
@@ -46,6 +73,7 @@ function audioFrom(senderId: number, speaking: boolean): ShardEvent {
     key: false,
     bytes: 160,
     flags: speaking ? FLAG_END_OF_FRAME | FLAG_ACTIVE_SPEAKER : FLAG_END_OF_FRAME,
+    seq,
   };
 }
 
@@ -152,6 +180,7 @@ test("映像は選別転送の対象外である", () => {
       ch: CHANNEL_VIDEO,
       sid: 0,
       tid: 0,
+      seq: 1,
       key: true,
       bytes: 900,
       flags: FLAG_END_OF_FRAME,
@@ -204,4 +233,56 @@ test("上限ちょうどの発話者がいるとき、発話していない者�
   assert.equal(state.speakers.length, AUDIO_SELECTIVE_FORWARD_COUNT, "発話者が上限ちょうどである");
   const outcome = forwarded(state, audioFrom(silent, false), at);
   assert.equal(outcome.forwarded, true, "発話していない送信者の音声も通る");
+});
+
+test("**音声の本数は購読者ごとに帯域で決まる**（輻輳が深いほど減る。ADR-0029 の 2）", () => {
+  // 上限（5 名）を超える 7 名が発話している状態を作る。
+  const senders = [1, 2, 3, 4, 5, 6, 7];
+  let state = meetingWith(senders, 100, 0);
+  let t = 10;
+  for (const id of senders) {
+    state = step(state, audioFrom(id, true), t).state;
+    t += 5;
+  }
+
+  // NORMAL では上限どおり 5 名が通る。最も古い発話者 2 名は落ちる。
+  const forwardedAtNormal = senders.filter((id) => {
+    const result = step(state, audioFrom(id, false), t);
+    return result.commands.some((command) => command.kind === "forward");
+  });
+  assert.equal(
+    forwardedAtNormal.length,
+    AUDIO_SELECTIVE_FORWARD_COUNT,
+    `NORMAL では上限どおり（実際 ${String(forwardedAtNormal.length)}）`,
+  );
+
+  // 購読者の勾配を悪化させて輻輳の段を深くする。段が深いほど本数が減る。
+  const rising: number[] = [];
+  for (let i = 0; i < 20; i += 1) {
+    rising.push(10_000 + i * 60_000);
+  }
+  let degraded = step(state, { kind: "report", from: 100, delayUs: rising }, t).state;
+  let previous = forwardedAtNormal.length;
+  for (let stage = 0; stage < 4; stage += 1) {
+    t += SHEDDING_HYSTERESIS_MS + 1;
+    degraded = step(degraded, { kind: "timer" }, t).state;
+    // 発話の記録を作り直す。ヒステリシスの待ち（501 ms）を 2 回跨ぐと
+    // AUDIO_SPEAKER_HOLD_MS（800 ms）を超えて候補が消えるため、そのままでは
+    // 「候補が上限以下だから全員通る」状態になり、本数の判定にならない。
+    for (const id of senders) {
+      degraded = step(degraded, audioFrom(id, true), t).state;
+      t += 1;
+    }
+    const forwarded = senders.filter((id) => {
+      const result = step(degraded, audioFrom(id, false), t);
+      return result.commands.some((command) => command.kind === "forward");
+    });
+    assert.ok(
+      forwarded.length <= previous,
+      `段が深くなるほど本数は増えない（前 ${String(previous)} 後 ${String(forwarded.length)}）`,
+    );
+    previous = forwarded.length;
+  }
+  assert.ok(previous >= AUDIO_SELECTIVE_MIN_COUNT, "**1 本は必ず残る**");
+  assert.ok(previous < AUDIO_SELECTIVE_FORWARD_COUNT, "実際に減っている");
 });

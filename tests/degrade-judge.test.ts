@@ -16,6 +16,7 @@ import {
   judgeContinuity,
   judgeDrops,
   judgeHashes,
+  judgeAvSkew,
   judgeKeyframeRequests,
   judgeMonotonic,
   type DegradeRecord,
@@ -202,4 +203,98 @@ test("A-3: 同じ層の中の逆行は検出する", () => {
   const violations = judgeMonotonic({ ...base, received: broken });
   assert.equal(violations.length, 1);
   assert.equal(violations[0]?.judgement, "A-3");
+});
+
+/* ------------------------------------------------------------------------- */
+/* 判定 D-1: 音声と映像のずれ（ADR-0028、F-043）                              */
+/* ------------------------------------------------------------------------- */
+
+/** 映像と音声が同じ番号で対応している記録を作る。ずれを `skewMs` で与える。 */
+function syncedRecord(count: number, skewMs: number): DegradeRecord {
+  const base = healthyRecord(count);
+  const played = [];
+  const presented = [];
+  for (let i = 1; i <= count; i += 1) {
+    const audioAt = i * 20;
+    played.push({ frameIndex: i, atMs: audioAt });
+    presented.push({ frameIndex: i, atMs: audioAt + skewMs });
+  }
+  return { ...base, playedAudio: played, presentedVideo: presented };
+}
+
+test("D-1: ずれが無ければ違反にならない", () => {
+  assert.deepEqual(judgeAvSkew(syncedRecord(10, 0), 22, 30), []);
+});
+
+test("D-1: 許容の内側（境界）は違反にならない", () => {
+  // 映像が遅れる方向（音声先行）の境界。
+  assert.deepEqual(judgeAvSkew(syncedRecord(10, 22), 22, 30), []);
+  // 映像が先行する方向（音声遅れ）の境界。
+  assert.deepEqual(judgeAvSkew(syncedRecord(10, -30), 22, 30), []);
+});
+
+test("**D-1 の否定対照: 意図的に 100 ms ずらすと落ちる**", () => {
+  const lead = judgeAvSkew(syncedRecord(10, 100), 22, 30);
+  assert.ok(lead.length > 0, "音声先行の 100 ms を検出する");
+  assert.ok(lead.every((v) => v.judgement === "D-1"));
+  assert.ok(
+    lead.some((v) => v.detail.includes("音声が先行しすぎている")),
+    `内容に方向が出る（実際 ${JSON.stringify(lead)}）`,
+  );
+
+  const lag = judgeAvSkew(syncedRecord(10, -100), 22, 30);
+  assert.ok(lag.length > 0, "音声遅れの 100 ms を検出する");
+  assert.ok(lag.some((v) => v.detail.includes("音声が遅れすぎている")));
+});
+
+test("**D-1 の許容は非対称である**（音声先行に厳しい。F-043）", () => {
+  // 25 ms の音声先行は落ちるが、25 ms の音声遅れは落ちない。
+  assert.ok(judgeAvSkew(syncedRecord(10, 25), 22, 30).length > 0, "音声先行 25 ms は落ちる");
+  assert.deepEqual(judgeAvSkew(syncedRecord(10, -25), 22, 30), [], "音声遅れ 25 ms は通る");
+});
+
+test("D-1: 対応する音声が再生されていないフレームは違反である（音声は破棄禁止）", () => {
+  const record = syncedRecord(5, 0);
+  const missing: DegradeRecord = {
+    ...record,
+    playedAudio: (record.playedAudio ?? []).filter((entry) => entry.frameIndex !== 3),
+  };
+  const violations = judgeAvSkew(missing, 22, 30);
+  assert.equal(violations.length, 1);
+  assert.ok(violations[0]?.detail.includes("対応する音声が再生されていない"));
+});
+
+test("D-1: 記録が無ければ判定しない（**合格ではなく未判定である**）", () => {
+  const base = healthyRecord(5);
+  assert.deepEqual(judgeAvSkew(base, 22, 30), [], "記録が無いので空を返す");
+  // judgeAll でも空になる。呼び出し側が記録を用意する責務を持つ。
+  const violations = judgeAll(base, { maxGapMs: 1000, requireComplete: true });
+  assert.ok(
+    violations.every((v) => v.judgement !== "D-1"),
+    "D-1 は現れない",
+  );
+});
+
+test("D-1: 単発の外れ値と定常のずれを区別して報告する", () => {
+  const record = syncedRecord(100, 0);
+  // 1 件だけ大きくずらす。最大値では落ちるが、p99 の報告は別に出る。
+  const presented = [...(record.presentedVideo ?? [])];
+  const first = presented[0];
+  assert.ok(first !== undefined);
+  presented[0] = { frameIndex: first.frameIndex, atMs: first.atMs + 500 };
+  const violations = judgeAvSkew({ ...record, presentedVideo: presented }, 22, 30);
+  assert.ok(violations.some((v) => v.detail.includes("音声が先行しすぎている")), "最大値で落ちる");
+  assert.ok(
+    !violations.some((v) => v.detail.includes("p99")),
+    "1 件の外れ値では p99 の違反は出さない",
+  );
+});
+
+test("D-1 は judgeAll に組み込まれている", () => {
+  const record = syncedRecord(10, 100);
+  const violations = judgeAll(record, { maxGapMs: 1000, requireComplete: false });
+  assert.ok(
+    violations.some((v) => v.judgement === "D-1"),
+    "judgeAll が D-1 を数える",
+  );
 });

@@ -101,7 +101,8 @@ export const AUDIO_SELECTIVE_FORWARD_COUNT = 5;
 /** 発話停止後も転送対象に残す時間 */
 export const AUDIO_SPEAKER_HOLD_MS = 800;
 export const AUDIO_DTX_ENABLED = true;
-export const AUDIO_FEC_ENABLED = true;
+/** TCP 上ではパケットロスによる欠落が起きないため、in-band FEC は 1 バイトも役に立たずビットレートだけを押し上げる（ADR-0030、congestion.md 0 節） */
+export const AUDIO_FEC_ENABLED = false;
 
 /* shardCapacity */
 /** 標準構成（HQ 1 + LQ N-2）でメッセージ予算に到達する人数。根拠 F-024 */
@@ -122,10 +123,10 @@ export const V_FULL_MESH_MAX_360P15 = 37;
 export const REPORT_INTERVAL_MS = 200;
 /** 200ms × 20 = 4 秒の観測窓 */
 export const DELAY_TREND_WINDOW = 20;
-/** 暫定値。未検証 Q-012 */
-export const DELAY_TREND_DEGRADE = 0.01;
-/** ヒステリシスのため劣化閾値より小さい。未検証 Q-012 */
-export const DELAY_TREND_RECOVER = -0.005;
+/** 健全な回線での勾配の最大 1,495 と輻輳時の最小 28,896 の間（F-048）。単位はマイクロ秒/標本である。旧値 0.01 は無次元の比として与えられており、比較の相手が勾配（マイクロ秒/標本）であるため常に成立していた（ADR-0037）。ADR-0037 */
+export const DELAY_TREND_DEGRADE = 5000;
+/** 健全な回線での勾配の最大 1,495 を含み、輻輳時の最小 28,896 を含まない上限（F-048）。「遅延が増えていない」を回復の条件とする。旧値 -0.005 は健全時の中央 -39 でも満たされず、目標を上げられなかった（ADR-0037）。ADR-0037 */
+export const DELAY_TREND_RECOVER = 1500;
 export const KEYFRAME_REQUEST_MIN_INTERVAL_MS = 500;
 export const AUDIO_STALL_RESET_MS = 500;
 /** 予備接続を常時保持するため短くできる */
@@ -140,6 +141,18 @@ export const SEND_WINDOW_MS = 200;
 export const ACK_INTERVAL_MS = 50;
 /** ack 100 回連続欠落 */
 export const ACK_TIMEOUT_MS = 5000;
+/** 上りの滞留が UPLINK_BACKLOG_BYTES を超えた観測が何回連続したら降格するか。congestion.md 3 節の「3 回連続（200 ms 周期）」。1 回で降格すると正常な送信の揺れで誤検知する */
+export const UPLINK_DEGRADE_STREAK = 3;
+/** 滞留が 0 の状態がこの時間続いたら 1 段昇格する。congestion.md 3 節の「5 秒」 */
+export const UPLINK_RECOVER_MS = 5000;
+/** 降格の直後はこの時間だけ昇格しない。congestion.md 3 節の「直近の降格から 10 秒」。上りの回復判定（5 秒）の 2 倍にして振動を防ぐ */
+export const UPLINK_UPGRADE_HOLD_MS = 10000;
+/** 符号化の待ち行列（encodeQueueSize）がこの値を超えた状態が続いたら降格する。client-architecture.md 10 節。3 は「1 フレームの符号化中に次の 2 枚が待っている」状態であり、実時間に追いついていない */
+export const ENCODE_QUEUE_LIMIT = 3;
+/** 符号化の待ち行列が上限を超えた状態がこの時間続いたら降格する。client-architecture.md 10 節の「2 秒」 */
+export const ENCODE_QUEUE_HOLD_MS = 2000;
+/** 発熱による降格の後はこの時間だけ昇格しない。client-architecture.md 10 節の「30 秒」。上りの昇格待ち（10 秒）より長いのは、発熱が回復するのに時間がかかるためである */
+export const THERMAL_UPGRADE_HOLD_MS = 30000;
 /** 4K60 の 2 フレーム分。ADR-0014 */
 export const UPLINK_BACKLOG_BYTES = 100000;
 /** レート減少後の観測期間 */
@@ -152,26 +165,38 @@ export const RATE_RECOVER_STREAK = 3;
 export const RATE_DECREASE_FACTOR = 0.85;
 /** 60 fps の 2 フレーム分 */
 export const LATE_FRAME_TOLERANCE_MS = 33;
-/** 360p15 200,000 + 音声 32,000 */
-export const MIN_VIABLE_BPS = 232000;
-/** DELAY_TREND_DEGRADE を有理数 1/100 として表した分子。コアは浮動小数点を使わないため、閾値も整数対で与える。ADR-0017 */
-export const DELAY_TREND_DEGRADE_NUM = 1;
-/** 同分母。ADR-0017 */
-export const DELAY_TREND_DEGRADE_DEN = 100;
-/** DELAY_TREND_RECOVER を有理数 -1/200 として表した分子。ADR-0017 */
-export const DELAY_TREND_RECOVER_NUM = -1;
-/** 同分母。ADR-0017 */
-export const DELAY_TREND_RECOVER_DEN = 200;
+/** ヘッダを含めた実効レートで再導出（ADR-0029 の 3）。音声 1 本 41,600 + 360p15 1 本 203,360。音声 1 本 = (MESSAGE_HEADER_BYTES 8 + AUDIO_UNITS_PER_MESSAGE 2 × (UNIT_HEADER_BYTES 20 + A_VOICE.bytesPerPacket 80)) × 8 × 1000 / AUDIO_BUNDLE_MS 40。360p15 = 200,000 + 15 fps × (8 + 20) × 8。旧値 232,000 はヘッダを無視していた */
+export const MIN_VIABLE_BPS = 244960;
+/** MIN_VIABLE_BPS と同じ。これを下回ったら映像の購読を落として音声だけにする（ADR-0029 の 1） */
+export const AUDIO_ONLY_ENTER_BPS = 244960;
+/** MIN_VIABLE_BPS 244,960 の 1.83 倍ではなく、音声 5 本 208,000 + 360p15 203,360 + 余裕 36,960（音声 1 本ぶんに近い値）。映像へ戻す条件を入る条件より高くしてヒステリシスを作る（ADR-0029 の 1） */
+export const AUDIO_ONLY_EXIT_BPS = 448320;
+/** 帯域が足りないときに残す音声の本数の下限。1 本を切ると会議が成立しない（ADR-0029 の 4 の優先順位の最上位） */
+export const AUDIO_SELECTIVE_MIN_COUNT = 1;
+/** DELAY_TREND_DEGRADE を有理数 5000/1 として表した分子。コアは浮動小数点を使わない。ADR-0037 */
+export const DELAY_TREND_DEGRADE_NUM = 5000;
+/** 同分母。ADR-0037 */
+export const DELAY_TREND_DEGRADE_DEN = 1;
+/** DELAY_TREND_RECOVER を有理数 1500/1 として表した分子。ADR-0037 */
+export const DELAY_TREND_RECOVER_NUM = 1500;
+/** 同分母。ADR-0037 */
+export const DELAY_TREND_RECOVER_DEN = 1;
 
 /* jitterBuffer */
 export const VIDEO_JITTER_MIN_FRAMES = 2;
 export const VIDEO_JITTER_MAX_FRAMES = 10;
 export const AUDIO_JITTER_MIN_PACKETS = 2;
 export const AUDIO_JITTER_MAX_PACKETS = 8;
-/** この範囲では補正しない */
+/** この範囲では補正しない（不感帯）。ITU-R BT.1359-0 の送出許容（音声先行 +22.5 ms）の内側に取る。F-043 */
 export const AV_SKEW_TOLERANCE_MS = 20;
-/** 超過時は次のキーフレームまでスキップ */
-export const AV_SKEW_RESYNC_MS = 200;
+/** 音声が映像より先行してよい上限。ITU-R BT.1359-0 の +22.5 ms を整数へ切り捨てた値。許容は非対称であり、人は音声先行に厳しい。F-043、ADR-0028 */
+export const AV_SKEW_AUDIO_LEAD_MAX_MS = 22;
+/** 音声が映像より遅れてよい上限。ITU-R BT.1359-0 の -30 ms。F-043、ADR-0028 */
+export const AV_SKEW_AUDIO_LAG_MAX_MS = 30;
+/** ドリフト補正の 1 回あたりの刻み（マイクロ秒）。48 kHz の 1 標本は 20.83 µs であり、これを切り捨てた値。1 パケット（OPUS_FRAME_MS = 20 ms）あたり 1 標本の挿入または削除で吸収できる最小の量である。20 µs / 20 ms = 1000 ppm までのクロック差に追従できる。追従の十分性は Q-023 で確かめる。ADR-0028 */
+export const AV_DRIFT_STEP_US = 20;
+/** これを超える欠落は不連続として扱い、対応付けを作り直す。映像のジッタバッファの最大深度（VIDEO_JITTER_MAX_FRAMES 10 / 60 fps = 167 ms）の 6 倍を超える欠落は、回線の揺れでは説明できない。ADR-0028 */
+export const AV_RESYNC_GAP_MS = 1000;
 
 /* timeouts */
 /** DO 間接続の実測 438ms の 10 倍以上。根拠 F-016 */
@@ -207,8 +232,8 @@ export const FMIX32_C2 = 3266489909;
 /* slo */
 export const STALL_RATIO_P95 = 0.005;
 export const AUDIO_GAP_RATIO_P95 = 0.001;
-/** 人間の知覚閾値 */
-export const AV_SKEW_MS_P99 = 80;
+/** ITU-R BT.1359-0 の送出許容のうち緩い側（音声遅れ 30 ms）。旧値 80 は音声先行方向で検知閾値（+45 ms）を超えており、ずれが見える水準であった。F-043、ADR-0028 */
+export const AV_SKEW_MS_P99 = 30;
 export const KEYFRAME_REQUEST_RATE_P95 = 1;
 /** クライアント↔DO 往復 25ms + DO 間 2ms + 処理。根拠 F-017,F-018 */
 export const GLASS_TO_GLASS_MS_P50 = 150;
@@ -278,28 +303,32 @@ export const SHARD_UTIL_EXIT_SPATIAL_DEN = 10;
 export const SHARD_UTIL_EXIT_KEY_ONLY_NUM = 1;
 /** KEY_ONLY → SHEDDING_SPATIAL の util 閾値 1.0 の分母。ADR-0017 */
 export const SHARD_UTIL_EXIT_KEY_ONLY_DEN = 1;
-/** NORMAL → SHEDDING_T2 の maxTrend 閾値 0.01 の分子。ADR-0017 */
-export const SHARD_TREND_ENTER_T2_NUM = 1;
-/** NORMAL → SHEDDING_T2 の maxTrend 閾値 0.01 の分母。ADR-0017 */
-export const SHARD_TREND_ENTER_T2_DEN = 100;
-/** SHEDDING_T2 → SHEDDING_T1 の maxTrend 閾値 0.03 の分子。ADR-0017 */
-export const SHARD_TREND_ENTER_T1_NUM = 3;
-/** SHEDDING_T2 → SHEDDING_T1 の maxTrend 閾値 0.03 の分母。ADR-0017 */
-export const SHARD_TREND_ENTER_T1_DEN = 100;
-/** SHEDDING_T1 → SHEDDING_SPATIAL の maxTrend 閾値 0.06 の分子。ADR-0017 */
-export const SHARD_TREND_ENTER_SPATIAL_NUM = 3;
-/** SHEDDING_T1 → SHEDDING_SPATIAL の maxTrend 閾値 0.06 の分母。ADR-0017 */
-export const SHARD_TREND_ENTER_SPATIAL_DEN = 50;
-/** SHEDDING_SPATIAL → KEY_ONLY の maxTrend 閾値 0.1 の分子。ADR-0017 */
-export const SHARD_TREND_ENTER_KEY_ONLY_NUM = 1;
-/** SHEDDING_SPATIAL → KEY_ONLY の maxTrend 閾値 0.1 の分母。ADR-0017 */
-export const SHARD_TREND_ENTER_KEY_ONLY_DEN = 10;
-/** 回復側の maxTrend 閾値 -0.005 の分子。ADR-0017 */
-export const SHARD_TREND_EXIT_NUM = -1;
-/** 回復側の maxTrend 閾値 -0.005 の分母。ADR-0017 */
-export const SHARD_TREND_EXIT_DEN = 200;
+/** 最初の段。健全時の最大 1,495 の 3.3 倍（F-048）。単位はマイクロ秒/標本。ADR-0037 */
+export const SHARD_TREND_ENTER_T2_NUM = 5000;
+/** 同分母。ADR-0037 */
+export const SHARD_TREND_ENTER_T2_DEN = 1;
+/** 8 Mbps 過剰時の中央 44,503 に至る途中（F-048）。旧比 1:3 を保つ。単位はマイクロ秒/標本。ADR-0037 */
+export const SHARD_TREND_ENTER_T1_NUM = 15000;
+/** 同分母。ADR-0037 */
+export const SHARD_TREND_ENTER_T1_DEN = 1;
+/** 8 Mbps 過剰時の中央 44,503 を下回る（F-048）。旧比 1:6 を保つ。単位はマイクロ秒/標本。ADR-0037 */
+export const SHARD_TREND_ENTER_SPATIAL_NUM = 30000;
+/** 同分母。ADR-0037 */
+export const SHARD_TREND_ENTER_SPATIAL_DEN = 1;
+/** 8 Mbps 過剰時の中央 44,503 を上回り 16 Mbps 過剰時の中央 237,691 を下回る（F-048）。旧比 1:10 を保つ。単位はマイクロ秒/標本。ADR-0037 */
+export const SHARD_TREND_ENTER_KEY_ONLY_NUM = 50000;
+/** 同分母。ADR-0037 */
+export const SHARD_TREND_ENTER_KEY_ONLY_DEN = 1;
+/** 健全な回線での勾配の最大 1,495 を含み、輻輳時の最小 28,896 を含まない上限（F-048）。「遅延が増えていない」を回復の条件とする。旧値 -0.005 は健全時の中央 -39 でも満たされず、目標を上げられなかった（ADR-0037）。ADR-0037 */
+export const SHARD_TREND_EXIT_NUM = 1500;
+/** 同分母。ADR-0037 */
+export const SHARD_TREND_EXIT_DEN = 1;
 /** KEY_ONLY → SHEDDING_SPATIAL の maxTrend 閾値 0 の分子。ADR-0017 */
 export const SHARD_TREND_EXIT_KEY_ONLY_NUM = 0;
 /** KEY_ONLY → SHEDDING_SPATIAL の maxTrend 閾値 0 の分母。ADR-0017 */
 export const SHARD_TREND_EXIT_KEY_ONLY_DEN = 1;
+
+/* observability */
+/** 表に無いイベントの記録の上限。無制限に積むと Durable Object の記憶（128 MB。F-006）を食う。原因の特定には直近の数十件で足りるため、古い側を捨てる。根拠 F-006 */
+export const MAX_UNEXPECTED_EVENTS = 64;
 

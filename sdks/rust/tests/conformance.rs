@@ -174,9 +174,9 @@ fn discardable_matches_specification() {
 #[test]
 fn slope_and_thresholds_match_specification() {
     // 単調増加は正、一定は 0、減少は負。
-    let rising: Vec<i64> = (0..20).map(|i| 10_000 + i * 1_000).collect();
+    let rising: Vec<i64> = (0..20).map(|i| 10_000 + i * 60_000).collect();
     let flat: Vec<i64> = vec![10_000; 20];
-    let falling: Vec<i64> = (0..20).map(|i| 30_000 - i * 1_000).collect();
+    let falling: Vec<i64> = (0..20).map(|i| 1_200_000 - i * 60_000).collect();
 
     assert!(delay_slope(&rising).numerator > 0);
     assert_eq!(delay_slope(&flat).numerator, 0);
@@ -184,6 +184,8 @@ fn slope_and_thresholds_match_specification() {
 
     assert!(is_degrading(delay_slope(&rising)), "増加は劣化と判定する");
     assert!(!is_degrading(delay_slope(&flat)), "一定は劣化でない");
+    // 平坦は回復である（待ち行列が伸びていない）。単位はマイクロ秒/標本（ADR-0037）。
+    assert!(is_recovering(delay_slope(&flat)), "一定は回復と判定する");
     assert!(is_recovering(delay_slope(&falling)), "減少は回復と判定する");
 
     // 分母は常に正である（conformance.md 3.3）。

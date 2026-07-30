@@ -159,9 +159,9 @@ class ConformanceTest {
 
     @Test
     fun slopeAndThresholdsMatchSpecification() {
-        val rising = (0 until 20).map { 10000L + it * 1000L }
+        val rising = (0 until 20).map { 10000L + it * 60000L }
         val flat = (0 until 20).map { 10000L }
-        val falling = (0 until 20).map { 30000L - it * 1000L }
+        val falling = (0 until 20).map { 1200000L - it * 60000L }
 
         assertTrue(delaySlope(rising).numerator > 0)
         assertEquals(0L, delaySlope(flat).numerator)

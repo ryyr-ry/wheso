@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use wheso_client::receiver_core::{
-    initial_receiver_state, receiver_step, ReceiverCommand, ReceiverEvent, SubscribeEntry,
+    initial_receiver_state, receiver_step, CatalogLadder, CatalogRung,
+    ReceiverCommand, ReceiverEvent, SubscribeEntry,
 };
 
 fn trace_path() -> PathBuf {
@@ -43,11 +44,36 @@ fn to_event(input: &Value) -> Option<ReceiverEvent> {
         "leave" => Some(ReceiverEvent::Leave { id: input.get("id")?.as_i64()? }),
         "visibility" => Some(ReceiverEvent::Visibility { visible: input.get("visible")?.as_bool()? }),
         "budget" => Some(ReceiverEvent::Budget { bytes_per_sec: input.get("bytesPerSec")?.as_i64()? }),
+        "goodput" => Some(ReceiverEvent::Goodput { bytes_per_sec: input.get("bytesPerSec")?.as_i64()? }),
         "activeSpeaker" => {
             // null は「発話者なし」を意味する。欄の欠落と区別する。
             let value = input.get("id")?;
             let id = if value.is_null() { None } else { Some(value.as_i64()?) };
             Some(ReceiverEvent::ActiveSpeaker { id })
+        }
+        "catalog" => {
+            let raw = input.get("entries")?.as_array()?;
+            let mut entries = Vec::with_capacity(raw.len());
+            for entry in raw {
+                let rungs_arr = entry.get("rungs")?.as_array()?;
+                let mut rungs = Vec::with_capacity(rungs_arr.len());
+                for rung in rungs_arr {
+                    rungs.push(CatalogRung {
+                        sid: rung.get("sid")?.as_i64()?,
+                        width: rung.get("width")?.as_i64()?,
+                        height: rung.get("height")?.as_i64()?,
+                        framerate: rung.get("framerate")?.as_i64()?,
+                        temporal_layers: rung.get("temporalLayers")?.as_i64()?,
+                        target_bitrate: rung.get("targetBitrate")?.as_i64()?,
+                    });
+                }
+                entries.push(CatalogLadder {
+                    sender_id: entry.get("senderId")?.as_i64()?,
+                    channel: entry.get("channel")?.as_i64()?,
+                    rungs,
+                });
+            }
+            Some(ReceiverEvent::Catalog { entries })
         }
         "displaySize" => Some(ReceiverEvent::DisplaySize {
             sender_id: input.get("senderId")?.as_i64()?,
@@ -71,6 +97,11 @@ fn to_event(input: &Value) -> Option<ReceiverEvent> {
             bytes: input.get("bytes").and_then(Value::as_i64).unwrap_or(0),
             flags: input.get("flags").and_then(Value::as_i64).unwrap_or(0),
             seq: input.get("seq").and_then(Value::as_i64).unwrap_or(0),
+        }),
+        "keyframeRequest" => Some(ReceiverEvent::KeyframeRequest {
+            sender_id: input.get("senderId")?.as_i64()?,
+            channel: input.get("channel")?.as_i64()?,
+            spatial_id: input.get("spatialId")?.as_i64()?,
         }),
         "timer" => Some(ReceiverEvent::Timer),
         _ => None,
@@ -115,9 +146,7 @@ fn to_json(command: &ReceiverCommand) -> Value {
     }
 }
 
-/// 予算の初期値。生成器（tools/traces-receiver.ts）と一致させる必要がある。
-/// 一致しなければ最初の再配分から出力が分かれる。
-const INITIAL_BUDGET_BYTES_PER_SEC: i64 = 7_000_000;
+/// 予算の初期値は規範が定める最低の成立点から始まる（引数不要）。
 
 #[test]
 fn frozen_receiver_trace_matches_typescript_reference() {
@@ -136,7 +165,7 @@ fn frozen_receiver_trace_matches_typescript_reference() {
     };
     assert_eq!(header.get("unit").and_then(Value::as_str), Some("receiver"), "受信ノードのトレースである");
 
-    let mut state = initial_receiver_state(INITIAL_BUDGET_BYTES_PER_SEC);
+    let mut state = initial_receiver_state();
     let mut pending: Option<ReceiverEvent> = None;
     // 入力行の時刻。AIMD の待ち（RATE_HOLD_MS）の判定に使う。
     let mut pending_t: i64 = 0;

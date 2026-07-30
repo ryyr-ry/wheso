@@ -8,24 +8,16 @@ import assert from "node:assert/strict";
 
 import {
   audioJitterPackets,
-  decidePlayout,
   jitterP99Ms,
   videoJitterFrames,
 } from "../packages/client/src/sync/jitter-buffer.ts";
 import {
   AUDIO_JITTER_MAX_PACKETS,
   AUDIO_JITTER_MIN_PACKETS,
-  LATE_FRAME_TOLERANCE_MS,
   OPUS_FRAME_MS,
   VIDEO_JITTER_MAX_FRAMES,
   VIDEO_JITTER_MIN_FRAMES,
 } from "../packages/core/src/generated/constants.ts";
-import {
-  CHANNEL_AUDIO,
-  CHANNEL_VIDEO,
-  FLAG_END_OF_FRAME,
-  FLAG_KEY,
-} from "../packages/core/src/generated/wire-layout.ts";
 
 test("映像の深度は式どおりで下限と上限に収まる", () => {
   // 60 fps でジッタ 0 なら ceil(0) + 1 = 1 → 下限 2 に丸められる。
@@ -78,42 +70,3 @@ test("p99 は標本を昇順に見た上位 1% の境界を返し、入力を壊
   assert.equal(jitterP99Ms(twoOutliers), 50);
 });
 
-test("再生予定が未来のユニットは待つ", () => {
-  const decision = decidePlayout(
-    { channel: CHANNEL_VIDEO, flags: FLAG_END_OF_FRAME, playoutAtMs: 1000 },
-    900,
-  );
-  assert.equal(decision, "wait");
-});
-
-test("許容範囲内の遅れは復号する", () => {
-  const decision = decidePlayout(
-    { channel: CHANNEL_VIDEO, flags: FLAG_END_OF_FRAME, playoutAtMs: 1000 },
-    1000 + LATE_FRAME_TOLERANCE_MS,
-  );
-  assert.equal(decision, "decode");
-});
-
-test("許容範囲を超えて遅れた映像は捨てる", () => {
-  const decision = decidePlayout(
-    { channel: CHANNEL_VIDEO, flags: FLAG_END_OF_FRAME, playoutAtMs: 1000 },
-    1000 + LATE_FRAME_TOLERANCE_MS + 1,
-  );
-  assert.equal(decision, "discard");
-});
-
-test("遅れてもキーフレームは復号する（参照連鎖の起点）", () => {
-  const decision = decidePlayout(
-    { channel: CHANNEL_VIDEO, flags: FLAG_END_OF_FRAME | FLAG_KEY, playoutAtMs: 1000 },
-    5000,
-  );
-  assert.equal(decision, "decode");
-});
-
-test("遅れても音声は再生する（音声は捨てない）", () => {
-  const decision = decidePlayout(
-    { channel: CHANNEL_AUDIO, flags: FLAG_END_OF_FRAME, playoutAtMs: 1000 },
-    5000,
-  );
-  assert.equal(decision, "decode");
-});

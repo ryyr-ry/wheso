@@ -10,6 +10,8 @@ public enum WhesoWireLayout {
     public static let UNIT_HEADER_BYTES: Int = 20
     public static let MAX_UNITS_PER_MESSAGE: Int = 255
     public static let MAX_MESSAGE_BYTES: Int = 16000000
+    public static let MAX_SPATIAL_ID: Int = 3
+    public static let MAX_TEMPORAL_ID: Int = 7
 
     public static let CHANNEL_VIDEO: UInt8 = 1
     public static let CHANNEL_AUDIO: UInt8 = 2

@@ -119,8 +119,6 @@ struct DynamicKey: CodingKey {
 }
 
 final class TraceTests: XCTestCase {
-    /// 生成器（tools/traces-receiver.ts）と一致させる初期予算。
-    private let initialReceiverBudget: Int64 = 7_000_000
 
     private func traceLines(_ name: String) throws -> [String] {
         let here = URL(fileURLWithPath: #filePath)
@@ -157,7 +155,8 @@ final class TraceTests: XCTestCase {
                   let sid = input.field("sid")?.asInteger,
                   let tid = input.field("tid")?.asInteger,
                   let bytes = input.field("bytes")?.asInteger,
-                  let flags = input.field("flags")?.asInteger
+                  let flags = input.field("flags")?.asInteger,
+                  let seq = input.field("seq")?.asInteger
             else {
                 return nil
             }
@@ -168,17 +167,51 @@ final class TraceTests: XCTestCase {
                 tid: tid,
                 key: input.field("key")?.asBool ?? false,
                 bytes: bytes,
-                flags: flags
+                flags: flags,
+                seq: seq
             )
         case "subscribe":
             guard let from = input.field("from")?.asInteger,
                   let to = input.field("to")?.asInteger,
+                  let ch = input.field("ch")?.asInteger,
                   let want = input.field("want")?.asBool,
-                  let maxSpatialId = input.field("maxSpatialId")?.asInteger
+                  let maxSpatialId = input.field("maxSpatialId")?.asInteger,
+                  let maxTemporalId = input.field("maxTemporalId")?.asInteger
             else {
                 return nil
             }
-            return .subscribe(from: from, to: to, want: want, maxSpatialId: maxSpatialId)
+            return .subscribe(from: from, to: to, ch: ch, want: want, maxSpatialId: maxSpatialId, maxTemporalId: maxTemporalId)
+        case "ack":
+            guard let from = input.field("from")?.asInteger,
+                  let to = input.field("to")?.asInteger,
+                  let ch = input.field("ch")?.asInteger,
+                  let sid = input.field("sid")?.asInteger,
+                  let highestSeq = input.field("highestSeq")?.asInteger
+            else {
+                return nil
+            }
+            return .ack(from: from, to: to, ch: ch, sid: sid, highestSeq: highestSeq)
+        case "streamAnnounce":
+            guard let from = input.field("from")?.asInteger,
+                  let ch = input.field("ch")?.asInteger,
+                  let rungsArray = input.field("rungs")?.asArray
+            else {
+                return nil
+            }
+            var rungs: [WhesoLadderRung] = []
+            for element in rungsArray {
+                guard let sid = element.field("sid")?.asInteger,
+                      let width = element.field("width")?.asInteger,
+                      let height = element.field("height")?.asInteger,
+                      let framerate = element.field("framerate")?.asInteger,
+                      let temporalLayers = element.field("temporalLayers")?.asInteger,
+                      let targetBitrate = element.field("targetBitrate")?.asInteger
+                else {
+                    return nil
+                }
+                rungs.append(WhesoLadderRung(sid: sid, width: width, height: height, framerate: framerate, temporalLayers: temporalLayers, targetBitrate: targetBitrate))
+            }
+            return .streamAnnounce(from: from, ch: ch, rungs: rungs)
         case "join":
             guard let id = input.field("id")?.asInteger else {
                 return nil
@@ -215,6 +248,15 @@ final class TraceTests: XCTestCase {
                 delayUs.append(value)
             }
             return .report(from: from, delayUs: delayUs)
+        case "keyframeRequest":
+            guard let from = input.field("from")?.asInteger,
+                  let target = input.field("target")?.asInteger,
+                  let ch = input.field("ch")?.asInteger,
+                  let sid = input.field("sid")?.asInteger
+            else {
+                return nil
+            }
+            return .keyframeRequest(from: from, target: target, ch: ch, sid: sid)
         default:
             return nil
         }
@@ -238,6 +280,26 @@ final class TraceTests: XCTestCase {
                 "kind": .text("setTier"),
                 "for": .integer(targetId),
                 "tier": .integer(tier),
+            ])
+        case .keyframeRequest(let targetId, let channel, let spatialId):
+            return .object([
+                "kind": .text("keyframeRequest"),
+                "for": .integer(targetId),
+                "channel": .integer(channel),
+                "spatialId": .integer(spatialId),
+            ])
+        case .ackUpstream(let to, let channel, let spatialId, let highestSeq):
+            return .object([
+                "kind": .text("ackUpstream"),
+                "to": .integer(to),
+                "channel": .integer(channel),
+                "spatialId": .integer(spatialId),
+                "highestSeq": .integer(highestSeq),
+            ])
+        case .disconnect(let peer):
+            return .object([
+                "kind": .text("disconnect"),
+                "peer": .integer(peer),
             ])
         }
     }
@@ -329,6 +391,11 @@ final class TraceTests: XCTestCase {
                 return nil
             }
             return .budget(bytesPerSec: bytesPerSec)
+        case "goodput":
+            guard let bytesPerSec = input.field("bytesPerSec")?.asInteger else {
+                return nil
+            }
+            return .goodput(bytesPerSec: bytesPerSec)
         case "activeSpeaker":
             // null は「発話者なし」を意味する。欄の欠落と区別する。
             guard let value = input.field("id") else {
@@ -349,6 +416,38 @@ final class TraceTests: XCTestCase {
                 return nil
             }
             return .displaySize(senderId: senderId, channel: channel, width: width)
+        case "catalog":
+            guard let raw = input.field("entries")?.asArray else {
+                return nil
+            }
+            var ladders: [WhesoCatalogLadder] = []
+            for element in raw {
+                guard let senderId = element.field("senderId")?.asInteger,
+                      let channel = element.field("channel")?.asInteger,
+                      let rungsArr = element.field("rungs")?.asArray
+                else {
+                    return nil
+                }
+                var rungs: [WhesoCatalogRung] = []
+                for r in rungsArr {
+                    guard let sid = r.field("sid")?.asInteger,
+                          let width = r.field("width")?.asInteger,
+                          let height = r.field("height")?.asInteger,
+                          let framerate = r.field("framerate")?.asInteger,
+                          let temporalLayers = r.field("temporalLayers")?.asInteger,
+                          let targetBitrate = r.field("targetBitrate")?.asInteger
+                    else {
+                        return nil
+                    }
+                    rungs.append(WhesoCatalogRung(
+                        sid: sid, width: width, height: height,
+                        framerate: framerate, temporalLayers: temporalLayers,
+                        targetBitrate: targetBitrate
+                    ))
+                }
+                ladders.append(WhesoCatalogLadder(senderId: senderId, channel: channel, rungs: rungs))
+            }
+            return .catalog(entries: ladders)
         case "report":
             guard let samples = input.field("delayUs")?.asArray else {
                 return nil
@@ -370,6 +469,14 @@ final class TraceTests: XCTestCase {
                 return nil
             }
             return .media(from: from, ch: ch, sid: sid, tid: tid, seq: input.field("seq")?.asInteger ?? 0)
+        case "keyframeRequest":
+            guard let senderId = input.field("senderId")?.asInteger,
+                  let channel = input.field("channel")?.asInteger,
+                  let spatialId = input.field("spatialId")?.asInteger
+            else {
+                return nil
+            }
+            return .keyframeRequest(senderId: senderId, channel: channel, spatialId: spatialId)
         case "timer":
             return .timer
         default:
@@ -430,7 +537,7 @@ final class TraceTests: XCTestCase {
         let header = try parse(lines[0])
         XCTAssertEqual(header.field("unit")?.asText, "receiver", "受信ノードのトレースである")
 
-        var state = whesoInitialReceiverState(initialReceiverBudget)
+        var state = whesoInitialReceiverState()
         var pending: JsonValue?
         var pendingT: Int64 = 0
         var checked = 0

@@ -29,6 +29,7 @@ public object Errors {
     public const val E_RATE_LIMIT_CONNECT_CLOSE_CODE: Long = 4031L
     public const val E_NODE_OVERLOADED_CLOSE_CODE: Long = 4032L
     public const val E_ROOM_FULL_CLOSE_CODE: Long = 4033L
+    public const val E_ACK_TIMEOUT_CLOSE_CODE: Long = 4034L
     public const val E_EPOCH_STALE_CLOSE_CODE: Long = 4040L
     public const val E_MEETING_ENDED_CLOSE_CODE: Long = 4041L
     public const val E_EVICTED_CLOSE_CODE: Long = 4042L

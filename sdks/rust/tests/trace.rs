@@ -9,7 +9,7 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
-use wheso_client::shard_core::{initial_state, step, ShardCommand, ShardEvent};
+use wheso_client::shard_core::{initial_state, step, LadderRung, ShardCommand, ShardEvent};
 
 fn trace_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -21,7 +21,7 @@ fn trace_path() -> PathBuf {
     path
 }
 
-/// 入力行を ShardEvent に変換する。未知の種類は None（ベクタに無いはずである）。
+/// 入力行を ShardEvent に変換する。未知の種類は None。
 fn to_event(input: &Value) -> Option<ShardEvent> {
     let kind = input.get("kind")?.as_str()?;
     match kind {
@@ -33,13 +33,42 @@ fn to_event(input: &Value) -> Option<ShardEvent> {
             key: input.get("key").and_then(Value::as_bool).unwrap_or(false),
             bytes: input.get("bytes")?.as_i64()?,
             flags: input.get("flags")?.as_i64()?,
+            seq: input.get("seq")?.as_i64()?,
         }),
         "subscribe" => Some(ShardEvent::Subscribe {
             from: input.get("from")?.as_i64()?,
             to: input.get("to")?.as_i64()?,
+            ch: input.get("ch")?.as_i64()?,
             want: input.get("want")?.as_bool()?,
             max_spatial_id: input.get("maxSpatialId")?.as_i64()?,
+            max_temporal_id: input.get("maxTemporalId")?.as_i64()?,
         }),
+        "ack" => Some(ShardEvent::Ack {
+            from: input.get("from")?.as_i64()?,
+            to: input.get("to")?.as_i64()?,
+            ch: input.get("ch")?.as_i64()?,
+            sid: input.get("sid")?.as_i64()?,
+            highest_seq: input.get("highestSeq")?.as_i64()?,
+        }),
+        "streamAnnounce" => {
+            let rungs_arr = input.get("rungs")?.as_array()?;
+            let mut rungs = Vec::with_capacity(rungs_arr.len());
+            for rung in rungs_arr {
+                rungs.push(LadderRung {
+                    sid: rung.get("sid")?.as_i64()?,
+                    width: rung.get("width")?.as_i64()?,
+                    height: rung.get("height")?.as_i64()?,
+                    framerate: rung.get("framerate")?.as_i64()?,
+                    temporal_layers: rung.get("temporalLayers")?.as_i64()?,
+                    target_bitrate: rung.get("targetBitrate")?.as_i64()?,
+                });
+            }
+            Some(ShardEvent::StreamAnnounce {
+                from: input.get("from")?.as_i64()?,
+                ch: input.get("ch")?.as_i64()?,
+                rungs,
+            })
+        }
         "join" => Some(ShardEvent::Join { id: input.get("id")?.as_i64()? }),
         "leave" => Some(ShardEvent::Leave { id: input.get("id")?.as_i64()? }),
         "link" => Some(ShardEvent::Link {
@@ -65,6 +94,12 @@ fn to_event(input: &Value) -> Option<ShardEvent> {
                 delay_us,
             })
         }
+        "keyframeRequest" => Some(ShardEvent::KeyframeRequest {
+            from: input.get("from")?.as_i64()?,
+            target: input.get("target")?.as_i64()?,
+            ch: input.get("ch")?.as_i64()?,
+            sid: input.get("sid")?.as_i64()?,
+        }),
         _ => None,
     }
 }
@@ -76,10 +111,19 @@ fn to_json(command: &ShardCommand) -> Value {
         ShardCommand::Drop { priority, count } => {
             json!({ "kind": "drop", "priority": priority, "count": count })
         }
-        ShardCommand::Notify { code } => json!({ "kind": "notify", "code": code }),
         ShardCommand::SetTier { target_id, tier } => {
             json!({ "kind": "setTier", "for": target_id, "tier": tier })
         }
+        ShardCommand::KeyframeRequest { target_id, channel, spatial_id } => {
+            json!({ "kind": "keyframeRequest", "for": target_id, "channel": channel, "spatialId": spatial_id })
+        }
+        ShardCommand::AckUpstream { to, channel, spatial_id, highest_seq } => {
+            json!({ "kind": "ackUpstream", "to": to, "channel": channel, "spatialId": spatial_id, "highestSeq": highest_seq })
+        }
+        ShardCommand::Disconnect { peer } => {
+            json!({ "kind": "disconnect", "peer": peer })
+        }
+        ShardCommand::Notify { code } => json!({ "kind": "notify", "code": code }),
     }
 }
 
@@ -140,14 +184,14 @@ fn frozen_trace_matches_typescript_reference() {
         assert_eq!(
             actual.len(),
             expected.len(),
-            "{}行目: 出力コマンドの数が一致する（入力 {input}）",
+            "{}行目: 出力コマンドの数が一致しない（入力 {input}）\n  実際: {actual:?}\n  期待: {expected:?}",
             index + 2
         );
         for (position, expected_command) in expected.iter().enumerate() {
             assert_eq!(
                 actual.get(position),
                 Some(expected_command),
-                "{}行目の {position} 番目のコマンドが一致する",
+                "{}行目の {position} 番目のコマンドが一致しない\n  入力: {input}",
                 index + 2
             );
             commands_compared += 1;

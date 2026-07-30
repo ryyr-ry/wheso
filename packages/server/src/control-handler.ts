@@ -27,11 +27,49 @@ export interface Participant {
   readonly role: "host" | "presenter" | "viewer";
 }
 
+/**
+ * 送信者 1 人・1 チャネルのはしご（ADR-0027）。
+ *
+ * 受信ノードはこれを使って「表示寸法から段を選ぶ」ことと「申告ビットレートで費用を
+ * 見積もる」ことを行う。大域のプロファイル表を使ってはならない。送信者の実体と合わない。
+ */
+export interface CatalogEntry {
+  readonly senderId: number;
+  readonly channel: number;
+  /** 段。sid の昇順で保持する。 */
+  readonly rungs: readonly CatalogRung[];
+}
+
+export interface CatalogRung {
+  readonly sid: number;
+  readonly width: number;
+  readonly height: number;
+  readonly framerate: number;
+  readonly temporalLayers: number;
+  readonly targetBitrate: number;
+}
+
 export interface ControlState {
   /** userId の昇順で保持する。反復順序が配信内容に影響するため決定的にする。 */
   readonly participants: readonly Participant[];
+  /**
+   * `meta` が配る会議全体の名簿。
+   *
+   * **そのままクライアントへ流してはならない。** `meta` は接続の直後に空の名簿を送る
+   * （登録より前であるため空である）。空をそのまま配ると、クライアントは
+   * 「全員が退出した」と解釈して一覧を消す（実際にそうなった）。自分の参加者と
+   * 統合してから配る。
+   */
+  readonly directory: readonly Participant[];
   /** ノードから届いた状態通知の記録。過負荷の検出に使う。 */
   readonly nodeStatuses: readonly number[];
+  /**
+   * 会議全体のはしご（ADR-0027 の 1）。(senderId, channel) の昇順で保持する。
+   *
+   * ここに集約する理由は、`ctl` が会議に 1 個であり全参加者を見ているためである。
+   * 中継ノードは会議を分割した一部しか見ないため、会議全体のはしごを持てない。
+   */
+  readonly catalog: readonly CatalogEntry[];
 }
 
 export interface ControlError {
@@ -41,7 +79,7 @@ export interface ControlError {
 }
 
 export function createControlState(): ControlState {
-  return { participants: [], nodeStatuses: [] };
+  return { participants: [], directory: [], nodeStatuses: [], catalog: [] };
 }
 
 /** `hello` の内容。実行時検査を通した後の型である。 */
@@ -151,16 +189,178 @@ export function recordNodeStatus(state: ControlState, code: number): ControlStat
   return { ...state, nodeStatuses: [...state.nodeStatuses, code] };
 }
 
+/**
+ * はしごの申告を取り込む（`streamCatalogUpdate`。ADR-0027 の 1）。純関数。
+ *
+ * 同一の (senderId, channel) は上書きする。はしごは実行中に変わる（カメラ切替、
+ * 画面共有の開始と停止、発熱降格）。古い段を残すと、存在しない段を要求させてしまう。
+ */
+export function recordCatalogEntry(state: ControlState, entry: CatalogEntry): ControlState {
+  const rest = state.catalog.filter(
+    (existing) => !(existing.senderId === entry.senderId && existing.channel === entry.channel),
+  );
+  const normalized: CatalogEntry = {
+    senderId: entry.senderId,
+    channel: entry.channel,
+    rungs: [...entry.rungs].sort((a, b) => a.sid - b.sid),
+  };
+  const merged = [...rest, normalized].sort((a, b) =>
+    a.senderId !== b.senderId ? a.senderId - b.senderId : a.channel - b.channel,
+  );
+  return { ...state, catalog: merged };
+}
+
+/** 参加者の退出でその送信者のはしごを消す。純関数。 */
+export function removeCatalogFor(state: ControlState, senderId: number): ControlState {
+  return { ...state, catalog: state.catalog.filter((entry) => entry.senderId !== senderId) };
+}
+
+/**
+ * `streamCatalog` の配信内容を作る（ADR-0027 の 1）。
+ *
+ * 宛先は全受信ノードと全クライアントである。受信ノードはこれで費用と段を決める。
+ */
+export function streamCatalogMessage(state: ControlState): string {
+  return JSON.stringify({
+    t: "streamCatalog",
+    entries: state.catalog.map((entry) => ({
+      senderId: entry.senderId,
+      channel: entry.channel,
+      rungs: entry.rungs.map((rung) => ({
+        spatialId: rung.sid,
+        width: rung.width,
+        height: rung.height,
+        framerate: rung.framerate,
+        temporalLayers: rung.temporalLayers,
+        targetBitrate: rung.targetBitrate,
+      })),
+    })),
+  });
+}
+
+/**
+ * `streamCatalogUpdate` を解析する。形式違反は null（例外を投げない）。
+ *
+ * 送信ノードが自分のクライアントの `streamAnnounce` を写して送ってくる。
+ */
+export function parseCatalogUpdate(text: string): CatalogEntry | null {
+  let value: unknown = null;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const record: Record<string, unknown> = { ...value };
+  if (record["t"] !== "streamCatalogUpdate") {
+    return null;
+  }
+  const senderId = record["senderId"];
+  const channel = record["channel"];
+  const rungs = record["rungs"];
+  if (!isCatalogInteger(senderId) || !isCatalogInteger(channel) || !Array.isArray(rungs)) {
+    return null;
+  }
+  const parsed: CatalogRung[] = [];
+  for (const rung of rungs) {
+    if (typeof rung !== "object" || rung === null) {
+      continue;
+    }
+    const entry: Record<string, unknown> = { ...rung };
+    const sid = entry["spatialId"];
+    const width = entry["width"];
+    const height = entry["height"];
+    const framerate = entry["framerate"];
+    const temporalLayers = entry["temporalLayers"];
+    const targetBitrate = entry["targetBitrate"];
+    if (
+      !isCatalogInteger(sid) ||
+      !isCatalogInteger(width) ||
+      !isCatalogInteger(height) ||
+      !isCatalogInteger(framerate) ||
+      !isCatalogInteger(temporalLayers) ||
+      !isCatalogInteger(targetBitrate)
+    ) {
+      // 欠けた欄を既定値で埋めない。埋めると実体と違う費用で見積もることになる。
+      continue;
+    }
+    parsed.push({ sid, width, height, framerate, temporalLayers, targetBitrate });
+  }
+  if (parsed.length === 0) {
+    return null;
+  }
+  return { senderId, channel, rungs: parsed };
+}
+
+function isCatalogInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0;
+}
+
 /** 参加者一覧の配信内容を作る。 */
 export function participantsMessage(state: ControlState): string {
+  // 自分の参加者と `meta` の名簿を統合する。userId で重複を除き、昇順に並べる。
+  const merged = new Map<string, Participant>();
+  for (const entry of state.directory) {
+    merged.set(entry.userId, entry);
+  }
+  for (const entry of state.participants) {
+    merged.set(entry.userId, entry);
+  }
+  const entries = [...merged.values()].sort((a, b) =>
+    a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0,
+  );
   return JSON.stringify({
     t: "participants",
-    entries: state.participants.map((entry) => ({
+    entries: entries.map((entry) => ({
       userId: entry.userId,
       senderId: entry.senderId,
       role: entry.role,
     })),
   });
+}
+
+/**
+ * `meta` から届いた会議全体の名簿を取り込む（純関数）。
+ * 形式違反の項目は捨てる。**欠けた欄を既定値で埋めない。**
+ */
+export function recordDirectory(state: ControlState, text: string): ControlState | null {
+  let value: unknown = null;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const record: Record<string, unknown> = { ...value };
+  if (record["t"] !== "participants") {
+    return null;
+  }
+  const entries = record["entries"];
+  if (!Array.isArray(entries)) {
+    return null;
+  }
+  const parsed: Participant[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== "object" || entry === null) {
+      continue;
+    }
+    const item: Record<string, unknown> = { ...entry };
+    const userId = item["userId"];
+    const senderId = item["senderId"];
+    const role = item["role"];
+    if (typeof userId !== "string" || typeof senderId !== "number" || !Number.isInteger(senderId)) {
+      continue;
+    }
+    if (role !== "host" && role !== "presenter" && role !== "viewer") {
+      continue;
+    }
+    parsed.push({ userId, senderId, role });
+  }
+  return { ...state, directory: parsed };
 }
 
 /** 過負荷の通知が届いているか。届いていればシャードの再分割が必要である。 */

@@ -11,12 +11,6 @@
  */
 
 import { computeDiscardable, encodeMediaMessage, type Unit } from "@wheso/core/src/wire.ts";
-import {
-  V_1080P30,
-  V_1080P60,
-  V_360P15,
-  V_4K60,
-} from "@wheso/core/src/generated/constants.ts";
 import { FLAG_END_OF_FRAME, FLAG_KEY } from "@wheso/core/src/generated/wire-layout.ts";
 import { type Result, err, ok } from "@wheso/core/src/result.ts";
 import type { ProfileId } from "./capability.ts";
@@ -38,50 +32,7 @@ export interface EncoderSpec {
   readonly temporalLayers: number;
 }
 
-/** プロファイル識別子から設定を引く。 */
-export function specOf(profile: ProfileId): Result<EncoderSpec, EncoderError> {
-  switch (profile) {
-    case "V_4K60":
-      return ok(fromConstant(profile, V_4K60, 3));
-    case "V_1080P60":
-      return ok(fromConstant(profile, V_1080P60, 3));
-    case "V_1080P30":
-      return ok(fromConstant(profile, V_1080P30, 3));
-    case "V_360P15":
-      return ok(fromConstant(profile, V_360P15, 2));
-    case "H264_1080P30":
-      return ok({ ...fromConstant(profile, V_1080P30, 1), scalabilityMode: "L1T1" });
-    case "H264_360P15":
-      return ok({ ...fromConstant(profile, V_360P15, 1), scalabilityMode: "L1T1" });
-  }
-}
 
-interface ProfileConstant {
-  readonly spatialId: number;
-  readonly width: number;
-  readonly height: number;
-  readonly framerate: number;
-  readonly targetBitrate: number;
-  readonly scalabilityMode: string;
-}
-
-function fromConstant(profile: ProfileId, constant: ProfileConstant, temporalLayers: number): EncoderSpec {
-  return {
-    profile,
-    spatialId: constant.spatialId,
-    width: constant.width,
-    height: constant.height,
-    framerate: constant.framerate,
-    bitrate: constant.targetBitrate,
-    scalabilityMode: constant.scalabilityMode,
-    temporalLayers,
-  };
-}
-
-/** コーデック文字列。AV1 と H.264 で異なる。 */
-export function codecOf(profile: ProfileId): string {
-  return profile.startsWith("H264") ? "avc1.42E01F" : "av01.0.08M.08";
-}
 
 /** 符号化されたチャンクから、ワイヤ形式の 1 メッセージを作るための入力。 */
 export interface EncodedInput {

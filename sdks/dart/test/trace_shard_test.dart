@@ -14,7 +14,7 @@ import 'dart:io';
 import 'package:test/test.dart';
 import 'package:wheso_client/src/shard_core.dart';
 
-/// 連想配列として読む。型が違えば試験を失敗させる（既定値へ落とさない）。
+/// 連想配列として読む。型が違えば試験を失敗させる。
 Map<String, Object?> readMap(Object? value, String where) {
   if (value is Map<String, Object?>) {
     return value;
@@ -58,13 +58,43 @@ ShardEvent toEvent(Map<String, Object?> input) {
         key: input['key'] == true,
         bytes: readInt(input, 'bytes', 'media'),
         flags: readInt(input, 'flags', 'media'),
+        seq: readInt(input, 'seq', 'media'),
       );
     case 'subscribe':
       return SubscribeEvent(
         from: readInt(input, 'from', 'subscribe'),
         to: readInt(input, 'to', 'subscribe'),
+        ch: readInt(input, 'ch', 'subscribe'),
         want: readBool(input, 'want', 'subscribe'),
         maxSpatialId: readInt(input, 'maxSpatialId', 'subscribe'),
+        maxTemporalId: readInt(input, 'maxTemporalId', 'subscribe'),
+      );
+    case 'ack':
+      return AckEvent(
+        from: readInt(input, 'from', 'ack'),
+        to: readInt(input, 'to', 'ack'),
+        ch: readInt(input, 'ch', 'ack'),
+        sid: readInt(input, 'sid', 'ack'),
+        highestSeq: readInt(input, 'highestSeq', 'ack'),
+      );
+    case 'streamAnnounce':
+      final rungsList = readList(input['rungs'], 'streamAnnounce rungs');
+      final List<LadderRung> rungs = [];
+      for (final item in rungsList) {
+        final r = readMap(item, 'streamAnnounce rung');
+        rungs.add(LadderRung(
+          sid: readInt(r, 'sid', 'rung'),
+          width: readInt(r, 'width', 'rung'),
+          height: readInt(r, 'height', 'rung'),
+          framerate: readInt(r, 'framerate', 'rung'),
+          temporalLayers: readInt(r, 'temporalLayers', 'rung'),
+          targetBitrate: readInt(r, 'targetBitrate', 'rung'),
+        ));
+      }
+      return StreamAnnounceEvent(
+        from: readInt(input, 'from', 'streamAnnounce'),
+        ch: readInt(input, 'ch', 'streamAnnounce'),
+        rungs: rungs,
       );
     case 'join':
       return JoinEvent(id: readInt(input, 'id', 'join'));
@@ -83,7 +113,7 @@ ShardEvent toEvent(Map<String, Object?> input) {
       return BudgetEvent(bytesPerSec: readInt(input, 'bytesPerSec', 'budget'));
     case 'report':
       final samples = readList(input['delayUs'], 'report delayUs');
-      final delayUs = <int>[];
+      final List<int> delayUs = [];
       for (final sample in samples) {
         if (sample is! int) {
           throw StateError('report delayUs: 整数ではない');
@@ -91,6 +121,13 @@ ShardEvent toEvent(Map<String, Object?> input) {
         delayUs.add(sample);
       }
       return ReportEvent(from: readInt(input, 'from', 'report'), delayUs: delayUs);
+    case 'keyframeRequest':
+      return KeyframeRequestEvent(
+        from: readInt(input, 'from', 'keyframeRequest'),
+        target: readInt(input, 'target', 'keyframeRequest'),
+        ch: readInt(input, 'ch', 'keyframeRequest'),
+        sid: readInt(input, 'sid', 'keyframeRequest'),
+      );
   }
   throw StateError('未知のイベント: $kind');
 }
@@ -102,10 +139,27 @@ Map<String, Object?> toJson(ShardCommand command) {
       return <String, Object?>{'kind': 'forward', 'to': command.to};
     case DropCommand():
       return <String, Object?>{'kind': 'drop', 'priority': command.priority, 'count': command.count};
-    case NotifyCommand():
-      return <String, Object?>{'kind': 'notify', 'code': command.code};
     case SetTierCommand():
       return <String, Object?>{'kind': 'setTier', 'for': command.targetId, 'tier': command.tier};
+    case KeyframeRequestCommand():
+      return <String, Object?>{
+        'kind': 'keyframeRequest',
+        'for': command.targetId,
+        'channel': command.channel,
+        'spatialId': command.spatialId,
+      };
+    case AckUpstreamCommand():
+      return <String, Object?>{
+        'kind': 'ackUpstream',
+        'to': command.to,
+        'channel': command.channel,
+        'spatialId': command.spatialId,
+        'highestSeq': command.highestSeq,
+      };
+    case DisconnectCommand():
+      return <String, Object?>{'kind': 'disconnect', 'peer': command.peer};
+    case NotifyCommand():
+      return <String, Object?>{'kind': 'notify', 'code': command.code};
   }
 }
 
@@ -118,8 +172,6 @@ void main() {
     final header = readMap(jsonDecode(lines.first), 'header');
     expect(header['unit'], equals('shard'));
 
-    // 初期状態の時刻はトレースの最初の t と一致させる必要がある。
-    // 一致しなければ最初の窓の判定から出力が分かれる。
     ShardState? state;
     Map<String, Object?>? pending;
     var checked = 0;

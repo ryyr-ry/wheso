@@ -14,6 +14,8 @@ inline constexpr std::size_t MESSAGE_HEADER_BYTES = 8;
 inline constexpr std::size_t UNIT_HEADER_BYTES = 20;
 inline constexpr std::size_t MAX_UNITS_PER_MESSAGE = 255;
 inline constexpr std::size_t MAX_MESSAGE_BYTES = 16000000;
+inline constexpr std::uint8_t MAX_SPATIAL_ID = 3;
+inline constexpr std::uint8_t MAX_TEMPORAL_ID = 7;
 
 inline constexpr std::uint8_t CHANNEL_VIDEO = 1;
 inline constexpr std::uint8_t CHANNEL_AUDIO = 2;

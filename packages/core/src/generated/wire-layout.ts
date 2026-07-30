@@ -11,6 +11,8 @@ export const MESSAGE_HEADER_BYTES = 8;
 export const UNIT_HEADER_BYTES = 20;
 export const MAX_UNITS_PER_MESSAGE = 255;
 export const MAX_MESSAGE_BYTES = 16000000;
+export const MAX_SPATIAL_ID = 3;
+export const MAX_TEMPORAL_ID = 7;
 export const DOCUMENTED_RECEIVE_LIMIT_BYTES = 33554432;
 
 /** メッセージヘッダのフィールド位置。 */

@@ -13,6 +13,7 @@
  */
 
 import { DISPLAY_SIZE_REPORT_MIN_INTERVAL_MS } from "@wheso/core/src/generated/constants.ts";
+import type { MediaFrame } from "../api/meeting.ts";
 
 /** 受け皿が外へ伝えること。表示寸法の申告のみである。 */
 export interface SinkCallbacks {
@@ -38,7 +39,7 @@ export interface SinkTarget {
 
 export interface Sink {
   /** フレームを 1 枚描く。呼び出し側が復号したものを渡す。 */
-  readonly draw: (frame: VideoFrame) => void;
+  readonly draw: (frame: MediaFrame) => void;
   /** 描画を止め、観測を解除する。 */
   readonly detach: () => void;
   /** 表示寸法を明示的に申告する。生のトラックを使う場合に必要である。 */
@@ -129,7 +130,7 @@ export function createSink(
   const context = resolveContext(target);
 
   return {
-    draw: (frame: VideoFrame): void => {
+    draw: (frame: MediaFrame): void => {
       // 保留していた申告があれば、描画の機会に合わせて送る。
       if (pending !== null) {
         const next = pending;
@@ -179,7 +180,7 @@ function resolveContext(target: SinkTarget): CanvasLikeContext | null {
 
 /** 描画に使う最小の形。 */
 interface CanvasLikeContext {
-  drawImage: (image: VideoFrame, x: number, y: number, width: number, height: number) => void;
+  drawImage: (image: MediaFrame, x: number, y: number, width: number, height: number) => void;
   canvas: { width: number; height: number };
 }
 

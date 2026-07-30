@@ -10,7 +10,7 @@
  * `nodeHello` を受け取る前に届いたメディアメッセージは破棄する（wire-format.md 2.8）。
  */
 
-import { nodeAuthTimeWindow, verifyNodeAuthTag } from "@wheso/core/src/auth.ts";
+import { verifyNodeAuthTag } from "@wheso/core/src/auth.ts";
 import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
 import { type Result, err, ok } from "@wheso/core/src/result.ts";
 
@@ -101,10 +101,6 @@ export async function verifyNodeHello(options: VerifyNodeOptions): Promise<Resul
   return ok(verified.value);
 }
 
-/** 現在の時刻窓。試験と送信側で使う。 */
-export function currentNodeAuthWindow(nowSec: number): number {
-  return nodeAuthTimeWindow(nowSec);
-}
 
 /**
  * 受理の通知（nodeHelloAck）。

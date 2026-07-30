@@ -12,7 +12,6 @@ import {
   createReceiverHandlerState,
   handleClientBinary,
   handleClientText,
-  handleSenderLeave,
   handleUpstreamBinary,
   type ReceiverHandlerState,
   type ReceiverTransport,
@@ -71,12 +70,9 @@ function mediaBytes(senderId: number, spatialId: number, temporalId: number): Ui
   return encoded.ok ? encoded.value : new Uint8Array(0);
 }
 
-/** 高品質 1 本を賄える予算（bytes/sec）。 */
-const BUDGET = Math.trunc((V_4K60.targetBitrate * 10) / (8 * 9)) + 1;
-
 function subscribed(): { state: ReceiverHandlerState; transport: ReceiverTransport; log: Log } {
   const { transport, log } = recorder();
-  let state = createReceiverHandlerState(BUDGET, T0);
+  let state = createReceiverHandlerState(T0);
   state = handleClientText(
     state,
     JSON.stringify({
@@ -124,12 +120,45 @@ test("要求 tier を超えるメディアは転送されない", () => {
 });
 
 test("表示寸法を申告すると上流へ tier の更新が送られる", () => {
-  const { state, transport, log } = subscribed();
+  const { state: base, transport, log } = subscribed();
+  // **はしごを知らない相手の段は上がらない**（ADR-0027）。カタログを先に配る。
+  const state = handleClientText(
+    base,
+    JSON.stringify({
+      t: "streamCatalog",
+      entries: [
+        {
+          senderId: 7,
+          channel: CHANNEL_VIDEO,
+          rungs: [
+            { spatialId: 0, width: 640, height: 360, framerate: 15, temporalLayers: 2, targetBitrate: 200000 },
+            {
+              spatialId: 1,
+              width: V_4K60.width,
+              height: V_4K60.height,
+              framerate: V_4K60.framerate,
+              temporalLayers: V_4K60.temporalLayers,
+              targetBitrate: V_4K60.targetBitrate,
+            },
+          ],
+        },
+      ],
+    }),
+    T0,
+    transport,
+  );
+  // 段を上げるには帯域も必要である。goodput の報告として与える（congestion.md 4.1）。
+  const funded = handleClientText(
+    state,
+    JSON.stringify({ t: "report", downlinkBps: V_4K60.targetBitrate * 4 }),
+    T0,
+    transport,
+  );
   const before = log.upstream.length;
   // 購読時に同じ (senderId, channel, spatialId) へ要求を出しているため、
   // 間隔制限（wire-format.md 2.5）を越える時刻で申告する。
   handleClientText(
-    state,
+    funded,
     JSON.stringify({ t: "displaySize", senderId: 7, channel: CHANNEL_VIDEO, width: 3840 }),
     T0 + KEYFRAME_REQUEST_MIN_INTERVAL_MS,
     transport,
@@ -138,8 +167,8 @@ test("表示寸法を申告すると上流へ tier の更新が送られる", ()
   const added = log.upstream.slice(before);
   // setTier は購読の更新として、続くキーフレーム要求は別のメッセージとして送られる。
   assert.ok(
-    added.some((text) => text.includes(`"maxSpatialId":${V_4K60.spatialId}`)),
-    "高品質の tier を含む購読更新がある",
+    added.some((text) => text.includes(`"maxSpatialId":1`)),
+    "高い段を含む購読更新がある",
   );
   assert.ok(added.some((text) => text.includes("keyframeRequest")), "キーフレーム要求も送る");
 });
@@ -170,12 +199,6 @@ test("report の下り帯域が予算に反映される", () => {
   );
   assert.equal(after.core.targetBytesPerSec, Math.trunc(400_000 / 8));
   assert.ok(log.upstream.length >= before, "予算の変化に応じて上流へ反映しうる");
-});
-
-test("送信者の退出で購読が消える", () => {
-  const { state, transport } = subscribed();
-  const after = handleSenderLeave(state, 7, T0, transport);
-  assert.equal(after.core.streams.length, 0);
 });
 
 test("未知の制御メッセージと壊れた JSON は無視される", () => {

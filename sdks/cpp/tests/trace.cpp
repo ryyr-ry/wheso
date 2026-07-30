@@ -141,15 +141,47 @@ bool toShardEvent(const JsonPtr& input, wheso::shard::Event& event) {
     event.key = key != nullptr && key->kind == JsonValue::Kind::Bool && key->boolean;
     event.bytes = asInt(field(input, "bytes"));
     event.flags = asInt(field(input, "flags"));
+    event.seq = asInt(field(input, "seq"));
     return true;
   }
   if (kind == "subscribe") {
     event.kind = wheso::shard::EventKind::Subscribe;
     event.from = asInt(field(input, "from"));
     event.to = asInt(field(input, "to"));
+    event.ch = asInt(field(input, "ch"));
     const JsonPtr want = field(input, "want");
     event.want = want != nullptr && want->kind == JsonValue::Kind::Bool && want->boolean;
     event.max_spatial_id = asInt(field(input, "maxSpatialId"));
+    event.max_temporal_id = asInt(field(input, "maxTemporalId"));
+    return true;
+  }
+  if (kind == "ack") {
+    event.kind = wheso::shard::EventKind::Ack;
+    event.from = asInt(field(input, "from"));
+    event.to = asInt(field(input, "to"));
+    event.ch = asInt(field(input, "ch"));
+    event.sid = asInt(field(input, "sid"));
+    event.highest_seq = asInt(field(input, "highestSeq"));
+    return true;
+  }
+  if (kind == "streamAnnounce") {
+    event.kind = wheso::shard::EventKind::StreamAnnounce;
+    event.from = asInt(field(input, "from"));
+    event.ch = asInt(field(input, "ch"));
+    event.rungs.clear();
+    const JsonPtr rungs = field(input, "rungs");
+    if (rungs != nullptr && rungs->kind == JsonValue::Kind::Array) {
+      for (const JsonPtr& element : rungs->array) {
+        wheso::shard::LadderRung rung;
+        rung.sid = asInt(field(element, "sid"));
+        rung.width = asInt(field(element, "width"));
+        rung.height = asInt(field(element, "height"));
+        rung.framerate = asInt(field(element, "framerate"));
+        rung.temporal_layers = asInt(field(element, "temporalLayers"));
+        rung.target_bitrate = asInt(field(element, "targetBitrate"));
+        event.rungs.push_back(rung);
+      }
+    }
     return true;
   }
   if (kind == "join") {
@@ -189,6 +221,14 @@ bool toShardEvent(const JsonPtr& input, wheso::shard::Event& event) {
     }
     return true;
   }
+  if (kind == "keyframeRequest") {
+    event.kind = wheso::shard::EventKind::KeyframeRequest;
+    event.from = asInt(field(input, "from"));
+    event.target = asInt(field(input, "target"));
+    event.ch = asInt(field(input, "ch"));
+    event.sid = asInt(field(input, "sid"));
+    return true;
+  }
   return false;
 }
 
@@ -214,6 +254,35 @@ Fields shardFields(const wheso::shard::Command& command) {
       fields["for"] = integerText(command.target_id);
       fields["tier"] = integerText(command.tier);
       break;
+    case wheso::shard::CommandKind::KeyframeRequest:
+      fields["kind"] = "keyframeRequest";
+      fields["for"] = integerText(command.target_id);
+      fields["channel"] = integerText(command.channel);
+      fields["spatialId"] = integerText(command.spatial_id);
+      break;
+    case wheso::shard::CommandKind::AckUpstream:
+      fields["kind"] = "ackUpstream";
+      fields["to"] = integerText(command.target_id);
+      fields["channel"] = integerText(command.channel);
+      fields["spatialId"] = integerText(command.spatial_id);
+      fields["highestSeq"] = integerText(command.highest_seq);
+      break;
+    case wheso::shard::CommandKind::Disconnect:
+      fields["kind"] = "disconnect";
+      fields["peer"] = integerText(command.peer);
+      break;
+    case wheso::shard::CommandKind::Connect:
+      fields["kind"] = "connect";
+      fields["peer"] = integerText(command.peer);
+      break;
+    case wheso::shard::CommandKind::Schedule:
+      fields["kind"] = "schedule";
+      fields["at"] = integerText(command.at);
+      break;
+    case wheso::shard::CommandKind::Close:
+      fields["kind"] = "close";
+      fields["code"] = integerText(command.code);
+      break;
   }
   return fields;
 }
@@ -225,6 +294,33 @@ constexpr std::int64_t INITIAL_RECEIVER_BUDGET = 7000000;
 
 bool toReceiverEvent(const JsonPtr& input, wheso::receiver::Event& event) {
   const std::string kind = wheso::testing::asText(field(input, "kind"));
+  if (kind == "catalog") {
+    event.kind = wheso::receiver::EventKind::Catalog;
+    event.catalog_entries.clear();
+    const JsonPtr entries = field(input, "entries");
+    if (entries != nullptr && entries->kind == JsonValue::Kind::Array) {
+      for (const JsonPtr& element : entries->array) {
+        wheso::receiver::CatalogLadder ladder;
+        ladder.sender_id = asInt(field(element, "senderId"));
+        ladder.channel = asInt(field(element, "channel"));
+        const JsonPtr rungs = field(element, "rungs");
+        if (rungs != nullptr && rungs->kind == JsonValue::Kind::Array) {
+          for (const JsonPtr& rung_val : rungs->array) {
+            wheso::receiver::CatalogRung rung;
+            rung.sid = asInt(field(rung_val, "sid"));
+            rung.width = asInt(field(rung_val, "width"));
+            rung.height = asInt(field(rung_val, "height"));
+            rung.framerate = asInt(field(rung_val, "framerate"));
+            rung.temporal_layers = asInt(field(rung_val, "temporalLayers"));
+            rung.target_bitrate = asInt(field(rung_val, "targetBitrate"));
+            ladder.rungs.push_back(rung);
+          }
+        }
+        event.catalog_entries.push_back(ladder);
+      }
+    }
+    return true;
+  }
   if (kind == "subscribe") {
     event.kind = wheso::receiver::EventKind::SubscribeList;
     event.entries.clear();
@@ -254,6 +350,11 @@ bool toReceiverEvent(const JsonPtr& input, wheso::receiver::Event& event) {
   }
   if (kind == "budget") {
     event.kind = wheso::receiver::EventKind::Budget;
+    event.bytes_per_sec = asInt(field(input, "bytesPerSec"));
+    return true;
+  }
+  if (kind == "goodput") {
+    event.kind = wheso::receiver::EventKind::Goodput;
     event.bytes_per_sec = asInt(field(input, "bytesPerSec"));
     return true;
   }
@@ -293,6 +394,13 @@ bool toReceiverEvent(const JsonPtr& input, wheso::receiver::Event& event) {
     event.sid = asInt(field(input, "sid"));
     event.tid = asInt(field(input, "tid"));
     event.seq = asInt(field(input, "seq"));
+    return true;
+  }
+  if (kind == "keyframeRequest") {
+    event.kind = wheso::receiver::EventKind::KeyframeRequest;
+    event.sender_id = asInt(field(input, "senderId"));
+    event.channel = asInt(field(input, "channel"));
+    event.sid = asInt(field(input, "spatialId"));
     return true;
   }
   if (kind == "timer") {
@@ -447,7 +555,7 @@ void testReceiverTrace(const std::string& dir) {
   const JsonPtr header = parseLine(lines[0]);
   expect(wheso::testing::asText(field(header, "unit")) == "receiver", "受信ノードのトレースである");
 
-  wheso::receiver::State state = wheso::receiver::initial_state(INITIAL_RECEIVER_BUDGET);
+  wheso::receiver::State state = wheso::receiver::initial_state();
   JsonPtr pending = nullptr;
   int checkedRows = 0;
 
@@ -466,13 +574,14 @@ void testReceiverTrace(const std::string& dir) {
       expect(false, "出力に対応する入力が無い");
       return;
     }
+    const std::int64_t t = asInt(field(row, "t"));
     wheso::receiver::Event event;
     if (!toReceiverEvent(pending, event)) {
       expect(false, "入力を解釈できない（行 " + std::to_string(index + 1) + "）");
       return;
     }
     pending = nullptr;
-    const wheso::receiver::StepResult result = wheso::receiver::step(state, event);
+    const wheso::receiver::StepResult result = wheso::receiver::step(state, event, t);
     state = result.state;
 
     bool same = result.commands.size() == out->array.size();

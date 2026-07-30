@@ -8,18 +8,27 @@
  *   接続の遷移      transport/connection.ts
  *   購読と層        受信ノード（サーバ側。画質の判断主体は受信側ユーザー部屋である）
  *   復号の可否      media/decoder-pool.ts
- *   映像音声の同期  sync/av-sync.ts
+ *   再生クロックと同期  core/playout.ts（ADR-0028）
  *   報告            quality/reporter.ts
  *
  * レイアウト・装飾・操作部品は提供しない（sdk-api.md 5.2）。
  */
 
 import { ERROR_DEFINITIONS, WARNING_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
+import { fnv1a32 } from "@wheso/core/src/naming.ts";
 
 /** 会議の状態（sdk-api.md 3 節）。 */
 export type MeetingPhase = "connecting" | "active" | "degraded" | "reconnecting" | "failed" | "closed";
 
 export type ParticipantRole = "host" | "presenter" | "viewer";
+
+/**
+ * 復号できた映像 1 枚。
+ *
+ * 型は環境ごとに異なる（ブラウザは `VideoFrame`、移植先は別の型）。`unknown` で受け渡し、
+ * 実際に描く直前に端が実行時に検査する。**`any` と型アサーションを使わないためである。**
+ */
+export type MediaFrame = unknown;
 
 /** 映像の受け皿（sdk-api.md 5 節）。描画先の型は環境ごとに異なるため未知の型で受ける。 */
 export interface VideoSinkHandle {
@@ -29,6 +38,17 @@ export interface VideoSinkHandle {
   readonly detach: () => void;
   /** 表示している論理寸法を申告する（track / frames を直接使う場合は必須）。 */
   readonly setDisplaySize: (width: number, height: number) => void;
+}
+
+/**
+ * 端が復号したフレームを渡す口。
+ *
+ * **利用者はこれを呼ばない。** 入口（`join-meeting.ts`）が受信経路から受け取った
+ * フレームを流し込むために使う。`VideoSinkHandle` と分けている理由は、公開 API に
+ * 「自分でフレームを描く」口を出さないことである（描画の責務は SDK 側にある）。
+ */
+export interface FrameSink extends VideoSinkHandle {
+  readonly draw: (frame: MediaFrame) => void;
 }
 
 export interface Participant {
@@ -74,10 +94,6 @@ export type MeetingEventName = keyof MeetingEvents;
 export interface MeetingLinks {
   /** ctl 部屋へ制御メッセージを送る。 */
   readonly sendControl: (text: string) => void;
-  /** 映像送信部屋へ制御メッセージを送る。 */
-  readonly sendVideoControl: (text: string) => void;
-  /** 音声送信部屋へ制御メッセージを送る。 */
-  readonly sendAudioControl: (text: string) => void;
   /**
    * 映像受信部屋へ制御メッセージを送る。
    * 表示寸法の申告と購読の要求はここへ送る（画質の判断主体は受信側ユーザー部屋である）。
@@ -89,7 +105,7 @@ export interface MeetingLinks {
 
 /** 受け皿の生成。環境依存であるため注入する。 */
 export interface SinkFactory {
-  readonly create: (participantId: string) => VideoSinkHandle;
+  readonly create: (participantId: string) => FrameSink;
 }
 
 export interface MeetingOptions {
@@ -112,6 +128,14 @@ export class Meeting {
   private phase: MeetingPhase = "connecting";
 
   private readonly members = new Map<string, Participant>();
+
+  /**
+   * 参加者ごとのフレームの宛先。
+   *
+   * `Participant.video` は公開 API（`VideoSinkHandle`）であり `draw` を持たない。
+   * 入口が復号したフレームを流し込むため、生成した `FrameSink` をここに保持する。
+   */
+  private readonly frameSinks = new Map<string, FrameSink>();
 
   private speaker: string | null = null;
 
@@ -150,6 +174,8 @@ export class Meeting {
 
   constructor(options: MeetingOptions) {
     this.options = options;
+    const selfSink = options.sinks.create(options.selfId);
+    this.frameSinks.set(options.selfId, selfSink);
     this.members.set(options.selfId, {
       id: options.selfId,
       displayName: options.displayName,
@@ -159,8 +185,16 @@ export class Meeting {
       microphoneEnabled: true,
       screenSharing: false,
       receivedProfile: null,
-      video: options.sinks.create(options.selfId),
+      video: selfSink,
     });
+  }
+
+  /**
+   * 参加者のフレームの宛先。入口が復号したフレームを渡すために使う。
+   * 未知の参加者では undefined を返す（例外を投げない）。
+   */
+  sinkFor(participantId: string): FrameSink | undefined {
+    return this.frameSinks.get(participantId);
   }
 
   get state(): MeetingPhase {
@@ -206,14 +240,20 @@ export class Meeting {
     return this.framesEnabled;
   }
 
+  /**
+   * カメラの入切。
+   *
+   * 宛先は `ctl` である。会議全体へ配る必要があるためである（他の参加者の一覧に
+   * 消音と映像の停止を出す）。送信部屋へ送っても誰も見ていない。
+   */
   setCamera(enabled: boolean): void {
     this.updateSelf((self) => ({ ...self, cameraEnabled: enabled }));
-    this.options.links.sendVideoControl(JSON.stringify({ t: "mediaState", kind: "camera", enabled }));
+    this.options.links.sendControl(JSON.stringify({ t: "mediaState", kind: "camera", enabled }));
   }
 
   setMicrophone(enabled: boolean): void {
     this.updateSelf((self) => ({ ...self, microphoneEnabled: enabled }));
-    this.options.links.sendAudioControl(JSON.stringify({ t: "mediaState", kind: "microphone", enabled }));
+    this.options.links.sendControl(JSON.stringify({ t: "mediaState", kind: "microphone", enabled }));
   }
 
   startScreenShare(): void {
@@ -272,6 +312,8 @@ export class Meeting {
     if (this.members.has(input.id)) {
       return;
     }
+    const sink = this.options.sinks.create(input.id);
+    this.frameSinks.set(input.id, sink);
     const participant: Participant = {
       id: input.id,
       displayName: input.displayName,
@@ -281,7 +323,7 @@ export class Meeting {
       microphoneEnabled: true,
       screenSharing: false,
       receivedProfile: null,
-      video: this.options.sinks.create(input.id),
+      video: sink,
     };
     this.members.set(input.id, participant);
     this.emit("participantJoined", participant);
@@ -291,6 +333,9 @@ export class Meeting {
     if (!this.members.delete(participantId)) {
       return;
     }
+    // 受け皿を解放する。解放しないと寸法の観測（ResizeObserver）が残る。
+    this.frameSinks.get(participantId)?.detach();
+    this.frameSinks.delete(participantId);
     if (this.speaker === participantId) {
       this.speaker = null;
       this.emit("activeSpeakerChanged", null);
@@ -312,7 +357,16 @@ export class Meeting {
     if (this.speaker === participantId) {
       return;
     }
+    const previous = this.speaker;
     this.speaker = participantId;
+    // 発話中の印を参加者へ反映する。反映しないと `Participant.speaking` が常に false になり、
+    // 利用側は誰が話しているかを描けない（sdk-api.md 3 節）。
+    if (previous !== null) {
+      this.updateParticipant(previous, { speaking: false });
+    }
+    if (participantId !== null) {
+      this.updateParticipant(participantId, { speaking: true });
+    }
     this.emit("activeSpeakerChanged", participantId);
   }
 
@@ -362,14 +416,17 @@ export class Meeting {
 
 /**
  * 利用者 ID からワイヤの senderId を導く。
- * 入口と同じ算出でなければ申告が別人に届く。算出は 1 箇所に置く。
+ *
+ * 算出は `naming.ts` の `fnv1a32`（参照実装）に委ねる。**ここで書き直してはならない。**
+ * 以前はこのファイルに独立した実装があり、`hash * 0x01000193` を浮動小数点で計算していた。
+ * 積が 2^53 を超えるため下位ビットが失われ、FNV-1a の定義と**すべての入力で**値が違った
+ * （実測: 20,000 件すべて不一致）。他の言語が規範どおりに実装すると別の senderId になり、
+ * 購読と表示寸法の申告が別人へ届く。同じ計算の実装を 2 つ持ってはならない。
+ *
+ * 0 は禁止であるため（wire-format.md 1.1）、0 になった場合のみ 1 へ寄せる。
  */
 export function senderIdOf(userId: string): number {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < userId.length; index += 1) {
-    hash = (hash ^ userId.charCodeAt(index)) >>> 0;
-    hash = Math.trunc(hash * 0x01000193) >>> 0;
-  }
+  const hash = fnv1a32(userId);
   return hash === 0 ? 1 : hash;
 }
 

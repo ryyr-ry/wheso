@@ -7,29 +7,20 @@
  * lint-policy.md 9 節: コアで浮動小数点・時刻・乱数・入出力を使わない。
  */
 
-import {
-  DELAY_TREND_DEGRADE_DEN,
-  DELAY_TREND_DEGRADE_NUM,
-  DELAY_TREND_RECOVER_DEN,
-  DELAY_TREND_RECOVER_NUM,
-} from "./generated/constants.ts";
 import { type Result, ok, err } from "./result.ts";
 
 /* ------------------------------------------------------------------------- */
 /* 閾値                                                                      */
 /* ------------------------------------------------------------------------- */
 
-/**
- * 閾値は有理数（分子と分母の整数対）としてスキーマに定義されている。
+/*
+ * 閾値の判定は呼び出し側が行う。
  *
- * なぜ小数の定数から変換しないか: 小数から有理数への変換は浮動小数点演算を伴い、
- * 言語ごとに丸めが一致しない。閾値の境界で判定が反転すると、トレースベクタの
- * 完全一致（conformance.md 4.4）が壊れる。したがって分子と分母を単一情報源
- * （spec/schema/constants.json）に整数として持たせ、コアは整数のみを読む。
- * ADR-0017。
+ * 閾値は有理数（分子と分母の整数対）としてスキーマに定義されており、判定は交差乗算で
+ * 行う（ADR-0017）。**このファイルに閾値を持たせない。** 中継ノードと受信ノードは
+ * 同じ勾配に対して別の閾値を使うため（購読単位と会議単位）、閾値を共有すると
+ * どちらかが誤った値で判定する。
  */
-const DEGRADE_RATIONAL = { num: DELAY_TREND_DEGRADE_NUM, den: DELAY_TREND_DEGRADE_DEN } as const;
-const RECOVER_RATIONAL = { num: DELAY_TREND_RECOVER_NUM, den: DELAY_TREND_RECOVER_DEN } as const;
 
 /** 整数演算の失敗。例外を投げず Result で返す（コーディング規約）。 */
 export type FixedErrorCode = "E_FIXED_DIVIDE_BY_ZERO" | "E_FIXED_RANGE";
@@ -121,52 +112,8 @@ export function delaySlope(samplesUs: readonly number[]): Slope {
 /* 閾値判定                                                                  */
 /* ------------------------------------------------------------------------- */
 
-/**
- * 輻輳の予兆を判定する。
- *
- * 判定: slope > DELAY_TREND_DEGRADE
- * 交差乗算: numerator / denominator > degradeNum / degradeDen
- *         ⟺ numerator × degradeDen > denominator × degradeNum
- *
- * 分母（denominator と degradeDen）が共に正であるため不等号の向きは変わらない。
- */
-export function isDegrading(slope: Slope): boolean {
-  // numerator × degradeDen > denominator × degradeNum
-  return slope.numerator * DEGRADE_RATIONAL.den > slope.denominator * DEGRADE_RATIONAL.num;
-}
 
-/**
- * 回復を判定する。
- *
- * 判定: slope < DELAY_TREND_RECOVER
- * 交差乗算: numerator / denominator < recoverNum / recoverDen
- *         ⟺ numerator × recoverDen < denominator × recoverNum
- *
- * recoverDen は正（200）。denominator は正。不等号の向きは変わらない。
- */
-export function isRecovering(slope: Slope): boolean {
-  // numerator × recoverDen < denominator × recoverNum
-  return slope.numerator * RECOVER_RATIONAL.den < slope.denominator * RECOVER_RATIONAL.num;
-}
 
-/* ------------------------------------------------------------------------- */
-/* 巻き戻り 32bit 演算                                                       */
-/* ------------------------------------------------------------------------- */
-
-/**
- * 32bit 符号なし整数に切り詰める。
- *
- * 既存の naming.ts は `hash >>> 0` と `Math.imul` で 32bit 巻き戻りを行う。
- * 本関数は同じ意味を明示的なヘルパとして提供する。
- * naming.ts の fnv1a32 / fmix32 と結果が一致する。
- */
-export function wrap32(value: number): number {
-  return value >>> 0;
-}
-
-/* ------------------------------------------------------------------------- */
-/* 切り捨て整数除算                                                          */
-/* ------------------------------------------------------------------------- */
 
 /**
  * 切り捨て整数除算。商をゼロ方向に丸める。
@@ -196,3 +143,14 @@ export function truncDiv(dividend: number, divisor: number): Result<number, Fixe
 
 /** 観測窓の大きさ。generated の定数から公開する。 */
 export { DELAY_TREND_WINDOW } from "./generated/constants.ts";
+
+/**
+ * 32 bit の符号なしへの切り詰め。
+ *
+ * `naming.ts` の `fnv1a32`（`Math.imul` と `>>> 0`）と同じ動作をする。ハッシュと
+ * `sequenceNumber` の巻き戻し（wire-format.md 1.2）で使う。**言語ごとに違う演算子を
+ * 使わないため、切り詰めを 1 箇所に置く。**
+ */
+export function wrap32(value: number): number {
+  return value >>> 0;
+}

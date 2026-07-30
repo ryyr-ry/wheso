@@ -31,27 +31,57 @@ import {
   type StandbyDeps,
   type StandbySocket,
 } from "../packages/client/src/transport/standby.ts";
-import { createMeeting, type VideoSinkHandle } from "../packages/client/src/api/meeting.ts";
+import { createMeeting, type FrameSink } from "../packages/client/src/api/meeting.ts";
 import {
   applyControlMessage,
   joinWith,
-  resolveProfiles,
   senderIdFrom,
   type JoinSocket,
+  type ControlHooks,
 } from "../packages/client/src/api/join-meeting.ts";
+import type { CaptureDeps } from "../packages/client/src/media/browser-capture.ts";
 import { DELAY_TREND_WINDOW, REPORT_INTERVAL_MS } from "../packages/core/src/generated/constants.ts";
 
 const T0 = 4_000_000;
+
+/** 取得と符号化の偽物。WebCodecs は Node に無い。呼ばれたことだけを数える。 */
+const NO_CAPTURE: CaptureDeps = {
+  bindCapture: (): void => undefined,
+  startCapture: async (): Promise<{ source: null; video: false; audio: false }> => ({
+    source: null,
+    video: false,
+    audio: false,
+  }),
+  configureVideo: (): void => undefined,
+  configureAudio: (): void => undefined,
+  requestKeyframe: (): void => undefined,
+  setVideoEnabled: (): void => undefined,
+  setAudioEnabled: (): void => undefined,
+  encodeQueueSize: (): number => 0,
+  close: (): void => undefined,
+};
 
 /** 識別子は規範の形式に従う（room-naming.md 1 節）。ULID 小文字 26 文字と 16 進 32 文字である。 */
 const MEETING_ID = "01jxy8kq2r3mz5v7h9abcderfa";
 const USER_ID = "550e8400e29b41d4a716446655440000";
 
-function sink(): VideoSinkHandle {
+function sink(drawn: unknown[] = []): FrameSink {
   return {
     attach: (): void => undefined,
     detach: (): void => undefined,
     setDisplaySize: (): void => undefined,
+    draw: (frame): void => {
+      drawn.push(frame);
+    },
+  };
+}
+
+/** ctl の取っ手。既定では何も記録しない。 */
+function hooks(overrides: Partial<ControlHooks> = {}): ControlHooks {
+  return {
+    onCatalog: (): void => undefined,
+    onMediaState: (): void => undefined,
+    ...overrides,
   };
 }
 
@@ -163,8 +193,6 @@ test("Meeting は状態と参加者の変化をイベントで通知する", () 
     displayName: "自分",
     links: {
       sendControl: (text) => sent.push(text),
-      sendVideoControl: (text) => sent.push(text),
-      sendAudioControl: (text) => sent.push(text),
       sendVideoReceiveControl: (text) => sent.push(text),
       closeAll: () => sent.push("closeAll"),
     },
@@ -207,8 +235,6 @@ test("Meeting の操作は制御メッセージになり、フレーム通知は
     displayName: "自分",
     links: {
       sendControl: (text) => sent.push(text),
-      sendVideoControl: (text) => sent.push(text),
-      sendAudioControl: (text) => sent.push(text),
       sendVideoReceiveControl: (text) => sent.push(text),
       closeAll: () => sent.push("closeAll"),
     },
@@ -245,15 +271,13 @@ test("ctl 部屋のメッセージが Meeting へ反映される", () => {
     displayName: "自分",
     links: {
       sendControl: (): void => undefined,
-      sendVideoControl: (): void => undefined,
-      sendAudioControl: (): void => undefined,
       sendVideoReceiveControl: (): void => undefined,
       closeAll: (): void => undefined,
     },
     sinks: { create: () => sink() },
   });
 
-  applyControlMessage(meeting, JSON.stringify({ t: "helloAck" }), T0);
+  applyControlMessage(meeting, JSON.stringify({ t: "helloAck" }), T0, hooks());
   assert.equal(meeting.state, "active");
 
   applyControlMessage(
@@ -266,6 +290,7 @@ test("ctl 部屋のメッセージが Meeting へ反映される", () => {
       ],
     }),
     T0,
+    hooks(),
   );
   assert.equal(meeting.participants.length, 2);
 
@@ -274,36 +299,30 @@ test("ctl 部屋のメッセージが Meeting へ反映される", () => {
     meeting,
     JSON.stringify({ t: "participants", entries: [{ userId: "u-self", senderId: 1, role: "host" }] }),
     T0,
+    hooks(),
   );
   assert.equal(meeting.participants.length, 1);
 
   const chats: string[] = [];
   meeting.on("chatReceived", (event) => chats.push(`${event.from}:${event.text}`));
-  applyControlMessage(meeting, JSON.stringify({ t: "chat", from: "u-b", text: "やあ" }), T0);
+  applyControlMessage(meeting, JSON.stringify({ t: "chat", from: "u-b", text: "やあ" }), T0, hooks());
   assert.deepEqual(chats, ["u-b:やあ"]);
 
-  applyControlMessage(meeting, JSON.stringify({ t: "activeSpeaker", participantId: "u-b" }), T0);
+  applyControlMessage(meeting, JSON.stringify({ t: "activeSpeaker", participantId: "u-b" }), T0, hooks());
   assert.equal(meeting.activeSpeakerId, "u-b");
 
   const warnings: string[] = [];
   meeting.on("warning", (code) => warnings.push(code));
-  applyControlMessage(meeting, JSON.stringify({ t: "warning", code: "W_DEGRADED" }), T0);
+  applyControlMessage(meeting, JSON.stringify({ t: "warning", code: "W_DEGRADED" }), T0, hooks());
   assert.deepEqual(warnings, ["W_DEGRADED"]);
 
-  applyControlMessage(meeting, JSON.stringify({ t: "error", code: "E_AUTH" }), T0, (code) => errors.push(code));
+  applyControlMessage(meeting, JSON.stringify({ t: "error", code: "E_AUTH" }), T0, hooks({ onError: (code) => errors.push(code) }));
   assert.deepEqual(errors, ["E_AUTH"], "文言ではなくコードを渡す");
 
   // 未知の t と壊れた JSON は無視する。
-  applyControlMessage(meeting, JSON.stringify({ t: "未知" }), T0);
-  applyControlMessage(meeting, "{壊れている", T0);
+  applyControlMessage(meeting, JSON.stringify({ t: "未知" }), T0, hooks());
+  applyControlMessage(meeting, "{壊れている", T0, hooks());
   assert.equal(meeting.state, "active");
-});
-
-test("送信プロファイルは能力から決まり、明示した場合は最低品質と組む", () => {
-  const capable = { hardwareAv1For4K60: true, encodeAv1: true, mobile: false, charging: true };
-  assert.deepEqual(resolveProfiles(capable), ["V_4K60", "V_360P15"]);
-  assert.deepEqual(resolveProfiles(capable, "V_1080P30"), ["V_1080P30", "V_360P15"]);
-  assert.deepEqual(resolveProfiles(capable, "V_360P15"), ["V_360P15"], "最低品質のみは重ねない");
 });
 
 test("senderId は利用者 ID から決定的に決まり 0 にならない", () => {
@@ -331,9 +350,26 @@ function fakeToken(meetingId: string, userId: string): string {
   return `${header}.${payload}.c2ln`;
 }
 
+
+/** 何もしない復号と音声再生の口。受信経路そのものは別の試験が検証する。 */
+const NO_MEDIA = {
+  configureDecoder: (): void => undefined,
+  resetDecoder: (): void => undefined,
+  closeDecoder: (): void => undefined,
+  decodeVideo: (): void => undefined,
+  enqueueAudio: (): void => undefined,
+};
+
+/** タイマーを起こさない注入。参加の手順だけを見る試験で使う。 */
+const NO_TIMERS = {
+  scheduleAt: (): (() => void) => (): void => undefined,
+  setPeriodic: (): (() => void) => (): void => undefined,
+};
+
 test("参加は 5 個の部屋へ接続し hello と streamAnnounce を送る", async () => {
   const opened: string[] = [];
   const sentByRole = new Map<string, string[]>();
+  const textHandlers = new Map<string, (text: string) => void>();
   const deps = {
     openSocket: (url: string, role: string): JoinSocket => {
       opened.push(role);
@@ -344,13 +380,27 @@ test("参加は 5 個の部屋へ接続し hello と streamAnnounce を送る", 
         send: (text: string): void => {
           log.push(text);
         },
+        sendBinary: (): void => undefined,
         close: (): void => undefined,
-        onText: (): void => undefined,
+        onText: (handler: (text: string) => void): void => {
+          textHandlers.set(role, handler);
+        },
+        onBinary: (): void => undefined,
+        // 開いたことを直ちに伝える。リンクはこれを受けて hello を送る。
+        onOpen: (handler: () => void): void => handler(),
+        onClose: (): void => undefined,
+        bufferedBytes: (): number => 0,
       };
     },
-    createSink: (): VideoSinkHandle => sink(),
+    createSink: (): FrameSink => sink(),
+    bindOutput: (): void => undefined,
     capability: { hardwareAv1For4K60: false, encodeAv1: true, mobile: false, charging: true },
+    // はしごは源から導出する（ADR-0026）。試験では 1080p30 の源を与える。
+    source: { width: 1920, height: 1080, framerate: 30 },
     now: (): number => T0,
+    ...NO_TIMERS,
+    media: NO_MEDIA,
+    capture: NO_CAPTURE,
   };
 
   const url = `https://example.test/j/${MEETING_ID}#${fakeToken(MEETING_ID, USER_ID)}`;
@@ -360,6 +410,12 @@ test("参加は 5 個の部屋へ接続し hello と streamAnnounce を送る", 
     return;
   }
   assert.deepEqual(opened, ["ctl", "vs", "vr", "as", "ar"], "5 個の部屋へ接続する");
+
+  // `streamAnnounce` と `subscribe` は `ACTIVE` へ入ってから送る（ADR-0032）。
+  // `helloAck` を返さない限り送られない。これは仕様どおりである。
+  for (const [, handler] of textHandlers) {
+    handler(JSON.stringify({ t: "helloAck" }));
+  }
 
   for (const role of opened) {
     const log = sentByRole.get(role) ?? [];
@@ -373,19 +429,31 @@ test("参加は 5 個の部屋へ接続し hello と streamAnnounce を送る", 
     videoSend.some((text) => text.includes('"t":"streamAnnounce"')),
     "送信部屋へ構成を申告する",
   );
-  assert.equal(joined.value.meeting.state, "connecting", "helloAck を待つ");
+  assert.equal(joined.value.meeting.state, "active", "ctl の helloAck で active になる");
+  assert.equal(joined.value.links.get("ctl")?.phase(), "ACTIVE");
 });
 
 test("参加は不正な URL とトークンで失敗を返す（例外を投げない）", async () => {
   const deps = {
     openSocket: (): JoinSocket => ({
       send: (): void => undefined,
+      sendBinary: (): void => undefined,
       close: (): void => undefined,
       onText: (): void => undefined,
+      onBinary: (): void => undefined,
+      onOpen: (): void => undefined,
+      onClose: (): void => undefined,
+      bufferedBytes: (): number => 0,
     }),
-    createSink: (): VideoSinkHandle => sink(),
+    createSink: (): FrameSink => sink(),
+    bindOutput: (): void => undefined,
     capability: { hardwareAv1For4K60: false, encodeAv1: true, mobile: false, charging: true },
+    // はしごは源から導出する（ADR-0026）。試験では 1080p30 の源を与える。
+    source: { width: 1920, height: 1080, framerate: 30 },
     now: (): number => T0,
+    ...NO_TIMERS,
+    media: NO_MEDIA,
+    capture: NO_CAPTURE,
   };
   const noToken = await joinWith(`https://example.test/j/${MEETING_ID}`, deps);
   assert.equal(noToken.ok, false);
@@ -395,8 +463,11 @@ test("参加は不正な URL とトークンで失敗を返す（例外を投げ
   assert.equal(badToken.ok, false);
 });
 
-test("接続を開けない場合は開いた分を閉じて失敗を返す", async () => {
-  const closed: string[] = [];
+test("**接続を開けなくても参加は失敗しない。リンクが再接続を待つ**", () => {
+  // 一時的に開けないことは頻繁に起きる（回線の瞬断、ノードの起動待ち）。
+  // ここで参加そのものを失敗させると、利用者は入り直すことになる。
+  // 接続の失敗は状態機械が扱う（`RECONNECT_WAIT` へ入り、バックオフ後に再試行する）。
+  const scheduled: number[] = [];
   const deps = {
     openSocket: (_url: string, role: string): JoinSocket | null => {
       if (role === "vr") {
@@ -404,18 +475,36 @@ test("接続を開けない場合は開いた分を閉じて失敗を返す", as
       }
       return {
         send: (): void => undefined,
-        close: (): void => {
-          closed.push(role);
-        },
+        sendBinary: (): void => undefined,
+        close: (): void => undefined,
         onText: (): void => undefined,
+        onBinary: (): void => undefined,
+        onOpen: (handler: () => void): void => handler(),
+        onClose: (): void => undefined,
+        bufferedBytes: (): number => 0,
       };
     },
-    createSink: (): VideoSinkHandle => sink(),
+    createSink: (): FrameSink => sink(),
+    bindOutput: (): void => undefined,
     capability: { hardwareAv1For4K60: false, encodeAv1: true, mobile: false, charging: true },
+    source: { width: 1920, height: 1080, framerate: 30 },
     now: (): number => T0,
+    scheduleAt: (atMs: number): (() => void) => {
+      scheduled.push(atMs);
+      return (): void => undefined;
+    },
+    setPeriodic: (): (() => void) => (): void => undefined,
+    media: NO_MEDIA,
+    capture: NO_CAPTURE,
   };
   const url = `https://example.test/j/${MEETING_ID}#${fakeToken(MEETING_ID, USER_ID)}`;
-  const result = await joinWith(url, deps);
-  assert.equal(result.ok, false);
-  assert.deepEqual(closed, ["ctl", "vs"], "開いた接続を残さない");
+  return joinWith(url, deps).then((result) => {
+    assert.equal(result.ok, true, "参加は成立する");
+    if (!result.ok) {
+      return;
+    }
+    assert.equal(result.value.links.get("vr")?.phase(), "RECONNECT_WAIT", "開けない部屋は再接続を待つ");
+    assert.equal(result.value.links.get("ctl")?.phase(), "HELLO_SENT", "開けた部屋は進む");
+    assert.ok(scheduled.length > 0, "バックオフを予約する");
+  });
 });

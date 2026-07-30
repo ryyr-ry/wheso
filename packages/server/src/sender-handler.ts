@@ -32,6 +32,14 @@ const INBOUND_WINDOW_MS = 1000;
 
 /** 送信の口。実装は Durable Object 側が与える。 */
 export interface SenderTransport {
+  /**
+   * 渡さなかったことを記録する（観測のため。判断には使わない）。
+   *
+   * **これが無いと「送ったのに届かない」の原因が分からない。** 実測では送信ノードが
+   * 52 件の入力のうち 43 件を渡さなかったが、計数が無いため窓なのか層の選択なのかを
+   * 外から区別できなかった（F-064）。
+   */
+  noteDrop(priority: number): void;
   /** 割当先シャードへメディアを送る。peer は現行（1）か次期（2）である。 */
   sendToShard(peer: number, bytes: Uint8Array): void;
   /** 割当先シャードへ制御メッセージを送る。 */
@@ -49,6 +57,11 @@ export interface SenderTransport {
   closeClient(code: number, reason: string): void;
   /** 制御系へ報告する。 */
   notifyControl(code: string): void;
+  /**
+   * 制御系（`ctl` 部屋）へ本文をそのまま送る。
+   * はしごの申告を会議全体へ配るために使う（ADR-0027 の 1）。
+   */
+  sendTextToControl(text: string): void;
   /** 指定時刻に timer イベントを起こすよう要求する。 */
   scheduleAt(atMs: number): void;
 }
@@ -62,10 +75,23 @@ export interface SenderHandlerState {
   readonly keyframeMarks: readonly KeyframeMark[];
   /** クライアント接続からの受信メッセージ数の窓（auth.md 5 節）。 */
   readonly inbound: RateWindow;
+  /**
+   * このノードが担当する送信者のワイヤ上の ID。
+   *
+   * `hello` で受け取った値である（wire-format.md 2.1）。**0 を書いてはならない。**
+   * 以前は `streamCatalogUpdate` に 0 を直書きしていたため、`ctl` が集約するはしごが
+   * 全送信者で 1 件に潰れ、受信ノードは誰のはしごも引けなかった。
+   */
+  readonly senderId: number;
 }
 
 export function createSenderHandlerState(epoch: number, nowMs: number): SenderHandlerState {
-  return { core: initialSenderState(epoch), keyframeMarks: [], inbound: initialRateWindow(nowMs) };
+  return { core: initialSenderState(epoch), keyframeMarks: [], inbound: initialRateWindow(nowMs), senderId: 0 };
+}
+
+/** `hello` を通したときに担当する送信者 ID を記録する。 */
+export function noteSenderId(state: SenderHandlerState, senderId: number): SenderHandlerState {
+  return { ...state, senderId };
 }
 
 /**
@@ -131,7 +157,68 @@ export function handleClientText(
   if (limited.exceeded) {
     return limited.state;
   }
+  // はしごの申告は 3 箇所が必要とする。
+  //   1. 送信ノード自身（送信窓の fps。congestion.md 2 節）
+  //   2. 中継ノード（渡す段を 1 つ選ぶ。ADR-0027 の 3）
+  //   3. `ctl` 部屋（会議全体へ配り、受信ノードが費用と段を決める。ADR-0027 の 1）
+  // 1 箇所でも欠けると、段の選択か費用の見積りが実体と合わなくなる。
+  relayAnnounce(text, limited.state.senderId, transport);
   return stepText(limited.state, text, nowMs, transport);
+}
+
+/** `streamAnnounce` を中継ノードと `ctl` 部屋へ写す。判断は行わない。 */
+function relayAnnounce(text: string, senderId: number, transport: SenderTransport): void {
+  const message = parseObject(text);
+  if (message === null || message["t"] !== "streamAnnounce") {
+    return;
+  }
+  const streams = message["streams"];
+  if (!Array.isArray(streams)) {
+    return;
+  }
+  // 中継ノードへはそのまま渡す（形式は wire-format.md 2.3 のまま）。
+  transport.sendTextToShard(SHARD_PEER_CURRENT, text);
+
+  // `ctl` へはチャネルごとに 1 通にまとめて渡す。カタログの単位が (senderId, channel) である。
+  const byChannel = new Map<number, Record<string, unknown>[]>();
+  for (const stream of streams) {
+    if (typeof stream !== "object" || stream === null) {
+      continue;
+    }
+    const record: Record<string, unknown> = { ...stream };
+    const channel = record["channel"];
+    if (!isInteger(channel)) {
+      continue;
+    }
+    const existing = byChannel.get(channel);
+    if (existing === undefined) {
+      byChannel.set(channel, [record]);
+      continue;
+    }
+    existing.push(record);
+  }
+  for (const channel of [...byChannel.keys()].sort((a, b) => a - b)) {
+    const rungs = byChannel.get(channel);
+    if (rungs === undefined) {
+      continue;
+    }
+    transport.sendTextToControl(
+      JSON.stringify({
+        t: "streamCatalogUpdate",
+        // 送信者 ID はワイヤの senderId であり、`ctl` が hello で受け取った値と一致する。
+        senderId,
+        channel,
+        rungs: rungs.map((rung) => ({
+          spatialId: rung["spatialId"],
+          width: rung["width"],
+          height: rung["height"],
+          framerate: rung["framerate"],
+          temporalLayers: rung["temporalLayers"],
+          targetBitrate: rung["targetBitrate"],
+        })),
+      }),
+    );
+  }
 }
 
 /**
@@ -261,7 +348,8 @@ function applyCommand(command: SenderCommand, transport: SenderTransport): void 
       // forward は呼び出し側が扱う。
       return;
     case "drop":
-      // 渡さないことで表現される。
+      // 渡さないことで表現される。理由の内訳は優先順位で観測する。
+      transport.noteDrop(command.priority);
       return;
     case "connect":
       transport.connectShard(command.peer);

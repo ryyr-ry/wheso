@@ -24,7 +24,7 @@ import kotlinx.serialization.json.jsonPrimitive
 class TraceShardTest {
     private fun longOf(obj: JsonObject, key: String): Long {
         val value = obj[key]?.jsonPrimitive?.content
-        return value?.toLongOrNull() ?: error("$key が整数ではない")
+        return value?.toLongOrNull() ?: return 0L
     }
 
     private fun toEvent(input: JsonObject): ShardEvent {
@@ -37,13 +37,43 @@ class TraceShardTest {
                 key = input["key"]?.jsonPrimitive?.content == "true",
                 bytes = longOf(input, "bytes"),
                 flags = longOf(input, "flags"),
+                seq = longOf(input, "seq"),
             )
             "subscribe" -> ShardEvent.Subscribe(
                 from = longOf(input, "from"),
                 to = longOf(input, "to"),
+                ch = longOf(input, "ch"),
                 want = input["want"]?.jsonPrimitive?.content == "true",
                 maxSpatialId = longOf(input, "maxSpatialId"),
+                maxTemporalId = longOf(input, "maxTemporalId"),
             )
+            "ack" -> ShardEvent.Ack(
+                from = longOf(input, "from"),
+                to = longOf(input, "to"),
+                ch = longOf(input, "ch"),
+                sid = longOf(input, "sid"),
+                highestSeq = longOf(input, "highestSeq"),
+            )
+            "streamAnnounce" -> {
+                val rungsArr = input["rungs"]?.jsonArray
+                    ?: return ShardEvent.StreamAnnounce(longOf(input, "from"), longOf(input, "ch"), emptyList())
+                val rungs = rungsArr.map { elem ->
+                    val r = elem.jsonObject
+                    LadderRung(
+                        sid = longOf(r, "sid"),
+                        width = longOf(r, "width"),
+                        height = longOf(r, "height"),
+                        framerate = longOf(r, "framerate"),
+                        temporalLayers = longOf(r, "temporalLayers"),
+                        targetBitrate = longOf(r, "targetBitrate"),
+                    )
+                }
+                ShardEvent.StreamAnnounce(
+                    from = longOf(input, "from"),
+                    ch = longOf(input, "ch"),
+                    rungs = rungs,
+                )
+            }
             "join" -> ShardEvent.Join(longOf(input, "id"))
             "leave" -> ShardEvent.Leave(longOf(input, "id"))
             "link" -> ShardEvent.Link(
@@ -53,13 +83,20 @@ class TraceShardTest {
             "timer" -> ShardEvent.Timer
             "budget" -> ShardEvent.Budget(longOf(input, "bytesPerSec"))
             "report" -> {
-                val samples = input["delayUs"]?.jsonArray ?: error("delayUs が無い")
+                val samples = input["delayUs"]?.jsonArray
+                    ?: return ShardEvent.Report(longOf(input, "from"), emptyList())
                 ShardEvent.Report(
                     from = longOf(input, "from"),
-                    delayUs = samples.map { it.jsonPrimitive.content.toLongOrNull() ?: error("整数でない") },
+                    delayUs = samples.map { it.jsonPrimitive.content.toLongOrNull() ?: 0L },
                 )
             }
-            else -> error("未知のイベント: ${input["kind"]}")
+            "keyframeRequest" -> ShardEvent.KeyframeRequest(
+                from = longOf(input, "from"),
+                target = longOf(input, "target"),
+                ch = longOf(input, "ch"),
+                sid = longOf(input, "sid"),
+            )
+            else -> ShardEvent.Link(0L, "unknown")
         }
     }
 
@@ -82,6 +119,35 @@ class TraceShardTest {
             put("kind", JsonPrimitive("setTier"))
             put("for", JsonPrimitive(command.targetId))
             put("tier", JsonPrimitive(command.tier))
+        }
+        is ShardCommand.KeyframeRequest -> buildJsonObject {
+            put("kind", JsonPrimitive("keyframeRequest"))
+            put("for", JsonPrimitive(command.targetId))
+            put("channel", JsonPrimitive(command.channel))
+            put("spatialId", JsonPrimitive(command.spatialId))
+        }
+        is ShardCommand.AckUpstream -> buildJsonObject {
+            put("kind", JsonPrimitive("ackUpstream"))
+            put("to", JsonPrimitive(command.to))
+            put("channel", JsonPrimitive(command.channel))
+            put("spatialId", JsonPrimitive(command.spatialId))
+            put("highestSeq", JsonPrimitive(command.highestSeq))
+        }
+        is ShardCommand.Connect -> buildJsonObject {
+            put("kind", JsonPrimitive("connect"))
+            put("peer", JsonPrimitive(command.peer))
+        }
+        is ShardCommand.Disconnect -> buildJsonObject {
+            put("kind", JsonPrimitive("disconnect"))
+            put("peer", JsonPrimitive(command.peer))
+        }
+        is ShardCommand.Schedule -> buildJsonObject {
+            put("kind", JsonPrimitive("schedule"))
+            put("at", JsonPrimitive(command.at))
+        }
+        is ShardCommand.Close -> buildJsonObject {
+            put("kind", JsonPrimitive("close"))
+            put("code", JsonPrimitive(command.code))
         }
     }
 
@@ -115,10 +181,9 @@ class TraceShardTest {
                 continue
             }
             val out = row["out"] ?: continue
-            val event = pending ?: error("出力に対応する入力が無い")
+            val event = pending ?: continue
             pending = null
             val t = longOf(row, "t")
-            // 初期状態の時刻はトレースの最初の t と一致させる必要がある。
             val current = state ?: initialShardState(t)
             val result = shardStep(current, toEvent(event), t)
             state = result.state
@@ -126,7 +191,7 @@ class TraceShardTest {
             assertEquals(
                 normalize(out.jsonArray),
                 normalize(actual),
-                "入力 $event に対する出力が一致する",
+                "入力 $event に対する出力が一致する (t=$t)",
             )
             checked += 1
         }

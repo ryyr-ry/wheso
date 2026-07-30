@@ -172,7 +172,7 @@ test("表 17 行目: SWAPPING でキーフレームを受けると ACTIVE へ戻
   const swapping = connectionStep(withStandby, { kind: "stall", durationMs: VIDEO_STALL_RESET_MS + 1 }, 100).state;
   const result = connectionStep(swapping, { kind: "standbyKeyframe" }, 150);
   assert.equal(result.state.phase, "ACTIVE");
-  assert.deepEqual(kinds(result.commands), ["closeSocket", "startStandby", "warn"]);
+  assert.deepEqual(kinds(result.commands), ["closeSocket", "sendSubscribe", "startStandby", "warn"]);
   assert.equal(result.state.standbyReady, false, "新しい予備接続を確立するまでは使えない");
 });
 
@@ -260,4 +260,21 @@ test("FAILED では open() 以外のいかなるイベントでも復帰しな�
     assert.equal(result.state.phase, "FAILED", `${event.kind} では復帰しない`);
     assert.equal(result.commands.length, 0, `${event.kind} では副作用を出さない`);
   }
+});
+
+test("**ACTIVE へ入るすべての遷移で購読を送り直す**（ADR-0032）", () => {
+  // 購読は接続に紐づく。送り直さないと再接続後に無音の黒画面になる。
+  const helloAck = connectionStep(
+    connectionStep(connectionStep(initialConnectionState(0), { kind: "open" }, 0).state, { kind: "socketOpen" }, 10)
+      .state,
+    { kind: "helloAck" },
+    20,
+  );
+  assert.equal(helloAck.state.phase, "ACTIVE");
+  assert.ok(kinds(helloAck.commands).includes("sendSubscribe"), "helloAck の直後に送り直す");
+
+  const withStandby = connectionStep(activeState(), { kind: "standbyReady", ready: true }, 50).state;
+  const swapping = connectionStep(withStandby, { kind: "stall", durationMs: VIDEO_STALL_RESET_MS + 1 }, 100).state;
+  const swapped = connectionStep(swapping, { kind: "standbyKeyframe" }, 150);
+  assert.ok(kinds(swapped.commands).includes("sendSubscribe"), "予備接続への切替でも送り直す");
 });

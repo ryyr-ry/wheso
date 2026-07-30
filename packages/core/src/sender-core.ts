@@ -12,6 +12,8 @@
  */
 
 import {
+  ACK_TIMEOUT_MS,
+  MAX_UNEXPECTED_EVENTS,
   SEND_WINDOW_MS,
   EPOCH_DUAL_SUBSCRIBE_TIMEOUT_MS,
 } from "./generated/constants.ts";
@@ -30,6 +32,14 @@ export interface StreamWindow {
   readonly highestAcked: number;
   /** このストリームの fps。streamAnnounce で通知される。 */
   readonly framerate: number;
+  /**
+   * 最後に ack を受けた時刻（ミリ秒）。窓を作った時刻で初期化する。
+   *
+   * **ack が途絶えたときに窓を開け直すために持つ**（ADR-0038）。上流へ渡した媒体が
+   * 失われると（接続が整う前の数枚など）ack は永久に来ず、未確認量が増え続けて窓が
+   * 閉じたままになる。実測では 628 枚の入力に対し 3 枚しか上流へ渡らなかった（F-049）。
+   */
+  readonly lastAckAtMs: number;
 }
 
 export interface SenderState {
@@ -103,11 +113,11 @@ export function initialSenderState(epoch: number): SenderState {
 export function senderStep(state: SenderState, event: SenderEvent, t: number): SenderStepResult {
   switch (event.kind) {
     case "media":
-      return handleMedia(state, event);
+      return handleMedia(state, event, t);
     case "ack":
-      return handleAck(state, event);
+      return handleAck(state, event, t);
     case "streamAnnounce":
-      return handleAnnounce(state, event);
+      return handleAnnounce(state, event, t);
     case "epochChange":
       return handleEpochChange(state, event, t);
     case "newEpochFrame":
@@ -127,7 +137,11 @@ export function senderStep(state: SenderState, event: SenderEvent, t: number): S
  * 除算を避けるため、比較は交差乗算で行う。
  *   inFlightMs > SEND_WINDOW_MS ⇔ 未確認フレーム数 × 1000 > SEND_WINDOW_MS × fps
  */
-function handleMedia(state: SenderState, event: Extract<SenderEvent, { kind: "media" }>): SenderStepResult {
+function handleMedia(
+  state: SenderState,
+  event: Extract<SenderEvent, { kind: "media" }>,
+  t: number,
+): SenderStepResult {
   const window = findWindow(state, event.ch, event.sid);
   const framerate = window?.framerate ?? 0;
   const highestAcked = window?.highestAcked ?? 0;
@@ -135,6 +149,29 @@ function handleMedia(state: SenderState, event: Extract<SenderEvent, { kind: "me
 
   const priority = dropPriority(event.ch, event.flags);
   const overWindow = framerate > 0 && inFlight * 1000 > SEND_WINDOW_MS * framerate;
+
+  // **ack が途絶えたら窓を作り直す**（ADR-0038）。渡した媒体が失われると ack は来ない。
+  // 窓を閉じたままにすると、その 1 度の欠落で以後 1 枚も送れなくなる。
+  const lastAckAtMs = window?.lastAckAtMs ?? t;
+  if (overWindow && t - lastAckAtMs >= ACK_TIMEOUT_MS) {
+    return {
+      state: upsertWindow(state, {
+        channel: event.ch,
+        spatialId: event.sid,
+        highestSent: event.seq,
+        // この連番から数え直す。過去の未確認量は捨てる（相手は受け取っていない）。
+        highestAcked: event.seq - 1,
+        framerate,
+        lastAckAtMs: t,
+      }),
+      commands: [
+        {
+          kind: "forward",
+          to: state.phase === "DUAL_SUBSCRIBE" ? [SHARD_PEER_CURRENT, SHARD_PEER_NEXT] : [SHARD_PEER_CURRENT],
+        },
+      ],
+    };
+  }
 
   if (overWindow && priority !== null) {
     // 窓が閉じている間は渡さない。破棄禁止のユニット（KEY・音声）は渡す。
@@ -147,6 +184,7 @@ function handleMedia(state: SenderState, event: Extract<SenderEvent, { kind: "me
     highestSent: event.seq > (window?.highestSent ?? 0) ? event.seq : (window?.highestSent ?? 0),
     highestAcked,
     framerate,
+    lastAckAtMs,
   });
 
   // 二重購読中は新旧の両方へ渡す。切替の瞬間に映像を途切れさせないためである。
@@ -156,11 +194,15 @@ function handleMedia(state: SenderState, event: Extract<SenderEvent, { kind: "me
 }
 
 /** ack の適用。確認済みの位置は単調増加のみとする。 */
-function handleAck(state: SenderState, event: Extract<SenderEvent, { kind: "ack" }>): SenderStepResult {
+function handleAck(
+  state: SenderState,
+  event: Extract<SenderEvent, { kind: "ack" }>,
+  t: number,
+): SenderStepResult {
   const window = findWindow(state, event.ch, event.sid);
   if (window === undefined) {
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "ack"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "ack") },
       commands: [],
     };
   }
@@ -170,7 +212,7 @@ function handleAck(state: SenderState, event: Extract<SenderEvent, { kind: "ack"
     return { state, commands: [] };
   }
   return {
-    state: upsertWindow(state, { ...window, highestAcked: event.highestSeq }),
+    state: upsertWindow(state, { ...window, highestAcked: event.highestSeq, lastAckAtMs: t }),
     commands: [],
   };
 }
@@ -179,6 +221,7 @@ function handleAck(state: SenderState, event: Extract<SenderEvent, { kind: "ack"
 function handleAnnounce(
   state: SenderState,
   event: Extract<SenderEvent, { kind: "streamAnnounce" }>,
+  t: number,
 ): SenderStepResult {
   const window = findWindow(state, event.ch, event.sid);
   return {
@@ -188,6 +231,8 @@ function handleAnnounce(
       highestSent: window?.highestSent ?? 0,
       highestAcked: window?.highestAcked ?? 0,
       framerate: event.framerate,
+      // 申告の時点を起点にする。ここから ACK_TIMEOUT_MS 無音なら窓を作り直す。
+      lastAckAtMs: window?.lastAckAtMs ?? t,
     }),
     commands: [],
   };
@@ -202,7 +247,7 @@ function handleEpochChange(
   if (event.epoch <= state.epoch) {
     // epoch は単調増加のみである。後退する通知は無視して記録する。
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "epochChange"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "epochChange") },
       commands: [],
     };
   }
@@ -213,7 +258,7 @@ function handleEpochChange(
   if (state.phase !== "STEADY") {
     // 移行中の新たな epoch 変化は表に無い。記録して無視する。
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "epochChange"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "epochChange") },
       commands: [],
     };
   }
@@ -235,7 +280,7 @@ function handleEpochChange(
 function handleNewEpochFrame(state: SenderState): SenderStepResult {
   if (state.phase !== "DUAL_SUBSCRIBE") {
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "newEpochFrame"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "newEpochFrame") },
       commands: [],
     };
   }
@@ -289,4 +334,15 @@ function upsertWindow(state: SenderState, window: StreamWindow): SenderState {
     a.channel !== b.channel ? a.channel - b.channel : a.spatialId - b.spatialId,
   );
   return { ...state, windows: merged };
+}
+
+/**
+ * 表に無いイベントの記録に 1 件加える。**上限を超えたら古い側を捨てる。**
+ * 上限が無いと記録が無制限に伸び、Durable Object の記憶（128 MB。F-006）を食う。
+ */
+function appendUnexpected(events: readonly string[], name: string): readonly string[] {
+  const appended = [...events, name];
+  return appended.length > MAX_UNEXPECTED_EVENTS
+    ? appended.slice(appended.length - MAX_UNEXPECTED_EVENTS)
+    : appended;
 }

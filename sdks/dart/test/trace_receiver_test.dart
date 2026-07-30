@@ -10,10 +10,6 @@ import 'dart:io';
 import 'package:test/test.dart';
 import 'package:wheso_client/src/receiver_core.dart';
 
-/// 生成器（tools/traces-receiver.ts）と一致させる初期予算。
-/// 一致しなければ最初の再配分から出力が分かれる。
-const int initialBudgetBytesPerSec = 7000000;
-
 Map<String, Object?> readMap(Object? value, String where) {
   if (value is Map<String, Object?>) {
     return value;
@@ -61,6 +57,8 @@ ReceiverEvent toEvent(Map<String, Object?> input) {
       return VisibilityEvent(visible: visible);
     case 'budget':
       return BudgetEvent(bytesPerSec: readInt(input, 'bytesPerSec', 'budget'));
+    case 'goodput':
+      return GoodputEvent(bytesPerSec: readInt(input, 'bytesPerSec', 'goodput'));
     case 'activeSpeaker':
       // null は「発話者なし」を意味する。欄の欠落と区別する。
       if (!input.containsKey('id')) {
@@ -80,6 +78,31 @@ ReceiverEvent toEvent(Map<String, Object?> input) {
         channel: readInt(input, 'channel', 'displaySize'),
         width: readInt(input, 'width', 'displaySize'),
       );
+    case 'catalog':
+      final rawEntries = readList(input['entries'], 'catalog entries');
+      final catalogEntries = <CatalogLadder>[];
+      for (final rawEntry in rawEntries) {
+        final entry = readMap(rawEntry, 'catalog entry');
+        final rawRungs = readList(entry['rungs'], 'catalog rungs');
+        final rungs = <CatalogRung>[];
+        for (final rawRung in rawRungs) {
+          final r = readMap(rawRung, 'catalog rung');
+          rungs.add(CatalogRung(
+            sid: readInt(r, 'sid', 'rung'),
+            width: readInt(r, 'width', 'rung'),
+            height: readInt(r, 'height', 'rung'),
+            framerate: readInt(r, 'framerate', 'rung'),
+            temporalLayers: readInt(r, 'temporalLayers', 'rung'),
+            targetBitrate: readInt(r, 'targetBitrate', 'rung'),
+          ));
+        }
+        catalogEntries.add(CatalogLadder(
+          senderId: readInt(entry, 'senderId', 'catalog entry'),
+          channel: readInt(entry, 'channel', 'catalog entry'),
+          rungs: rungs,
+        ));
+      }
+      return CatalogEvent(entries: catalogEntries);
     case 'report':
       final delayUs = <int>[];
       for (final sample in readList(input['delayUs'], 'report delayUs')) {
@@ -97,6 +120,12 @@ ReceiverEvent toEvent(Map<String, Object?> input) {
         sid: readInt(input, 'sid', 'media'),
         tid: readInt(input, 'tid', 'media'),
         seq: seq is int ? seq : 0,
+      );
+    case 'keyframeRequest':
+      return KeyframeRequestEvent(
+        senderId: readInt(input, 'senderId', 'keyframeRequest'),
+        channel: readInt(input, 'channel', 'keyframeRequest'),
+        spatialId: readInt(input, 'spatialId', 'keyframeRequest'),
       );
     case 'timer':
       return const TimerEvent();
@@ -156,7 +185,7 @@ void main() {
     final header = readMap(jsonDecode(lines.first), 'header');
     expect(header['unit'], equals('receiver'));
 
-    var state = initialReceiverState(initialBudgetBytesPerSec);
+    var state = initialReceiverState();
     Map<String, Object?>? pending;
     // 入力行の時刻。AIMD の待ち（RATE_HOLD_MS）の判定に使う。
     int pendingT = 0;

@@ -76,7 +76,7 @@ public val AUDIO_UNITS_PER_MESSAGE: Long = 2L
 public val AUDIO_SELECTIVE_FORWARD_COUNT: Long = 5L
 public val AUDIO_SPEAKER_HOLD_MS: Long = 800L
 public val AUDIO_DTX_ENABLED: Boolean = true
-public val AUDIO_FEC_ENABLED: Boolean = true
+public val AUDIO_FEC_ENABLED: Boolean = false
 
 // shardCapacity
 public val V_SHARD_MAX_PARTICIPANTS: Long = 35L
@@ -89,8 +89,8 @@ public val V_FULL_MESH_MAX_360P15: Long = 37L
 // congestion
 public val REPORT_INTERVAL_MS: Long = 200L
 public val DELAY_TREND_WINDOW: Long = 20L
-public val DELAY_TREND_DEGRADE: Double = 0.01
-public val DELAY_TREND_RECOVER: Double = -0.005
+public val DELAY_TREND_DEGRADE: Long = 5000L
+public val DELAY_TREND_RECOVER: Long = 1500L
 public val KEYFRAME_REQUEST_MIN_INTERVAL_MS: Long = 500L
 public val AUDIO_STALL_RESET_MS: Long = 500L
 public val VIDEO_STALL_RESET_MS: Long = 1500L
@@ -99,17 +99,26 @@ public val SHEDDING_HYSTERESIS_MS: Long = 500L
 public val SEND_WINDOW_MS: Long = 200L
 public val ACK_INTERVAL_MS: Long = 50L
 public val ACK_TIMEOUT_MS: Long = 5000L
+public val UPLINK_DEGRADE_STREAK: Long = 3L
+public val UPLINK_RECOVER_MS: Long = 5000L
+public val UPLINK_UPGRADE_HOLD_MS: Long = 10000L
+public val ENCODE_QUEUE_LIMIT: Long = 3L
+public val ENCODE_QUEUE_HOLD_MS: Long = 2000L
+public val THERMAL_UPGRADE_HOLD_MS: Long = 30000L
 public val UPLINK_BACKLOG_BYTES: Long = 100000L
 public val RATE_HOLD_MS: Long = 1000L
 public val RATE_PROBE_BPS: Long = 200000L
 public val RATE_RECOVER_STREAK: Long = 3L
 public val RATE_DECREASE_FACTOR: Double = 0.85
 public val LATE_FRAME_TOLERANCE_MS: Long = 33L
-public val MIN_VIABLE_BPS: Long = 232000L
-public val DELAY_TREND_DEGRADE_NUM: Long = 1L
-public val DELAY_TREND_DEGRADE_DEN: Long = 100L
-public val DELAY_TREND_RECOVER_NUM: Long = -1L
-public val DELAY_TREND_RECOVER_DEN: Long = 200L
+public val MIN_VIABLE_BPS: Long = 244960L
+public val AUDIO_ONLY_ENTER_BPS: Long = 244960L
+public val AUDIO_ONLY_EXIT_BPS: Long = 448320L
+public val AUDIO_SELECTIVE_MIN_COUNT: Long = 1L
+public val DELAY_TREND_DEGRADE_NUM: Long = 5000L
+public val DELAY_TREND_DEGRADE_DEN: Long = 1L
+public val DELAY_TREND_RECOVER_NUM: Long = 1500L
+public val DELAY_TREND_RECOVER_DEN: Long = 1L
 
 // jitterBuffer
 public val VIDEO_JITTER_MIN_FRAMES: Long = 2L
@@ -117,7 +126,10 @@ public val VIDEO_JITTER_MAX_FRAMES: Long = 10L
 public val AUDIO_JITTER_MIN_PACKETS: Long = 2L
 public val AUDIO_JITTER_MAX_PACKETS: Long = 8L
 public val AV_SKEW_TOLERANCE_MS: Long = 20L
-public val AV_SKEW_RESYNC_MS: Long = 200L
+public val AV_SKEW_AUDIO_LEAD_MAX_MS: Long = 22L
+public val AV_SKEW_AUDIO_LAG_MAX_MS: Long = 30L
+public val AV_DRIFT_STEP_US: Long = 20L
+public val AV_RESYNC_GAP_MS: Long = 1000L
 
 // timeouts
 public val NODE_CONNECT_TIMEOUT_MS: Long = 5000L
@@ -145,7 +157,7 @@ public val FMIX32_C2: Long = 3266489909L
 // slo
 public val STALL_RATIO_P95: Double = 0.005
 public val AUDIO_GAP_RATIO_P95: Double = 0.001
-public val AV_SKEW_MS_P99: Long = 80L
+public val AV_SKEW_MS_P99: Long = 30L
 public val KEYFRAME_REQUEST_RATE_P95: Long = 1L
 public val GLASS_TO_GLASS_MS_P50: Long = 150L
 public val NODE_UTILIZATION_P95: Double = 0.8
@@ -185,16 +197,19 @@ public val SHARD_UTIL_EXIT_SPATIAL_NUM: Long = 9L
 public val SHARD_UTIL_EXIT_SPATIAL_DEN: Long = 10L
 public val SHARD_UTIL_EXIT_KEY_ONLY_NUM: Long = 1L
 public val SHARD_UTIL_EXIT_KEY_ONLY_DEN: Long = 1L
-public val SHARD_TREND_ENTER_T2_NUM: Long = 1L
-public val SHARD_TREND_ENTER_T2_DEN: Long = 100L
-public val SHARD_TREND_ENTER_T1_NUM: Long = 3L
-public val SHARD_TREND_ENTER_T1_DEN: Long = 100L
-public val SHARD_TREND_ENTER_SPATIAL_NUM: Long = 3L
-public val SHARD_TREND_ENTER_SPATIAL_DEN: Long = 50L
-public val SHARD_TREND_ENTER_KEY_ONLY_NUM: Long = 1L
-public val SHARD_TREND_ENTER_KEY_ONLY_DEN: Long = 10L
-public val SHARD_TREND_EXIT_NUM: Long = -1L
-public val SHARD_TREND_EXIT_DEN: Long = 200L
+public val SHARD_TREND_ENTER_T2_NUM: Long = 5000L
+public val SHARD_TREND_ENTER_T2_DEN: Long = 1L
+public val SHARD_TREND_ENTER_T1_NUM: Long = 15000L
+public val SHARD_TREND_ENTER_T1_DEN: Long = 1L
+public val SHARD_TREND_ENTER_SPATIAL_NUM: Long = 30000L
+public val SHARD_TREND_ENTER_SPATIAL_DEN: Long = 1L
+public val SHARD_TREND_ENTER_KEY_ONLY_NUM: Long = 50000L
+public val SHARD_TREND_ENTER_KEY_ONLY_DEN: Long = 1L
+public val SHARD_TREND_EXIT_NUM: Long = 1500L
+public val SHARD_TREND_EXIT_DEN: Long = 1L
 public val SHARD_TREND_EXIT_KEY_ONLY_NUM: Long = 0L
 public val SHARD_TREND_EXIT_KEY_ONLY_DEN: Long = 1L
+
+// observability
+public val MAX_UNEXPECTED_EVENTS: Long = 64L
 

@@ -76,7 +76,7 @@ public enum WhesoConstants {
     public static let AUDIO_SELECTIVE_FORWARD_COUNT: Int64 = 5
     public static let AUDIO_SPEAKER_HOLD_MS: Int64 = 800
     public static let AUDIO_DTX_ENABLED: Bool = true
-    public static let AUDIO_FEC_ENABLED: Bool = true
+    public static let AUDIO_FEC_ENABLED: Bool = false
 
     // shardCapacity
     public static let V_SHARD_MAX_PARTICIPANTS: Int64 = 35
@@ -89,8 +89,8 @@ public enum WhesoConstants {
     // congestion
     public static let REPORT_INTERVAL_MS: Int64 = 200
     public static let DELAY_TREND_WINDOW: Int64 = 20
-    public static let DELAY_TREND_DEGRADE: Double = 0.01
-    public static let DELAY_TREND_RECOVER: Double = -0.005
+    public static let DELAY_TREND_DEGRADE: Int64 = 5000
+    public static let DELAY_TREND_RECOVER: Int64 = 1500
     public static let KEYFRAME_REQUEST_MIN_INTERVAL_MS: Int64 = 500
     public static let AUDIO_STALL_RESET_MS: Int64 = 500
     public static let VIDEO_STALL_RESET_MS: Int64 = 1500
@@ -99,17 +99,26 @@ public enum WhesoConstants {
     public static let SEND_WINDOW_MS: Int64 = 200
     public static let ACK_INTERVAL_MS: Int64 = 50
     public static let ACK_TIMEOUT_MS: Int64 = 5000
+    public static let UPLINK_DEGRADE_STREAK: Int64 = 3
+    public static let UPLINK_RECOVER_MS: Int64 = 5000
+    public static let UPLINK_UPGRADE_HOLD_MS: Int64 = 10000
+    public static let ENCODE_QUEUE_LIMIT: Int64 = 3
+    public static let ENCODE_QUEUE_HOLD_MS: Int64 = 2000
+    public static let THERMAL_UPGRADE_HOLD_MS: Int64 = 30000
     public static let UPLINK_BACKLOG_BYTES: Int64 = 100000
     public static let RATE_HOLD_MS: Int64 = 1000
     public static let RATE_PROBE_BPS: Int64 = 200000
     public static let RATE_RECOVER_STREAK: Int64 = 3
     public static let RATE_DECREASE_FACTOR: Double = 0.85
     public static let LATE_FRAME_TOLERANCE_MS: Int64 = 33
-    public static let MIN_VIABLE_BPS: Int64 = 232000
-    public static let DELAY_TREND_DEGRADE_NUM: Int64 = 1
-    public static let DELAY_TREND_DEGRADE_DEN: Int64 = 100
-    public static let DELAY_TREND_RECOVER_NUM: Int64 = -1
-    public static let DELAY_TREND_RECOVER_DEN: Int64 = 200
+    public static let MIN_VIABLE_BPS: Int64 = 244960
+    public static let AUDIO_ONLY_ENTER_BPS: Int64 = 244960
+    public static let AUDIO_ONLY_EXIT_BPS: Int64 = 448320
+    public static let AUDIO_SELECTIVE_MIN_COUNT: Int64 = 1
+    public static let DELAY_TREND_DEGRADE_NUM: Int64 = 5000
+    public static let DELAY_TREND_DEGRADE_DEN: Int64 = 1
+    public static let DELAY_TREND_RECOVER_NUM: Int64 = 1500
+    public static let DELAY_TREND_RECOVER_DEN: Int64 = 1
 
     // jitterBuffer
     public static let VIDEO_JITTER_MIN_FRAMES: Int64 = 2
@@ -117,7 +126,10 @@ public enum WhesoConstants {
     public static let AUDIO_JITTER_MIN_PACKETS: Int64 = 2
     public static let AUDIO_JITTER_MAX_PACKETS: Int64 = 8
     public static let AV_SKEW_TOLERANCE_MS: Int64 = 20
-    public static let AV_SKEW_RESYNC_MS: Int64 = 200
+    public static let AV_SKEW_AUDIO_LEAD_MAX_MS: Int64 = 22
+    public static let AV_SKEW_AUDIO_LAG_MAX_MS: Int64 = 30
+    public static let AV_DRIFT_STEP_US: Int64 = 20
+    public static let AV_RESYNC_GAP_MS: Int64 = 1000
 
     // timeouts
     public static let NODE_CONNECT_TIMEOUT_MS: Int64 = 5000
@@ -145,7 +157,7 @@ public enum WhesoConstants {
     // slo
     public static let STALL_RATIO_P95: Double = 0.005
     public static let AUDIO_GAP_RATIO_P95: Double = 0.001
-    public static let AV_SKEW_MS_P99: Int64 = 80
+    public static let AV_SKEW_MS_P99: Int64 = 30
     public static let KEYFRAME_REQUEST_RATE_P95: Int64 = 1
     public static let GLASS_TO_GLASS_MS_P50: Int64 = 150
     public static let NODE_UTILIZATION_P95: Double = 0.8
@@ -185,17 +197,20 @@ public enum WhesoConstants {
     public static let SHARD_UTIL_EXIT_SPATIAL_DEN: Int64 = 10
     public static let SHARD_UTIL_EXIT_KEY_ONLY_NUM: Int64 = 1
     public static let SHARD_UTIL_EXIT_KEY_ONLY_DEN: Int64 = 1
-    public static let SHARD_TREND_ENTER_T2_NUM: Int64 = 1
-    public static let SHARD_TREND_ENTER_T2_DEN: Int64 = 100
-    public static let SHARD_TREND_ENTER_T1_NUM: Int64 = 3
-    public static let SHARD_TREND_ENTER_T1_DEN: Int64 = 100
-    public static let SHARD_TREND_ENTER_SPATIAL_NUM: Int64 = 3
-    public static let SHARD_TREND_ENTER_SPATIAL_DEN: Int64 = 50
-    public static let SHARD_TREND_ENTER_KEY_ONLY_NUM: Int64 = 1
-    public static let SHARD_TREND_ENTER_KEY_ONLY_DEN: Int64 = 10
-    public static let SHARD_TREND_EXIT_NUM: Int64 = -1
-    public static let SHARD_TREND_EXIT_DEN: Int64 = 200
+    public static let SHARD_TREND_ENTER_T2_NUM: Int64 = 5000
+    public static let SHARD_TREND_ENTER_T2_DEN: Int64 = 1
+    public static let SHARD_TREND_ENTER_T1_NUM: Int64 = 15000
+    public static let SHARD_TREND_ENTER_T1_DEN: Int64 = 1
+    public static let SHARD_TREND_ENTER_SPATIAL_NUM: Int64 = 30000
+    public static let SHARD_TREND_ENTER_SPATIAL_DEN: Int64 = 1
+    public static let SHARD_TREND_ENTER_KEY_ONLY_NUM: Int64 = 50000
+    public static let SHARD_TREND_ENTER_KEY_ONLY_DEN: Int64 = 1
+    public static let SHARD_TREND_EXIT_NUM: Int64 = 1500
+    public static let SHARD_TREND_EXIT_DEN: Int64 = 1
     public static let SHARD_TREND_EXIT_KEY_ONLY_NUM: Int64 = 0
     public static let SHARD_TREND_EXIT_KEY_ONLY_DEN: Int64 = 1
+
+    // observability
+    public static let MAX_UNEXPECTED_EVENTS: Int64 = 64
 
 }

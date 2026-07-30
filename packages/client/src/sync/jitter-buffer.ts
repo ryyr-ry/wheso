@@ -15,12 +15,10 @@
 import {
   AUDIO_JITTER_MAX_PACKETS,
   AUDIO_JITTER_MIN_PACKETS,
-  LATE_FRAME_TOLERANCE_MS,
   OPUS_FRAME_MS,
   VIDEO_JITTER_MAX_FRAMES,
   VIDEO_JITTER_MIN_FRAMES,
 } from "@wheso/core/src/generated/constants.ts";
-import { CHANNEL_AUDIO, CHANNEL_SCREEN_AUDIO, FLAG_KEY } from "@wheso/core/src/generated/wire-layout.ts";
 
 /** 切り上げの整数除算。負の値は扱わない（遅延と間隔は非負である）。 */
 function ceilDiv(numerator: number, denominator: number): number {
@@ -91,27 +89,4 @@ export interface PlayoutUnit {
 /** 判定の結果。 */
 export type PlayoutDecision = "decode" | "discard" | "wait";
 
-/**
- * 再生期限を過ぎたフレームの扱い（congestion.md 5 節）。
- *
- *   判定: 再生予定時刻 < 現在時刻 - LATE_FRAME_TOLERANCE_MS
- *   KEY=1 なら復号する（参照連鎖の起点として必要）
- *   音声なら再生する（音声は捨てない）
- *   それ以外は捨てる
- */
-export function decidePlayout(unit: PlayoutUnit, nowMs: number): PlayoutDecision {
-  if (unit.playoutAtMs > nowMs) {
-    return "wait";
-  }
-  const late = unit.playoutAtMs < nowMs - LATE_FRAME_TOLERANCE_MS;
-  if (!late) {
-    return "decode";
-  }
-  if ((unit.flags & FLAG_KEY) !== 0) {
-    return "decode";
-  }
-  if (unit.channel === CHANNEL_AUDIO || unit.channel === CHANNEL_SCREEN_AUDIO) {
-    return "decode";
-  }
-  return "discard";
-}
+

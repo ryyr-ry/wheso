@@ -46,7 +46,7 @@ import { ERROR_DEFINITIONS } from "../packages/core/src/generated/errors.ts";
 const T0 = 5_000_000;
 
 interface ShardLog {
-  readonly texts: { readonly to: number; readonly text: string }[];
+  readonly texts: { readonly to: number; readonly target: string; readonly text: string }[];
   readonly notified: number[];
 }
 
@@ -56,11 +56,14 @@ function shardRecorder(): { transport: ShardTransport; log: ShardLog } {
     sendBinary(): void {
       // メディアはこの試験の対象外である。
     },
-    sendText(participantId, text): void {
-      log.texts.push({ to: participantId, text });
+    sendText(participantId, target, text): void {
+      log.texts.push({ to: participantId, target, text });
     },
     close(): void {
       // 切断はこの試験の対象外である。
+    },
+    noteDrop(): void {
+      // 観測のみ。判定には使わない。
     },
     notifyControl(code): void {
       log.notified.push(code);
@@ -166,9 +169,7 @@ test("受信ノードはキーフレーム要求の重複を上流へ送らな�
     },
     closeClient(): void {},
   };
-  // 高品質 1 本を賄える予算にする。
-  const budget = Math.trunc((V_4K60.targetBitrate * 10) / (8 * 9)) + 1;
-  let state = createReceiverHandlerState(budget, T0);
+  let state = createReceiverHandlerState(T0);
   const subscribe = JSON.stringify({
     t: "subscribe",
     entries: [{ senderId: 7, channel: CHANNEL_VIDEO, maxSpatialId: V_4K60.spatialId, maxTemporalId: 7 }],
@@ -182,10 +183,11 @@ test("受信ノードはキーフレーム要求の重複を上流へ送らな�
   const secondCount = upstream.filter((text) => text.includes("keyframeRequest")).length;
   assert.equal(secondCount, 1, "規定間隔内は送らない");
 
-  // 送出する要求には spatialId が入る（既定値 0 を書かない）。
+  // 送出する要求には spatialId が入る。**最下段から始める**ため 0 である（ADR-0028 の原則）。
+  // カタログが無い相手は最下段しか要求しない（ADR-0027）。
   const request = upstream.find((text) => text.includes("keyframeRequest")) ?? "{}";
   const message = readMessage(request);
-  assert.equal(message["spatialId"], V_4K60.spatialId);
+  assert.equal(message["spatialId"], 0);
   assert.equal(message["channel"], CHANNEL_VIDEO);
   assert.equal(state.keyframeMarks.length, 1);
 });
@@ -198,6 +200,7 @@ interface SenderLog {
 function senderRecorder(): { transport: SenderTransport; log: SenderLog } {
   const log: SenderLog = { toClient: [], closed: [] };
   const transport: SenderTransport = {
+    noteDrop(): void {},
     sendToShard(): void {},
     sendTextToShard(): void {},
     sendTextToClient(text): void {
@@ -208,6 +211,7 @@ function senderRecorder(): { transport: SenderTransport; log: SenderLog } {
     closeClient(code): void {
       log.closed.push(code);
     },
+    sendTextToControl(): void {},
     notifyControl(): void {},
     scheduleAt(): void {},
   };
@@ -281,7 +285,7 @@ test("受信ノードは受信メッセージレートの上限を超えた接�
       closed.push(code);
     },
   };
-  let state = createReceiverHandlerState(V_360P15.targetBitrate, T0);
+  let state = createReceiverHandlerState(T0);
   for (let index = 0; index <= MAX_INBOUND_MESSAGES_PER_SEC_PER_CLIENT; index += 1) {
     state = receiverClientText(state, JSON.stringify({ t: "未知" }), T0, transport);
   }

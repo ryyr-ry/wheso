@@ -9,7 +9,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createPrng, next } from "../packages/core/src/prng.ts";
-import { isOk } from "../packages/core/src/result.ts";
 
 test("createPrng: 種 0 はエラーを返す", () => {
   const result = createPrng(0n);
@@ -125,9 +124,3 @@ test("next: 状態遷移は純関数（同じ入力で同じ出力）", () => {
   assert.equal(a.state.value, b.state.value);
 });
 
-test("isOk: Result の判別が正しく動作する", () => {
-  const success = createPrng(1n);
-  const failure = createPrng(0n);
-  assert.equal(isOk(success), true);
-  assert.equal(isOk(failure), false);
-});

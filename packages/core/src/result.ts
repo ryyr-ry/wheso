@@ -23,7 +23,4 @@ export function err<T, E>(error: E): Result<T, E> {
   return { ok: false, error };
 }
 
-/** Result が成功かどうかを判定する型ガード。 */
-export function isOk<T, E>(result: Result<T, E>): result is { readonly ok: true; readonly value: T } {
-  return result.ok;
-}
+

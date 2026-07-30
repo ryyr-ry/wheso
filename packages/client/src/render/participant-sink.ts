@@ -10,13 +10,10 @@
  */
 
 import { createSink, type Sink, type SinkTarget } from "./sink.ts";
-import type { VideoSinkHandle } from "../api/meeting.ts";
+import type { FrameSink, MediaFrame } from "../api/meeting.ts";
 
 /** 描画も行う受け皿。復号したフレームは端が渡す。 */
-export interface ParticipantSink extends VideoSinkHandle {
-  /** フレームを 1 枚描く。描画先が無い場合は何もしない。 */
-  readonly draw: (frame: VideoFrame) => void;
-}
+export type ParticipantSink = FrameSink;
 
 /**
  * 受け皿を作る。
@@ -49,7 +46,7 @@ export function createParticipantSink(onDisplaySize: (width: number, height: num
       }
       inner.setDisplaySize(width, height);
     },
-    draw: (frame: VideoFrame): void => {
+    draw: (frame: MediaFrame): void => {
       inner?.draw(frame);
     },
   };

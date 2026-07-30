@@ -15,6 +15,8 @@ import {
   RECEIVER_SELF_ID,
   type ReceiverCommand,
   type ReceiverEvent,
+  type CatalogLadder,
+  type CatalogRung,
   type ReceiverState,
   type SubscribeEntry,
 } from "@wheso/core/src/receiver-core.ts";
@@ -59,8 +61,15 @@ export interface ReceiverHandlerState {
   readonly inbound: RateWindow;
 }
 
-export function createReceiverHandlerState(targetBytesPerSec: number, nowMs: number): ReceiverHandlerState {
-  return { core: initialReceiverState(targetBytesPerSec), keyframeMarks: [], inbound: initialRateWindow(nowMs) };
+/**
+ * 初期状態。
+ *
+ * **下り帯域の初期値を引数で受けない。** 受けると、ノードの送出容量（280 MB/s）のような
+ * 無関係な値を渡す誤りが起きる（実際に起きた。参加直後に全員へ 4K60 を要求していた）。
+ * 開始点は規範が定める最低の成立点であり、goodput の観測で上げる（congestion.md 4.1）。
+ */
+export function createReceiverHandlerState(nowMs: number): ReceiverHandlerState {
+  return { core: initialReceiverState(), keyframeMarks: [], inbound: initialRateWindow(nowMs) };
 }
 
 /**
@@ -153,16 +162,6 @@ export function handleAckTimer(
   return applyCommands({ ...state, core: result.state }, result.commands, nowMs, transport);
 }
 
-/** 送信者の退出を入力イベントへ翻訳する。 */
-export function handleSenderLeave(
-  state: ReceiverHandlerState,
-  senderId: number,
-  nowMs: number,
-  transport: ReceiverTransport,
-): ReceiverHandlerState {
-  const result = receiverStep(state.core, { kind: "leave", id: senderId });
-  return applyCommands({ ...state, core: result.state }, result.commands, nowMs, transport);
-}
 
 /** 形式違反のメディアをクライアントから受けた場合は接続を閉じる。 */
 export function handleClientBinary(
@@ -206,6 +205,24 @@ function countInbound(
  * 出力コマンドを実行する。keyframeRequest のみ間隔制限を通す（wire-format.md 2.5）。
  * 抑制した要求は送らず、記録も更新しない（次の要求は前回の通過時刻から計る）。
  */
+/**
+ * 上流へ送る購読メッセージ（望む集合）を状態から作る（wire-format.md 2.4）。
+ *
+ * **再接続のたびにこれを送る。** 中継ノードは接続が切れた購読を捨てるため、
+ * 送らないと「受信ノードは購読済み・中継は購読なし」という食い違いが固定される。
+ */
+export function upstreamSubscribeText(core: ReceiverState): string {
+  const entries = core.streams
+    .filter((stream) => stream.phase !== "UNSUBSCRIBED")
+    .map((stream) => ({
+      senderId: stream.senderId,
+      channel: stream.channel,
+      maxSpatialId: stream.spatialId,
+      maxTemporalId: stream.temporalId,
+    }));
+  return JSON.stringify({ t: "subscribe", entries });
+}
+
 function applyCommands(
   state: ReceiverHandlerState,
   commands: readonly ReceiverCommand[],
@@ -234,31 +251,25 @@ function applyCommands(
       );
       continue;
     }
-    applyCommand(command, transport);
+    applyCommand(command, state.core, transport);
   }
   return { ...state, keyframeMarks: marks };
 }
 
 /** 出力コマンドを実際の送信へ写す。 */
-function applyCommand(command: ReceiverCommand, transport: ReceiverTransport): void {
+function applyCommand(command: ReceiverCommand, core: ReceiverState, transport: ReceiverTransport): void {
   switch (command.kind) {
     case "subscribeChange":
-      // 上流へ購読の変更を伝える。entries 形式は wire-format.md 2.4 に従う。
-      transport.sendUpstream(
-        JSON.stringify({
-          t: "subscribe",
-          entries: command.want
-            ? [
-                {
-                  senderId: command.to,
-                  channel: command.channel,
-                  maxSpatialId: command.maxSpatialId,
-                  maxTemporalId: command.maxTemporalId,
-                },
-              ]
-            : [],
-        }),
-      );
+      // **`entries` は「望む集合」である**（wire-format.md 2.4:「entries に含まれない
+      // (senderId, channel) の転送は停止する」）。差分ではない。
+      //
+      // 以前は変更 1 件だけを載せ、購読解除では空配列を送っていた。空配列は「何も望まない」
+      // を意味するため 1 本の解除が全部の解除になり、逆に追加時は既存の購読が
+      // 抜け落ちた。さらに**上流の接続が張り直されると集合が中継へ伝わらないまま**
+      // 「購読済み」になり、映像が永久に来なかった（F-056）。
+      //
+      // 集合はコアの状態そのものであるから、状態から作る。
+      transport.sendUpstream(upstreamSubscribeText(core));
       return;
     case "keyframeRequest":
       // 間隔制限を通す必要があるため applyCommands が扱う。ここへは到達しない。
@@ -364,9 +375,69 @@ function toReceiverEvents(message: Record<string, unknown>): readonly ReceiverEv
     }
     if (isInteger(downlink) && downlink > 0) {
       // bits/sec を bytes/sec に直す。整数除算で切り捨てる。
-      events.push({ kind: "budget", bytesPerSec: Math.trunc(downlink / 8) });
+      // **`budget` ではなく `goodput` として渡す。** goodput は下限としてしか使えない
+      // （congestion.md 4.1）。目標として渡すと、媒体が止まった瞬間に目標が潰れる。
+      events.push({ kind: "goodput", bytesPerSec: Math.trunc(downlink / 8) });
     }
     return events;
+  }
+  if (t === "streamCatalog") {
+    const entries = message["entries"];
+    if (!Array.isArray(entries)) {
+      return [];
+    }
+    const ladders: CatalogLadder[] = [];
+    for (const entry of entries) {
+      if (typeof entry !== "object" || entry === null) {
+        continue;
+      }
+      const record: Record<string, unknown> = { ...entry };
+      const senderId = record["senderId"];
+      const channel = record["channel"];
+      const rungs = record["rungs"];
+      if (!isInteger(senderId) || !isInteger(channel) || !Array.isArray(rungs)) {
+        continue;
+      }
+      const parsed: CatalogRung[] = [];
+      for (const rung of rungs) {
+        if (typeof rung !== "object" || rung === null) {
+          continue;
+        }
+        const item: Record<string, unknown> = { ...rung };
+        const sid = item["spatialId"];
+        const width = item["width"];
+        const height = item["height"];
+        const framerate = item["framerate"];
+        const temporalLayers = item["temporalLayers"];
+        const targetBitrate = item["targetBitrate"];
+        if (
+          !isInteger(sid) ||
+          !isInteger(width) ||
+          !isInteger(height) ||
+          !isInteger(framerate) ||
+          !isInteger(temporalLayers) ||
+          !isInteger(targetBitrate)
+        ) {
+          // 欠けた欄を既定値で埋めない。実体と違う費用で見積もることになる。
+          continue;
+        }
+        parsed.push({ sid, width, height, framerate, temporalLayers, targetBitrate });
+      }
+      if (parsed.length === 0) {
+        continue;
+      }
+      ladders.push({ senderId, channel, rungs: parsed });
+    }
+    return [{ kind: "catalog", entries: ladders }];
+  }
+  if (t === "leave") {
+    // 参加者が退出した。クライアントが `ctl` の一覧から知り、自分の受信部屋へ伝える。
+    // 伝えないと、居ない相手の受信位置と はしごが残り、ack を返し続ける。
+    const senderId = message["senderId"];
+    if (!isInteger(senderId)) {
+      return [];
+    }
+    return [{ kind: "leave", id: senderId }];
   }
   if (t === "displaySize") {
     const senderId = message["senderId"];
@@ -376,6 +447,16 @@ function toReceiverEvents(message: Record<string, unknown>): readonly ReceiverEv
       return [];
     }
     return [{ kind: "displaySize", senderId, channel, width }];
+  }
+  if (t === "keyframeRequest") {
+    // 購読者が復号を始められないときに送ってくる（ADR-0039）。全欄を実行時に検査する。
+    const senderId = message["senderId"];
+    const channel = message["channel"];
+    const spatialId = message["spatialId"];
+    if (!isInteger(senderId) || !isInteger(channel) || !isInteger(spatialId)) {
+      return [];
+    }
+    return [{ kind: "keyframeRequest", senderId, channel, spatialId }];
   }
   if (t === "visibility") {
     const visible = message["visible"];

@@ -17,11 +17,10 @@ import assert from "node:assert/strict";
 import { issueToken } from "../../packages/core/src/auth.ts";
 import { DEV_TOKEN_KEY, startLive } from "../support/live-env.ts";
 import {
-  applyControlMessage,
   joinWith,
   type JoinSocket,
 } from "../../packages/client/src/api/join-meeting.ts";
-import type { VideoSinkHandle } from "../../packages/client/src/api/meeting.ts";
+import type { FrameSink } from "../../packages/client/src/api/meeting.ts";
 
 const MEETING_ID = "01jxy8kq2r3mz5v7h9abcderfa";
 const USER_ID = "550e8400e29b41d4a716446655440000";
@@ -71,38 +70,61 @@ async function joinUrlFor(userId: string): Promise<string> {
   return `${BASE}/j/${MEETING_ID}#${token.ok ? token.value : ""}`;
 }
 
-function sink(): VideoSinkHandle {
+function sink(): FrameSink {
   return {
     attach: (): void => undefined,
     detach: (): void => undefined,
     setDisplaySize: (): void => undefined,
+    draw: (): void => undefined,
   };
 }
 
-/** 実物の WebSocket を `JoinSocket` の形に包む。送信は接続確立まで溜める。 */
-function realSocket(url: string, closeCodes: number[]): JoinSocket {
+/**
+ * 実物の WebSocket を `JoinSocket` の形に包む。送信は接続確立まで溜める。
+ *
+ * `received` に届いたテキストをすべて記録する。**記録しないと判定が空洞になる。**
+ * 以前はこの引数が無く、判定は常に空の配列を検査していたため必ず失敗していた。
+ */
+function realSocket(url: string, closeCodes: number[], received: string[] = []): JoinSocket {
   const socket = new globalThis.WebSocket(url);
   openSockets.push(socket);
+  socket.binaryType = "arraybuffer";
   const pending: string[] = [];
   let open = false;
   const handlers: ((text: string) => void)[] = [];
+  const binaryHandlers: ((bytes: Uint8Array) => void)[] = [];
+  const openHandlers: (() => void)[] = [];
+  const closeHandlers: ((code: number) => void)[] = [];
   socket.addEventListener("open", () => {
     open = true;
     for (const text of pending) {
       socket.send(text);
     }
     pending.length = 0;
+    for (const handler of openHandlers) {
+      handler();
+    }
   });
   socket.addEventListener("message", (event: MessageEvent) => {
-    if (typeof event.data !== "string") {
+    if (typeof event.data === "string") {
+      received.push(event.data);
+      for (const handler of handlers) {
+        handler(event.data);
+      }
       return;
     }
-    for (const handler of handlers) {
-      handler(event.data);
+    if (event.data instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(event.data);
+      for (const handler of binaryHandlers) {
+        handler(bytes);
+      }
     }
   });
   socket.addEventListener("close", (event: CloseEvent) => {
     closeCodes.push(event.code);
+    for (const handler of closeHandlers) {
+      handler(event.code);
+    }
   });
   return {
     send: (text): void => {
@@ -112,10 +134,21 @@ function realSocket(url: string, closeCodes: number[]): JoinSocket {
       }
       pending.push(text);
     },
+    sendBinary: (bytes): void => socket.send(bytes),
     close: (): void => socket.close(),
     onText: (handler): void => {
       handlers.push(handler);
     },
+    onBinary: (handler): void => {
+      binaryHandlers.push(handler);
+    },
+    onOpen: (handler): void => {
+      openHandlers.push(handler);
+    },
+    onClose: (handler): void => {
+      closeHandlers.push(handler);
+    },
+    bufferedBytes: (): number => socket.bufferedAmount,
   };
 }
 
@@ -124,24 +157,46 @@ test("参加 URL から 5 個の部屋へ接続し helloAck で active になる
   const received: string[] = [];
   const url = await joinUrlFor(USER_ID);
   const joined = await joinWith(url, {
-    openSocket: (address) => realSocket(address, closeCodes),
+    openSocket: (address) => realSocket(address, closeCodes, received),
     createSink: () => sink(),
+    bindOutput: (): void => undefined,
     capability: { hardwareAv1For4K60: false, encodeAv1: true, mobile: false, charging: true },
+    scheduleAt: (atMs: number, fire: () => void): (() => void) => {
+      const timer = globalThis.setTimeout(fire, Math.max(0, atMs - Date.now()));
+      return (): void => globalThis.clearTimeout(timer);
+    },
+    setPeriodic: (intervalMs: number, fire: () => void): (() => void) => {
+      const timer = globalThis.setInterval(fire, intervalMs);
+      return (): void => globalThis.clearInterval(timer);
+    },
+    // 取得と符号化は Node に無い。この試験は参加とリンクの到達を確かめる。
+    capture: {
+      bindCapture: (): void => undefined,
+      startCapture: async () => ({ source: null, video: false, audio: false }),
+      configureVideo: (): void => undefined,
+      configureAudio: (): void => undefined,
+      requestKeyframe: (): void => undefined,
+      setVideoEnabled: (): void => undefined,
+      setAudioEnabled: (): void => undefined,
+      encodeQueueSize: (): number => 0,
+      close: (): void => undefined,
+    },
+    media: {
+      configureDecoder: (): void => undefined,
+      resetDecoder: (): void => undefined,
+      closeDecoder: (): void => undefined,
+      decodeVideo: (): void => undefined,
+      enqueueAudio: (): void => undefined,
+    },
+    // はしごは源から導出する（ADR-0026）。
+    source: { width: 1920, height: 1080, framerate: 30 },
     now: () => Date.now(),
   });
   assert.equal(joined.ok, true, "参加できる");
   if (!joined.ok) {
     return;
   }
-  assert.equal(joined.value.sockets.size, 5, "5 個の部屋へ接続する");
-
-  // ctl 部屋の応答を待つ。入口が配線した経路とは別に、試験でも内容を確かめる。
-  const control = joined.value.sockets.get("ctl");
-  assert.notEqual(control, undefined);
-  control?.onText((text) => {
-    received.push(text);
-    applyControlMessage(joined.value.meeting, text, Date.now());
-  });
+  assert.equal(joined.value.links.size, 5, "5 個の部屋へリンクを張る");
 
   const deadline = Date.now() + 30_000;
   while (joined.value.meeting.state !== "active" && Date.now() < deadline) {
@@ -150,7 +205,32 @@ test("参加 URL から 5 個の部屋へ接続し helloAck で active になる
   assert.equal(joined.value.meeting.state, "active", "helloAck を受けて active になる");
   assert.ok(
     received.some((text) => text.includes('"t":"helloAck"')),
-    "ctl 部屋が helloAck を返す",
+    `ctl 部屋が helloAck を返す（受信 ${String(received.length)} 件）`,
+  );
+
+  // **5 本すべてが ACTIVE へ到達しなければならない。**
+  // `ACTIVE` に入らない部屋は `subscribe` と `streamAnnounce` を 1 度も送らない
+  // （state-machines.md 1 節。`sendSubscribe` は ACTIVE への遷移でのみ出る）。
+  // 到達しない部屋は 9 秒で時限切れになり、以後は無限に再接続を繰り返す。
+  const phaseDeadline = Date.now() + 30_000;
+  const phases = (): Map<string, string> => {
+    const out = new Map<string, string>();
+    for (const [role, link] of joined.value.links) {
+      out.set(role, link.phase());
+    }
+    return out;
+  };
+  while (Date.now() < phaseDeadline) {
+    const current = phases();
+    if ([...current.values()].every((phase) => phase === "ACTIVE")) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  assert.deepEqual(
+    [...phases().entries()].filter(([, phase]) => phase !== "ACTIVE"),
+    [],
+    "5 本すべてのリンクが ACTIVE である（helloAck を返さない部屋は再接続を繰り返す）",
   );
   joined.value.meeting.leave();
 });

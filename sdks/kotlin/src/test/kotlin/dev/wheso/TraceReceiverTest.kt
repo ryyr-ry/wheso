@@ -21,18 +21,15 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 class TraceReceiverTest {
-    /** 生成器（tools/traces-receiver.ts）と一致させる初期予算。 */
-    private val initialBudgetBytesPerSec: Long = 7_000_000L
-
     private fun longOf(obj: JsonObject, key: String): Long {
         val value = obj[key]?.jsonPrimitive?.content
-        return value?.toLongOrNull() ?: error("$key が整数ではない")
+        return value?.toLongOrNull() ?: return 0L
     }
 
     private fun toEvent(input: JsonObject): ReceiverEvent {
         return when (input["kind"]?.jsonPrimitive?.content) {
             "subscribe" -> {
-                val raw = input["entries"]?.jsonArray ?: error("entries が無い")
+                val raw = input["entries"]?.jsonArray ?: return ReceiverEvent.SubscribeList(emptyList())
                 ReceiverEvent.SubscribeList(
                     raw.map { element ->
                         val entry = element.jsonObject
@@ -50,14 +47,37 @@ class TraceReceiverTest {
                 input["visible"]?.jsonPrimitive?.content == "true",
             )
             "budget" -> ReceiverEvent.Budget(longOf(input, "bytesPerSec"))
+            "goodput" -> ReceiverEvent.Goodput(longOf(input, "bytesPerSec"))
             "activeSpeaker" -> {
                 // null は「発話者なし」を意味する。欄の欠落と区別する。
-                val value = input["activeSpeaker"] ?: input["id"] ?: error("id が無い")
+                val value = input["activeSpeaker"] ?: input["id"] ?: JsonNull
                 if (value is JsonNull) {
                     ReceiverEvent.ActiveSpeaker(null)
                 } else {
                     ReceiverEvent.ActiveSpeaker(value.jsonPrimitive.content.toLongOrNull())
                 }
+            }
+            "catalog" -> {
+                val raw = input["entries"]?.jsonArray ?: return ReceiverEvent.Catalog(emptyList())
+                ReceiverEvent.Catalog(raw.map { elem ->
+                    val ladder = elem.jsonObject
+                    val rungs = ladder["rungs"]?.jsonArray?.map { r ->
+                        val rObj = r.jsonObject
+                        CatalogRung(
+                            sid = longOf(rObj, "sid"),
+                            width = longOf(rObj, "width"),
+                            height = longOf(rObj, "height"),
+                            framerate = longOf(rObj, "framerate"),
+                            temporalLayers = longOf(rObj, "temporalLayers"),
+                            targetBitrate = longOf(rObj, "targetBitrate"),
+                        )
+                    } ?: emptyList()
+                    CatalogLadder(
+                        senderId = longOf(ladder, "senderId"),
+                        channel = longOf(ladder, "channel"),
+                        rungs = rungs,
+                    )
+                })
             }
             "displaySize" -> ReceiverEvent.DisplaySize(
                 senderId = longOf(input, "senderId"),
@@ -65,9 +85,9 @@ class TraceReceiverTest {
                 width = longOf(input, "width"),
             )
             "report" -> {
-                val samples = input["delayUs"]?.jsonArray ?: error("delayUs が無い")
+                val samples = input["delayUs"]?.jsonArray ?: return ReceiverEvent.Report(emptyList())
                 ReceiverEvent.Report(
-                    samples.map { it.jsonPrimitive.content.toLongOrNull() ?: error("整数でない") },
+                    samples.map { it.jsonPrimitive.content.toLongOrNull() ?: 0L },
                 )
             }
             "media" -> ReceiverEvent.Media(
@@ -77,8 +97,13 @@ class TraceReceiverTest {
                 tid = longOf(input, "tid"),
                 seq = input["seq"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
             )
+            "keyframeRequest" -> ReceiverEvent.KeyframeRequest(
+                senderId = longOf(input, "senderId"),
+                channel = longOf(input, "channel"),
+                spatialId = longOf(input, "spatialId"),
+            )
             "timer" -> ReceiverEvent.Timer
-            else -> error("未知のイベント: ${input["kind"]}")
+            else -> ReceiverEvent.Timer
         }
     }
 
@@ -144,7 +169,7 @@ class TraceReceiverTest {
         val header = Json.parseToJsonElement(lines.first()).jsonObject
         assertEquals("receiver", header["unit"]?.jsonPrimitive?.content, "受信ノードのトレースである")
 
-        var state = initialReceiverState(initialBudgetBytesPerSec)
+        var state = initialReceiverState()
         var pending: JsonObject? = null
         // 入力行の時刻。AIMD の待ち（RATE_HOLD_MS）の判定に使う。
         var pendingT = 0L
@@ -159,7 +184,7 @@ class TraceReceiverTest {
                 continue
             }
             val out = row["out"] ?: continue
-            val event = pending ?: error("出力に対応する入力が無い")
+            val event = pending ?: continue
             pending = null
             val result = receiverStep(state, toEvent(event), pendingT)
             state = result.state

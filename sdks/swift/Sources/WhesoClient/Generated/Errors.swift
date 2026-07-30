@@ -28,6 +28,7 @@ public enum WhesoErrors {
     public static let E_RATE_LIMIT_CONNECT_CLOSE_CODE: Int64 = 4031
     public static let E_NODE_OVERLOADED_CLOSE_CODE: Int64 = 4032
     public static let E_ROOM_FULL_CLOSE_CODE: Int64 = 4033
+    public static let E_ACK_TIMEOUT_CLOSE_CODE: Int64 = 4034
     public static let E_EPOCH_STALE_CLOSE_CODE: Int64 = 4040
     public static let E_MEETING_ENDED_CLOSE_CODE: Int64 = 4041
     public static let E_EVICTED_CLOSE_CODE: Int64 = 4042

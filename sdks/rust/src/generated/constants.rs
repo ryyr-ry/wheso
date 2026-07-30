@@ -76,7 +76,7 @@ pub const AUDIO_UNITS_PER_MESSAGE: i64 = 2;
 pub const AUDIO_SELECTIVE_FORWARD_COUNT: i64 = 5;
 pub const AUDIO_SPEAKER_HOLD_MS: i64 = 800;
 pub const AUDIO_DTX_ENABLED: bool = true;
-pub const AUDIO_FEC_ENABLED: bool = true;
+pub const AUDIO_FEC_ENABLED: bool = false;
 
 // shardCapacity
 pub const V_SHARD_MAX_PARTICIPANTS: i64 = 35;
@@ -89,8 +89,8 @@ pub const V_FULL_MESH_MAX_360P15: i64 = 37;
 // congestion
 pub const REPORT_INTERVAL_MS: i64 = 200;
 pub const DELAY_TREND_WINDOW: i64 = 20;
-pub const DELAY_TREND_DEGRADE: f64 = 0.01;
-pub const DELAY_TREND_RECOVER: f64 = -0.005;
+pub const DELAY_TREND_DEGRADE: i64 = 5000;
+pub const DELAY_TREND_RECOVER: i64 = 1500;
 pub const KEYFRAME_REQUEST_MIN_INTERVAL_MS: i64 = 500;
 pub const AUDIO_STALL_RESET_MS: i64 = 500;
 pub const VIDEO_STALL_RESET_MS: i64 = 1500;
@@ -99,17 +99,26 @@ pub const SHEDDING_HYSTERESIS_MS: i64 = 500;
 pub const SEND_WINDOW_MS: i64 = 200;
 pub const ACK_INTERVAL_MS: i64 = 50;
 pub const ACK_TIMEOUT_MS: i64 = 5000;
+pub const UPLINK_DEGRADE_STREAK: i64 = 3;
+pub const UPLINK_RECOVER_MS: i64 = 5000;
+pub const UPLINK_UPGRADE_HOLD_MS: i64 = 10000;
+pub const ENCODE_QUEUE_LIMIT: i64 = 3;
+pub const ENCODE_QUEUE_HOLD_MS: i64 = 2000;
+pub const THERMAL_UPGRADE_HOLD_MS: i64 = 30000;
 pub const UPLINK_BACKLOG_BYTES: i64 = 100000;
 pub const RATE_HOLD_MS: i64 = 1000;
 pub const RATE_PROBE_BPS: i64 = 200000;
 pub const RATE_RECOVER_STREAK: i64 = 3;
 pub const RATE_DECREASE_FACTOR: f64 = 0.85;
 pub const LATE_FRAME_TOLERANCE_MS: i64 = 33;
-pub const MIN_VIABLE_BPS: i64 = 232000;
-pub const DELAY_TREND_DEGRADE_NUM: i64 = 1;
-pub const DELAY_TREND_DEGRADE_DEN: i64 = 100;
-pub const DELAY_TREND_RECOVER_NUM: i64 = -1;
-pub const DELAY_TREND_RECOVER_DEN: i64 = 200;
+pub const MIN_VIABLE_BPS: i64 = 244960;
+pub const AUDIO_ONLY_ENTER_BPS: i64 = 244960;
+pub const AUDIO_ONLY_EXIT_BPS: i64 = 448320;
+pub const AUDIO_SELECTIVE_MIN_COUNT: i64 = 1;
+pub const DELAY_TREND_DEGRADE_NUM: i64 = 5000;
+pub const DELAY_TREND_DEGRADE_DEN: i64 = 1;
+pub const DELAY_TREND_RECOVER_NUM: i64 = 1500;
+pub const DELAY_TREND_RECOVER_DEN: i64 = 1;
 
 // jitterBuffer
 pub const VIDEO_JITTER_MIN_FRAMES: i64 = 2;
@@ -117,7 +126,10 @@ pub const VIDEO_JITTER_MAX_FRAMES: i64 = 10;
 pub const AUDIO_JITTER_MIN_PACKETS: i64 = 2;
 pub const AUDIO_JITTER_MAX_PACKETS: i64 = 8;
 pub const AV_SKEW_TOLERANCE_MS: i64 = 20;
-pub const AV_SKEW_RESYNC_MS: i64 = 200;
+pub const AV_SKEW_AUDIO_LEAD_MAX_MS: i64 = 22;
+pub const AV_SKEW_AUDIO_LAG_MAX_MS: i64 = 30;
+pub const AV_DRIFT_STEP_US: i64 = 20;
+pub const AV_RESYNC_GAP_MS: i64 = 1000;
 
 // timeouts
 pub const NODE_CONNECT_TIMEOUT_MS: i64 = 5000;
@@ -145,7 +157,7 @@ pub const FMIX32_C2: i64 = 3266489909;
 // slo
 pub const STALL_RATIO_P95: f64 = 0.005;
 pub const AUDIO_GAP_RATIO_P95: f64 = 0.001;
-pub const AV_SKEW_MS_P99: i64 = 80;
+pub const AV_SKEW_MS_P99: i64 = 30;
 pub const KEYFRAME_REQUEST_RATE_P95: i64 = 1;
 pub const GLASS_TO_GLASS_MS_P50: i64 = 150;
 pub const NODE_UTILIZATION_P95: f64 = 0.8;
@@ -185,16 +197,19 @@ pub const SHARD_UTIL_EXIT_SPATIAL_NUM: i64 = 9;
 pub const SHARD_UTIL_EXIT_SPATIAL_DEN: i64 = 10;
 pub const SHARD_UTIL_EXIT_KEY_ONLY_NUM: i64 = 1;
 pub const SHARD_UTIL_EXIT_KEY_ONLY_DEN: i64 = 1;
-pub const SHARD_TREND_ENTER_T2_NUM: i64 = 1;
-pub const SHARD_TREND_ENTER_T2_DEN: i64 = 100;
-pub const SHARD_TREND_ENTER_T1_NUM: i64 = 3;
-pub const SHARD_TREND_ENTER_T1_DEN: i64 = 100;
-pub const SHARD_TREND_ENTER_SPATIAL_NUM: i64 = 3;
-pub const SHARD_TREND_ENTER_SPATIAL_DEN: i64 = 50;
-pub const SHARD_TREND_ENTER_KEY_ONLY_NUM: i64 = 1;
-pub const SHARD_TREND_ENTER_KEY_ONLY_DEN: i64 = 10;
-pub const SHARD_TREND_EXIT_NUM: i64 = -1;
-pub const SHARD_TREND_EXIT_DEN: i64 = 200;
+pub const SHARD_TREND_ENTER_T2_NUM: i64 = 5000;
+pub const SHARD_TREND_ENTER_T2_DEN: i64 = 1;
+pub const SHARD_TREND_ENTER_T1_NUM: i64 = 15000;
+pub const SHARD_TREND_ENTER_T1_DEN: i64 = 1;
+pub const SHARD_TREND_ENTER_SPATIAL_NUM: i64 = 30000;
+pub const SHARD_TREND_ENTER_SPATIAL_DEN: i64 = 1;
+pub const SHARD_TREND_ENTER_KEY_ONLY_NUM: i64 = 50000;
+pub const SHARD_TREND_ENTER_KEY_ONLY_DEN: i64 = 1;
+pub const SHARD_TREND_EXIT_NUM: i64 = 1500;
+pub const SHARD_TREND_EXIT_DEN: i64 = 1;
 pub const SHARD_TREND_EXIT_KEY_ONLY_NUM: i64 = 0;
 pub const SHARD_TREND_EXIT_KEY_ONLY_DEN: i64 = 1;
+
+// observability
+pub const MAX_UNEXPECTED_EVENTS: i64 = 64;
 

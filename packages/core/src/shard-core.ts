@@ -2,13 +2,31 @@
  * 中継ノード（shard）の判断コア。
  *
  * sans-IO の純関数状態機械。時刻・乱数・浮動小数点・入出力・並行に触れない。
- * 規範: state-machines.md 3 節、conformance.md 4 節、wire-format.md 1.4。
+ * 規範: congestion.md 2 節（送信窓）・7 節（計上は接続単位）、state-machines.md 3 節、
+ *       wire-format.md 1.4（破棄優先順位）、ADR-0025（購読単位への分解）、
+ *       ADR-0027（spatialId はちょうど 1 段を選ぶ）。
+ *
+ * 設計の要点は 3 つである。
+ *
+ * 1. **判断は購読ごとに独立している。** 遅い受信者 1 人が他の受信者の品質を落としてはならない
+ *    （congestion.md 7 節が名指しで禁じている）。輻輳状態・送信窓・遅延勾配はすべて購読が持つ。
+ * 2. **送信窓が破棄を有効にする唯一の機構である。** TCP は一度 send() に渡したバイトを
+ *    取り消せない。したがって「渡す前」に落とすしかない。未確認の媒体を再生時間で数え、
+ *    SEND_WINDOW_MS を超える間は渡さない。未確認の量は受信側の ack から求める。
+ * 3. **解像度方向は simulcast である。** 各段は独立した完全なストリームであり（ADR-0004）、
+ *    下位段は復号に不要である。したがって購読者へ渡すのは**ちょうど 1 段**である。
+ *    `spatialId <= tier` で渡すと同じ内容が二重に届き、デコーダが段の切替として
+ *    reset を繰り返して 1 枚も復号できない（ADR-0027）。
  */
 
-import { CHANNEL_AUDIO, FLAG_ACTIVE_SPEAKER } from "./generated/wire-layout.ts";
+import { CHANNEL_AUDIO, CHANNEL_SCREEN_AUDIO, FLAG_ACTIVE_SPEAKER } from "./generated/wire-layout.ts";
 import {
+  ACK_TIMEOUT_MS,
   AUDIO_SELECTIVE_FORWARD_COUNT,
+  MAX_UNEXPECTED_EVENTS,
+  AUDIO_SELECTIVE_MIN_COUNT,
   AUDIO_SPEAKER_HOLD_MS,
+  SEND_WINDOW_MS,
   SHEDDING_HYSTERESIS_MS,
   NODE_MAX_OUT_BYTES_PER_SEC,
   NODE_MAX_OUT_MESSAGES_PER_SEC,
@@ -47,9 +65,9 @@ import { ERROR_DEFINITIONS } from "./generated/errors.ts";
 import { delaySlope, type Slope } from "./fixed.ts";
 import { dropPriority } from "./wire.ts";
 
-// --- Result 型 ---
-// wire.ts が既に定義しているが、担当外ファイルを変更しないため独自に定義する。
-// prng_fixed 担当が共通 Result を作成した場合はそちらへ移行する。
+/* ------------------------------------------------------------------------- */
+/* Result 型                                                                 */
+/* ------------------------------------------------------------------------- */
 
 export type Result<T, E> =
   | { readonly ok: true; readonly value: T }
@@ -63,7 +81,9 @@ export function err<T, E>(error: E): Result<T, E> {
   return { ok: false, error };
 }
 
-// --- 輻輳状態 (state-machines.md 3 節) ---
+/* ------------------------------------------------------------------------- */
+/* 輻輳状態（state-machines.md 3 節）                                        */
+/* ------------------------------------------------------------------------- */
 
 export type CongestionState =
   | "NORMAL"
@@ -72,7 +92,9 @@ export type CongestionState =
   | "SHEDDING_SPATIAL"
   | "KEY_ONLY";
 
-// --- 入力イベント (conformance.md 4.2) ---
+/* ------------------------------------------------------------------------- */
+/* 入力イベント（conformance.md 4.2）                                        */
+/* ------------------------------------------------------------------------- */
 
 export interface MediaEvent {
   readonly kind: "media";
@@ -83,15 +105,78 @@ export interface MediaEvent {
   readonly key: boolean;
   readonly bytes: number;
   readonly flags: number;
+  /**
+   * ワイヤの sequenceNumber。送信窓（congestion.md 2 節）の計算に使う。
+   * 同一 (senderId, channel, spatialId) 内で単調増加する。
+   */
+  readonly seq: number;
 }
 
 export interface SubscribeEvent {
   readonly kind: "subscribe";
   readonly from: number;
   readonly to: number;
+  /**
+   * 購読するチャネル。購読は (subscriberId, targetId, channel) で一意である。
+   * チャネルを見ないと、映像の購読が音声まで転送してしまう。
+   */
+  readonly ch: number;
   readonly want: boolean;
-  /** 購読者が要求する最大 spatialId（tier） */
+  /** 購読者が要求する最大 spatialId（tier）。段番号である（ADR-0026）。 */
   readonly maxSpatialId: number;
+  /** 購読者が要求する最大 temporalId。時間方向は SVC であり下位層が必要である。 */
+  readonly maxTemporalId: number;
+}
+
+/**
+ * 受信側からの受信位置の通知（congestion.md 2 節）。
+ *
+ * これが無いと未確認の量が分からず、送信窓が働かない。送信窓が働かないと
+ * カーネルキューに数秒分が溜まり、破棄を決めても効果が出ない（「詰まったら固まる」の原因）。
+ */
+export interface AckEvent {
+  readonly kind: "ack";
+  /** ack を返した購読者。 */
+  readonly from: number;
+  /** どの送信者のストリームに対する ack か。 */
+  readonly to: number;
+  readonly ch: number;
+  /**
+   * どの段に対する ack か。
+   *
+   * **段ごとに sequenceNumber の空間が独立している**（wire-format.md 1.2: 同一
+   * (senderId, channel, spatialId) 内で単調増加）。段を無視して ack を適用すると、
+   * 別の段の seq が混ざって未確認量の計算が壊れる。
+   */
+  readonly sid: number;
+  /** その時点で到着済みの最大 sequenceNumber。 */
+  readonly highestSeq: number;
+}
+
+/** はしごの 1 段（ADR-0026）。 */
+export interface LadderRung {
+  /** 段番号。0 が最下段であり密に詰める。 */
+  readonly sid: number;
+  readonly width: number;
+  readonly height: number;
+  readonly framerate: number;
+  readonly temporalLayers: number;
+  readonly targetBitrate: number;
+}
+
+/**
+ * 送信者が申告したはしご（wire-format.md 2.3、ADR-0026）。
+ *
+ * 中継ノードがこれを必要とする理由は 2 つある。
+ *   1. 送信窓の計算に fps が必要である（未確認フレーム数を再生時間へ直すため）
+ *   2. 購読者へ渡す 1 段を選ぶために、存在する段の集合が必要である
+ */
+export interface StreamAnnounceEvent {
+  readonly kind: "streamAnnounce";
+  readonly from: number;
+  readonly ch: number;
+  /** 段。sid の昇順で受け取る必要はない。内部で昇順に整列する。 */
+  readonly rungs: readonly LadderRung[];
 }
 
 export interface JoinEvent {
@@ -120,19 +205,44 @@ export interface BudgetEvent {
 }
 
 /**
- * 受信者からの測定報告（conformance.md 4.2）。
- * state-machines.md 3 節の遷移条件 maxTrend の入力である。
+ * 受信者からの測定報告（conformance.md 4.2、ADR-0021）。
+ *
+ * 勾配は**その受信者の購読にのみ**適用する。他人の勾配で自分の品質を落としてはならない
+ * （ADR-0025 の 4）。
  */
 export interface ReportEvent {
   readonly kind: "report";
   readonly from: number;
-  /** 片道遅延の標本列（マイクロ秒の整数）。勾配の算出に用いる */
+  /** 片道遅延の標本列（マイクロ秒の整数）。 */
   readonly delayUs: readonly number[];
+}
+
+/**
+ * 購読者からのキーフレーム要求（ADR-0039）。
+ *
+ * 会議の途中で購読を張ると最初に届くのは差分フレームであり、購読者の復号器は
+ * キーフレームまで何も出せない。以前はこの事象が無く、要求は中継ノードで捨てられて
+ * いたため**購読者には永久に何も表示されなかった**（F-053）。
+ *
+ * 要求できるのは**自分が購読している送信者の段**のみとする。購読していない相手の
+ * 符号化器をキーフレームで乱すことを防ぐ。
+ */
+export interface KeyframeRequestEvent {
+  readonly kind: "keyframeRequest";
+  /** 要求した購読者。 */
+  readonly from: number;
+  /** キーフレームを出してほしい送信者。 */
+  readonly target: number;
+  readonly ch: number;
+  readonly sid: number;
 }
 
 export type ShardEvent =
   | MediaEvent
+  | KeyframeRequestEvent
   | SubscribeEvent
+  | AckEvent
+  | StreamAnnounceEvent
   | JoinEvent
   | LeaveEvent
   | LinkEvent
@@ -140,7 +250,9 @@ export type ShardEvent =
   | BudgetEvent
   | ReportEvent;
 
-// --- 出力コマンド (conformance.md 4.3) ---
+/* ------------------------------------------------------------------------- */
+/* 出力コマンド（conformance.md 4.3）                                         */
+/* ------------------------------------------------------------------------- */
 
 export interface ForwardCommand {
   readonly kind: "forward";
@@ -159,9 +271,19 @@ export interface SetTierCommand {
   readonly tier: number;
 }
 
+/**
+ * キーフレームの要求（wire-format.md 2.5）。
+ *
+ * **`channel` と `spatialId` を持たせる。** 送信者は段ごとに独立した符号化器を持つため
+ * （simulcast。ADR-0004）、どの段のキーフレームを求めているかを伝えなければ、
+ * 受け取った側は要求を適用できない。以前は `for` だけを持っており、受け取る送信ノードが
+ * 必須検査で捨てていたため、要求は 1 度も通らなかった。
+ */
 export interface KeyframeRequestCommand {
   readonly kind: "keyframeRequest";
   readonly for: number;
+  readonly channel: number;
+  readonly spatialId: number;
 }
 
 export interface ConnectCommand {
@@ -186,15 +308,33 @@ export interface CloseCommand {
 
 /**
  * 制御系へのエラー通知（conformance.md 4.3）。
- * 接続は閉じない。KEY_ONLY への遷移でシャードの再分割を要求するために使う。
+ * 接続は閉じない。ノード全体の予算超過でシャードの再分割を要求するために使う。
  */
 export interface NotifyCommand {
   readonly kind: "notify";
   readonly code: number;
 }
 
+/**
+ * 上流（送信ノード）へ返す受信位置（congestion.md 2 節）。
+ *
+ * **送信ノードの送信窓はこれが無いと開かない。** 送信ノードは未確認のフレーム数から
+ * `inFlightMs` を求め、`SEND_WINDOW_MS` を超える間は渡さない。中継ノードが受信位置を
+ * 返さなければ、送信ノードは最初の数枚を渡した後に永久に窓を閉じる（実測: 10 枚のうち
+ * 4 枚だけが中継ノードへ届いた）。受信ノードが中継ノードへ返すのと同じ機構である。
+ */
+export interface AckUpstreamCommand {
+  readonly kind: "ackUpstream";
+  /** 宛先の送信者。 */
+  readonly to: number;
+  readonly channel: number;
+  readonly spatialId: number;
+  readonly highestSeq: number;
+}
+
 export type ShardCommand =
   | ForwardCommand
+  | AckUpstreamCommand
   | DropCommand
   | SetTierCommand
   | KeyframeRequestCommand
@@ -204,15 +344,55 @@ export type ShardCommand =
   | CloseCommand
   | NotifyCommand;
 
-// --- 購読情報 ---
+/* ------------------------------------------------------------------------- */
+/* 状態                                                                      */
+/* ------------------------------------------------------------------------- */
 
+/**
+ * 購読 1 本の状態。
+ *
+ * **判断はすべてここに閉じる。** ノード全体の状態は転送の可否に影響させない
+ * （ADR-0025 の 3・5）。
+ */
 export interface Subscription {
   readonly subscriberId: number;
   readonly targetId: number;
+  readonly channel: number;
+  /** 購読者が要求した最大 spatialId（段番号）。 */
   readonly maxSpatialId: number;
-}
+  /** 購読者が要求した最大 temporalId。 */
+  readonly maxTemporalId: number;
 
-// --- 状態 ---
+  /* --- 送信窓（congestion.md 2 節） --- */
+  /**
+   * 送信窓が追跡している段。段ごとに sequenceNumber の空間が独立しているため、
+   * 渡す段が変わったら窓を作り直す必要がある。−1 は「まだ渡していない」を表す。
+   */
+  readonly windowSid: number;
+  /** この購読へ渡した最大 sequenceNumber（`windowSid` の空間における値）。 */
+  readonly highestSent: number;
+  /** ack で確認された最大 sequenceNumber。 */
+  readonly highestAcked: number;
+  /** 最後に ack を受けた時刻。ACK_TIMEOUT_MS の判定に使う。 */
+  readonly lastAckAtMs: number;
+  /**
+   * ack が途絶えて転送を止めているか。
+   * 止めた後も購読は残す。再び ack が届けば復帰する（再接続で購読が張り直されるため）。
+   */
+  readonly stalled: boolean;
+
+  /* --- 輻輳（state-machines.md 3 節を購読単位で適用する） --- */
+  readonly congestion: CongestionState;
+  readonly congestionEnteredAt: number;
+  /**
+   * 輻輳による段の引き下げ量。SHEDDING_SPATIAL 以降で 1 になる。
+   *
+   * 最上位 spatialId を「破棄」してはならない。simulcast では購読者へ渡しているのは
+   * 1 段だけであり、その段を破棄すると画面が消える。段を 1 つ下げるのが正しい
+   * （ADR-0027 の 4）。
+   */
+  readonly tierPenalty: number;
+}
 
 /**
  * 送信者ごとの直近の発話時刻。音声の選別転送に使う（ADR-0024）。
@@ -224,58 +404,6 @@ export interface SpeakerActivity {
   readonly lastSpeechAtMs: number;
 }
 
-export interface ShardState {
-  /** 現在の輻輳状態 */
-  readonly congestion: CongestionState;
-  /** 輻輳状態に遷移した時刻（ヒステリシス判定用） */
-  readonly congestionEnteredAt: number;
-  /** 参加者 ID の集合（昇順で保持） */
-  readonly participants: readonly number[];
-  /** 購読の一覧。(subscriberId, targetId) で一意 */
-  readonly subscriptions: readonly Subscription[];
-  /** 帯域予算 bytes/sec。budget イベントで更新される */
-  readonly budgetBytesPerSec: number;
-  /** 現フレームまでの累積送信バイト（1 秒窓のレート推定用） */
-  readonly sentBytesInWindow: number;
-  /** 現フレームまでの累積送信メッセージ（1 秒窓のレート推定用） */
-  readonly sentMessagesInWindow: number;
-  /** 窓の開始時刻 */
-  readonly windowStartMs: number;
-  /** 無視されたイベントの記録（W_UNEXPECTED_EVENT） */
-  readonly unexpectedEvents: readonly string[];
-  /**
-   * 送信者ごとの直近の発話時刻（音声の選別転送。ADR-0024）。
-   * 上限は AUDIO_SELECTIVE_FORWARD_COUNT 名であり、これを超える送信者の音声は破棄する。
-   * senderId の昇順で保持する。
-   */
-  readonly speakers: readonly SpeakerActivity[];
-  /**
-   * 受信者ごとの遅延勾配。report イベントで更新する。
-   * subscriberId の昇順で保持する（決定性のため）。
-   */
-  readonly trends: readonly ReceiverTrend[];
-  /**
-   * (senderId, channel) ごとに観測した spatialId の最大値。
-   * SHEDDING_SPATIAL で「最上位 spatialId のみ」を破棄するために必要である。
-   * senderId, channel の昇順で保持する。
-   */
-  readonly maxSpatial: readonly MaxSpatial[];
-  /**
-   * 送信者ごとに指令したエンコーダの上限層。targetId の昇順で保持する。
-   *
-   * 購読の和集合から決まる。誰も高い層を要求していない送信者に高い層を作らせ続けると、
-   * 送信側の負荷と上りの帯域が無駄になる。指令の宛先は送信ノードであり、
-   * 送信ノードがクライアントへ中継する（ADR-0022）。
-   */
-  readonly encoderTiers: readonly EncoderTier[];
-}
-
-/** 送信者 1 人に指令したエンコーダの上限層。 */
-export interface EncoderTier {
-  readonly targetId: number;
-  readonly tier: number;
-}
-
 /** 受信者 1 人の遅延勾配。分子と分母の整数対で持つ（ADR-0017）。 */
 export interface ReceiverTrend {
   readonly subscriberId: number;
@@ -283,184 +411,489 @@ export interface ReceiverTrend {
   readonly denominator: number;
 }
 
-/** 送信者とチャネルごとの最大 spatialId。 */
-export interface MaxSpatial {
+/** 送信者が申告した、または観測されたはしご。 */
+export interface Ladder {
+  readonly from: number;
+  readonly ch: number;
+  /** sid の昇順。 */
+  readonly rungs: readonly LadderRung[];
+  /** 申告（streamAnnounce）に由来するか。false は観測のみ（fps が分からない）。 */
+  readonly announced: boolean;
+}
+
+/** 送信者 1 人に指令したエンコーダの上限段。 */
+export interface EncoderTier {
+  readonly targetId: number;
+  readonly tier: number;
+}
+
+export interface ShardState {
+  /** 参加者 ID の集合（昇順で保持）。 */
+  readonly participants: readonly number[];
+  /** 購読の一覧。(subscriberId, targetId, channel) で一意。昇順で保持。 */
+  readonly subscriptions: readonly Subscription[];
+  /** 送信者ごとのはしご。(from, ch) の昇順で保持。 */
+  readonly ladders: readonly Ladder[];
+  /** 受信者ごとの遅延勾配。subscriberId の昇順で保持。 */
+  readonly trends: readonly ReceiverTrend[];
+  /** 送信者ごとの直近の発話時刻（ADR-0024）。senderId の昇順で保持。 */
+  readonly speakers: readonly SpeakerActivity[];
+  /** 送信者ごとに指令したエンコーダの上限段（ADR-0022）。targetId の昇順で保持。 */
+  readonly encoderTiers: readonly EncoderTier[];
+
+  /* --- ノード全体の予算。転送の可否には使わない（ADR-0025 の 5） --- */
+  readonly budgetBytesPerSec: number;
+  readonly sentBytesInWindow: number;
+  readonly sentMessagesInWindow: number;
+  readonly windowStartMs: number;
+  /** 現在の窓で過負荷を通知したか。同じ窓で繰り返し通知しない。 */
+  readonly overloadNotified: boolean;
+
+  /**
+   * 送信者ごとに受け取った最大の sequenceNumber。
+   * `timer` で `ackUpstream` として返す（congestion.md 2 節）。
+   * (from, ch, sid) の昇順で保持する（決定性のため）。
+   */
+  readonly received: readonly ReceivedMark[];
+
+  /** 表に無いイベントの記録（W_UNEXPECTED_EVENT）。 */
+  readonly unexpectedEvents: readonly string[];
+}
+
+/** 受け取った位置。`ackUpstream` の内容になる。 */
+export interface ReceivedMark {
   readonly from: number;
   readonly ch: number;
   readonly sid: number;
+  readonly highestSeq: number;
 }
-
-// --- 初期状態 ---
 
 export function initialState(t: number): ShardState {
   return {
-    congestion: "NORMAL",
-    congestionEnteredAt: t,
     participants: [],
     subscriptions: [],
+    ladders: [],
+    trends: [],
+    speakers: [],
+    encoderTiers: [],
     budgetBytesPerSec: NODE_MAX_OUT_BYTES_PER_SEC,
     sentBytesInWindow: 0,
     sentMessagesInWindow: 0,
     windowStartMs: t,
+    overloadNotified: false,
+    received: [],
     unexpectedEvents: [],
-    trends: [],
-    maxSpatial: [],
-    encoderTiers: [],
-    speakers: [],
   };
 }
-
-// --- ステップ関数 ---
 
 export interface StepResult {
   readonly state: ShardState;
   readonly commands: readonly ShardCommand[];
 }
 
-/**
- * 純関数の状態遷移。
- * 入力イベントを受け取り、新しい状態と出力コマンド列を返す。
- */
+/* ------------------------------------------------------------------------- */
+/* ステップ関数                                                              */
+/* ------------------------------------------------------------------------- */
+
 export function step(state: ShardState, event: ShardEvent, t: number): StepResult {
   switch (event.kind) {
     case "media":
       return handleMedia(state, event, t);
     case "subscribe":
       return handleSubscribe(state, event, t);
+    case "ack":
+      return handleAck(state, event, t);
+    case "streamAnnounce":
+      return handleStreamAnnounce(state, event, t);
     case "join":
-      return handleJoin(state, event, t);
+      return handleJoin(state, event);
     case "leave":
-      return handleLeave(state, event, t);
+      return handleLeave(state, event);
     case "link":
-      return handleLink(state, event, t);
+      return ignoreEvent(state, "link");
     case "timer":
       return handleTimer(state, t);
     case "budget":
       return handleBudget(state, event, t);
     case "report":
       return handleReport(state, event, t);
+    case "keyframeRequest":
+      return handleKeyframeRequest(state, event);
   }
 }
 
-// --- 内部: メディアイベント処理 ---
+/**
+ * 購読者のキーフレーム要求を送信者への要求へ直す。
+ *
+ * 購読が無い相手への要求は無視して記録する（表に無い遷移として扱う。AGENTS 5.4）。
+ * 間隔制限は実行側が持つ（`rate-limit.ts`。wire-format.md 2.5）。
+ */
+function handleKeyframeRequest(state: ShardState, event: KeyframeRequestEvent): StepResult {
+  const subscribed = state.subscriptions.some(
+    (sub) => sub.subscriberId === event.from && sub.targetId === event.target && sub.channel === event.ch,
+  );
+  if (!subscribed) {
+    return ignoreEvent(state, "keyframeRequest");
+  }
+  return {
+    state,
+    commands: [
+      {
+        kind: "keyframeRequest",
+        for: event.target,
+        channel: event.ch,
+        spatialId: event.sid,
+      },
+    ],
+  };
+}
+
+function ignoreEvent(state: ShardState, name: string): StepResult {
+  // state-machines.md 3 節の表に無いイベントは無視して記録する（AGENTS 5.4）。
+  //
+  // **記録には上限を設ける。** 上限が無いと、購読に対応しない `ack` が届くたびに
+  // 文字列が積まれ続ける（ack は購読ごとに毎秒 20 件届く）。Durable Object の記憶は
+  // 128 MB であり、無制限に伸びる配列は必ず溢れる。古い側を捨てる。
+  const appended = [...state.unexpectedEvents, name];
+  const trimmed =
+    appended.length > MAX_UNEXPECTED_EVENTS
+      ? appended.slice(appended.length - MAX_UNEXPECTED_EVENTS)
+      : appended;
+  return {
+    state: { ...state, unexpectedEvents: trimmed },
+    commands: [],
+  };
+}
+
+/* ------------------------------------------------------------------------- */
+/* メディア                                                                  */
+/* ------------------------------------------------------------------------- */
+
+function isAudioChannel(ch: number): boolean {
+  return ch === CHANNEL_AUDIO || ch === CHANNEL_SCREEN_AUDIO;
+}
 
 function handleMedia(state: ShardState, event: MediaEvent, t: number): StepResult {
-  const commands: ShardCommand[] = [];
-
-  // 窓のリセット（観測窓が満了したら）
-  // 観測した spatialId の最大値も更新する。SHEDDING_SPATIAL の判定に使う。
-  const windowed = updateMaxSpatial(maybeResetWindow(state, t), event);
+  const windowed = observeLadder(maybeResetWindow(state, t), event);
 
   // 音声で ACTIVE_SPEAKER が立っていれば発話時刻を記録する（選別転送。ADR-0024）。
-  // 記録は選別の前に行う。自分が今まさに発話している場合、その音声は通す必要がある。
-  const isAudio = event.ch === CHANNEL_AUDIO;
-  const isSpeaking = (event.flags & FLAG_ACTIVE_SPEAKER) !== 0;
-  const newState: ShardState =
-    isAudio && isSpeaking
+  // 記録は選別の前に行う。今まさに発話している送信者の音声は通す必要がある。
+  const audio = isAudioChannel(event.ch);
+  const speaking = (event.flags & FLAG_ACTIVE_SPEAKER) !== 0;
+  const withSpeech: ShardState =
+    audio && speaking
       ? { ...windowed, speakers: recordSpeech(windowed.speakers, event.from, t) }
       : windowed;
 
-  // 音声の選別転送。上位 AUDIO_SELECTIVE_FORWARD_COUNT 名に入らない送信者は破棄する。
-  // 輻輳による破棄ではないため priority は 0 とする。
-  if (isAudio && !isAudioForwarded(newState, event.from, t)) {
-    commands.push({ kind: "drop", priority: 0, count: 1 });
-    return { state: newState, commands };
-  }
-
-  // 破棄優先順位を計算（wire.ts の dropPriority を再利用する）
   const priority = dropPriority(event.ch, event.flags);
+  // 受け取った位置を記録する。ack はタイマーでまとめて返す（フレームごとに返すと
+  // メッセージレートを食う。制約はレートである。F-024）。
+  const marked = markReceived(withSpeech, event);
 
-  // 輻輳状態に応じた破棄判定
-  const shouldDrop = shouldDropInCongestion(newState, event, priority);
-
-  if (shouldDrop) {
-    // 破棄する場合
-    const p = priority !== null ? priority : 0;
-    commands.push({ kind: "drop", priority: p, count: 1 });
-    return { state: newState, commands };
-  }
-
-  // 転送先の決定: 購読者のうち tier（maxSpatialId）以下の spatialId を持つユニットのみ転送
-  // 仕様に順序が無い場合は subscriberId の昇順とする（決定性のため）
   const targets: number[] = [];
-  for (const sub of newState.subscriptions) {
-    // 購読対象が送信者と一致し、かつユニットの spatialId が tier 以下
-    if (sub.targetId === event.from && event.sid <= sub.maxSpatialId) {
+  const dropped = new Map<number, number>();
+  const nextSubscriptions: Subscription[] = [];
+
+  for (const sub of marked.subscriptions) {
+    if (sub.targetId !== event.from || sub.channel !== event.ch) {
+      nextSubscriptions.push(sub);
+      continue;
+    }
+    const decision = decideForSubscription(marked, sub, event, priority, t);
+    nextSubscriptions.push(decision.subscription);
+    if (decision.forward) {
       targets.push(sub.subscriberId);
+      continue;
+    }
+    if (decision.dropPriority !== null) {
+      const current = dropped.get(decision.dropPriority) ?? 0;
+      dropped.set(decision.dropPriority, current + 1);
     }
   }
-  // 昇順に整列（決定性のため。仕様に順序指定が無い場合は昇順）
+
+  // 昇順に整列する（決定性のため。仕様に順序の指定が無い場合は昇順）。
   targets.sort((a, b) => a - b);
 
-  if (targets.length === 0) {
-    // 転送先が無い場合はコマンドを出さない
-    return { state: newState, commands };
+  const commands: ShardCommand[] = [];
+  // 破棄は優先順位の昇順でまとめて 1 件ずつ報告する。順序を固定しないと
+  // トレースベクタの完全一致（conformance.md 4.4）が壊れる。
+  for (const key of [...dropped.keys()].sort((a, b) => a - b)) {
+    const count = dropped.get(key);
+    if (count !== undefined && count > 0) {
+      commands.push({ kind: "drop", priority: key, count });
+    }
   }
 
-  // 予算超過の判定
-  const msgCost = targets.length;
-  const byteCost = targets.length * event.bytes;
-  const updatedSent = newState.sentBytesInWindow + byteCost;
-  const updatedMessages = newState.sentMessagesInWindow + msgCost;
-
-  // 予算超過時は破棄順位の低いものから破棄する
-  if (isOverBudget(updatedMessages, updatedSent, newState, t)) {
-    // 破棄可能なユニットのみ破棄する（KEY と音声は破棄禁止）
-    if (priority !== null) {
-      commands.push({ kind: "drop", priority, count: 1 });
-      return { state: newState, commands };
-    }
-    // 破棄禁止のユニットは転送する（KEY / 音声）
+  if (targets.length === 0) {
+    return { state: { ...marked, subscriptions: nextSubscriptions }, commands };
   }
 
   commands.push({ kind: "forward", to: targets });
 
-  const stateAfterForward: ShardState = {
-    ...newState,
-    sentBytesInWindow: newState.sentBytesInWindow + byteCost,
-    sentMessagesInWindow: newState.sentMessagesInWindow + msgCost,
+  // ノード全体の予算を計上する。**転送の可否には使わない。**
+  // 超過はシャードの再分割が必要な水準であり、個別の購読の問題ではない（ADR-0025 の 5）。
+  const accounted: ShardState = {
+    ...marked,
+    subscriptions: nextSubscriptions,
+    sentMessagesInWindow: marked.sentMessagesInWindow + targets.length,
+    sentBytesInWindow: marked.sentBytesInWindow + targets.length * event.bytes,
   };
+  const overload = notifyNodeOverload(accounted, t);
+  return { state: overload.state, commands: [...commands, ...overload.commands] };
+}
 
-  // 転送により利用率が上がるため、輻輳状態を再評価する。
-  // 評価しないと util が閾値を超えても遷移が起きない（state-machines.md 3 節）。
-  const evaluated = evaluateCongestionTransition(stateAfterForward, t);
-  return { state: evaluated.state, commands: [...commands, ...evaluated.commands] };
+interface SubscriptionDecision {
+  readonly subscription: Subscription;
+  readonly forward: boolean;
+  /** 破棄として報告する優先順位。報告しない場合は null。 */
+  readonly dropPriority: number | null;
 }
 
 /**
- * 音声の選別転送の判断（ADR-0024）。
+ * 購読 1 本に対する転送の可否を決める。
  *
- * 転送対象は「直近に ACTIVE_SPEAKER=1 の音声が届いた時刻」が新しい上位
- * AUDIO_SELECTIVE_FORWARD_COUNT 名である。発話が止まってからも AUDIO_SPEAKER_HOLD_MS は
- * 対象に残す。時刻が同じ場合は senderId の昇順とする（決定性のため）。
+ * 判定の順序を固定する。順序を変えると挙動が変わる。
+ *   1. ack が途絶えている  → 渡さない（報告もしない。相手は既に居ない）
+ *   2. 段の選択に合わない  → 渡さない（報告しない。輻輳ではなく層の選択である）
+ *   3. temporalId の超過   → 渡さない（同上）
+ *   4. 輻輳状態による破棄  → 渡さない（報告する）
+ *   5. 送信窓が閉じている  → 渡さない（報告する）
+ *   6. それ以外            → 渡す
  *
- * 発話中の送信者が上限に達していない場合は、発話していない送信者の音声も転送する。
- * DTX で無音の間に相手の環境音が完全に消えると通話が不自然になるためである。
+ * 4 と 5 では、破棄禁止のユニット（KEY と音声）は必ず渡す（wire-format.md 1.4）。
  */
-function isAudioForwarded(state: ShardState, senderId: number, t: number): boolean {
-  // 保持時間の内側にいる発話者だけを候補とする。
+function decideForSubscription(
+  state: ShardState,
+  sub: Subscription,
+  event: MediaEvent,
+  priority: number | null,
+  t: number,
+): SubscriptionDecision {
+  if (sub.stalled) {
+    return { subscription: sub, forward: false, dropPriority: null };
+  }
+
+  // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
+  //
+  // **本数は購読者ごとに決める。** 帯域が細い購読者へ 5 本の音声を送ると、
+  // 音声だけで 208 kbps を占め、映像の余地が無くなる（MIN_VIABLE_BPS の導出）。
+  // 輻輳の段が深いほど本数を減らす。減らす順序は ADR-0024 の順位に従う。
+  if (isAudioChannel(event.ch) && !isAudioForwarded(state, sub, event.from, t)) {
+    // 輻輳による破棄ではないため priority は 0 とする（ADR-0024 の 5）。
+    return { subscription: sub, forward: false, dropPriority: 0 };
+  }
+
+  // 音声は段を持たない（spatialId は常に 0。wire-format.md 1.2）。段の選択は映像のみ。
+  if (!isAudioChannel(event.ch)) {
+    const chosen = chooseRung(state, sub);
+    if (event.sid !== chosen) {
+      return { subscription: sub, forward: false, dropPriority: null };
+    }
+    if (event.tid > sub.maxTemporalId) {
+      return { subscription: sub, forward: false, dropPriority: null };
+    }
+  }
+
+  const mustForward = priority === null;
+
+  if (!mustForward && shouldDropInCongestion(sub, event, priority)) {
+    return { subscription: sub, forward: false, dropPriority: priority };
+  }
+
+  if (!mustForward && isWindowClosed(state, sub, event)) {
+    return { subscription: sub, forward: false, dropPriority: priority };
+  }
+
+  const chosen = isAudioChannel(event.ch) ? 0 : chooseRung(state, sub);
+  if (chosen !== sub.windowSid) {
+    // 渡す段が変わった。seq の空間が変わるため窓を作り直す。
+    // 作り直さないと、別の段の seq と比較して未確認量が誤る。
+    return {
+      subscription: { ...sub, windowSid: chosen, highestSent: event.seq, highestAcked: event.seq - 1 },
+      forward: true,
+      dropPriority: null,
+    };
+  }
+  const highestSent = event.seq > sub.highestSent ? event.seq : sub.highestSent;
+  return {
+    subscription: { ...sub, highestSent },
+    forward: true,
+    dropPriority: null,
+  };
+}
+
+/**
+ * 送信窓が閉じているか（congestion.md 2 節）。
+ *
+ *   inFlightMs = 未確認フレーム数 / fps × 1000
+ *   inFlightMs > SEND_WINDOW_MS ⇔ 未確認フレーム数 × 1000 > SEND_WINDOW_MS × fps
+ *
+ * 除算を避けて交差乗算で比較する。fps が分からない（streamAnnounce が未着）場合は
+ * 窓を評価しない。評価するには「未確認フレーム数を再生時間へ直す」ための fps が必要であり、
+ * 到着間隔から推定すると時刻と浮動小数点をコアへ持ち込むことになる（ADR-0017）。
+ */
+function isWindowClosed(state: ShardState, sub: Subscription, event: MediaEvent): boolean {
+  const framerate = framerateOf(state, sub);
+  if (framerate <= 0) {
+    return false;
+  }
+  // **窓がまだこの連番の空間に無いときは評価しない**（ADR-0038）。
+  //
+  // 購読を張った時点の窓は `windowSid = -1`、`highestSent = 0`、`highestAcked = 0` である。
+  // 一方、流れている媒体の連番は既に大きい（会議の途中で購読を張れば数百番）。この 2 つを
+  // そのまま比べると未確認フレーム数が数百となり、最初の 1 件から「窓が閉じている」と
+  // 判定される。渡さないので ack も来ず、`highestAcked` は永久に 0 のままとなり、
+  // **その購読へは 1 枚も届かない**（実測: 中継の binaryOut が 0、windowSid が -1 のまま
+  // 全ユニットが破棄された。F-049）。
+  //
+  // 窓は「段（連番の空間）ごと」に作り直すものであり（後段の `chosen !== sub.windowSid`）、
+  // 空間が違う間は評価する意味がない。音声は段を持たないため 0 と比べる。
+  const chosen = isAudioChannel(event.ch) ? 0 : chooseRung(state, sub);
+  if (chosen !== sub.windowSid) {
+    return false;
+  }
+  const inFlight = inFlightFrames(sub, event.seq);
+  return inFlight * 1000 > SEND_WINDOW_MS * framerate;
+}
+
+/** 未確認のフレーム数。ack が無い間は「渡した分すべて」が未確認である。 */
+function inFlightFrames(sub: Subscription, seq: number): number {
+  const highest = seq > sub.highestSent ? seq : sub.highestSent;
+  const inFlight = highest - sub.highestAcked - 1;
+  return inFlight < 0 ? 0 : inFlight;
+}
+
+/** この購読が渡している段の fps。申告が無ければ 0 を返す。 */
+function framerateOf(state: ShardState, sub: Subscription): number {
+  const ladder = findLadder(state, sub.targetId, sub.channel);
+  if (ladder === undefined || !ladder.announced) {
+    return 0;
+  }
+  const chosen = chooseRung(state, sub);
+  for (const rung of ladder.rungs) {
+    if (rung.sid === chosen) {
+      return rung.framerate;
+    }
+  }
+  return 0;
+}
+
+/**
+ * この購読へ渡す段を 1 つ選ぶ（ADR-0027 の 3）。
+ *
+ *   有効な要求段 = max(0, maxSpatialId − tierPenalty)
+ *   選ぶ段       = max{存在する段 | 段 <= 有効な要求段}
+ *   該当が無ければ最下段（存在する段の最小値）
+ *
+ * 最後の規則が再ネゴシエーションの安全弁である。はしごが縮んだ直後に古い段を
+ * 要求されても、存在する段から選ぶため黒画面にならない。
+ */
+function chooseRung(state: ShardState, sub: Subscription): number {
+  const wanted = sub.maxSpatialId - sub.tierPenalty;
+  const effective = wanted < 0 ? 0 : wanted;
+  const ladder = findLadder(state, sub.targetId, sub.channel);
+  if (ladder === undefined || ladder.rungs.length === 0) {
+    // 段の情報が無い間は要求どおりの段だけを通す。観測されれば次から選択が効く。
+    return effective;
+  }
+  let best = -1;
+  let lowest = -1;
+  for (const rung of ladder.rungs) {
+    if (lowest < 0 || rung.sid < lowest) {
+      lowest = rung.sid;
+    }
+    if (rung.sid <= effective && rung.sid > best) {
+      best = rung.sid;
+    }
+  }
+  if (best >= 0) {
+    return best;
+  }
+  return lowest < 0 ? effective : lowest;
+}
+
+/**
+ * 輻輳状態に応じた破棄判定（state-machines.md 3 節を購読単位で適用する）。
+ *
+ * SHEDDING_SPATIAL では段を破棄しない。段の引き下げは tierPenalty で行い、
+ * ここでは SHEDDING_T1 と同じ条件（temporalId >= 1）を維持する（ADR-0027 の 4）。
+ */
+function shouldDropInCongestion(sub: Subscription, event: MediaEvent, priority: number): boolean {
+  switch (sub.congestion) {
+    case "NORMAL":
+      return false;
+    case "SHEDDING_T2":
+      // 送信側が DISCARDABLE を立てた層を破棄する。判定は flags 由来の優先順位で行う。
+      return priority <= 3;
+    case "SHEDDING_T1":
+      return event.tid >= 1;
+    case "SHEDDING_SPATIAL":
+      return event.tid >= 1;
+    case "KEY_ONLY":
+      // priority が null でない = KEY ではない。すべて破棄する。
+      return true;
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+/* 音声の選別転送（ADR-0024）                                                */
+/* ------------------------------------------------------------------------- */
+
+function isAudioForwarded(
+  state: ShardState,
+  sub: Subscription,
+  senderId: number,
+  t: number,
+): boolean {
+  const limit = audioLimitFor(sub);
   const active: SpeakerActivity[] = [];
   for (const entry of state.speakers) {
     if (t - entry.lastSpeechAtMs <= AUDIO_SPEAKER_HOLD_MS) {
       active.push(entry);
     }
   }
-  if (active.length <= AUDIO_SELECTIVE_FORWARD_COUNT) {
-    // 上限に達していない。全員の音声を通す。
+  if (active.length <= limit) {
+    // 上限に達していない。全員の音声を通す。DTX の無音で環境音が完全に消えると
+    // 通話が不自然になるためである（ADR-0024 の 6）。
     return true;
   }
-  // 新しい順、同時刻なら senderId の昇順で並べる。
   const ordered = [...active].sort((a, b) => {
     if (a.lastSpeechAtMs !== b.lastSpeechAtMs) {
       return b.lastSpeechAtMs - a.lastSpeechAtMs;
     }
     return a.senderId - b.senderId;
   });
-  const chosen = ordered.slice(0, AUDIO_SELECTIVE_FORWARD_COUNT);
+  const chosen = ordered.slice(0, limit);
   return chosen.some((entry) => entry.senderId === senderId);
 }
 
-/** 発話の記録を更新する。senderId の昇順を保つ（決定性のため）。 */
+/**
+ * この購読者へ同時に転送する音声の本数（ADR-0029 の 2）。
+ *
+ * 輻輳の段が深いほど減らす。**1 本は必ず残す。** 音声が 0 本になると会議が成立しない
+ * （ADR-0029 の 4 の優先順位の最上位）。
+ */
+function audioLimitFor(sub: Subscription): number {
+  const reduced = AUDIO_SELECTIVE_FORWARD_COUNT - congestionDepth(sub.congestion);
+  return reduced < AUDIO_SELECTIVE_MIN_COUNT ? AUDIO_SELECTIVE_MIN_COUNT : reduced;
+}
+
+/** 輻輳の深さ。NORMAL が 0 で、段が深くなるほど大きい。 */
+function congestionDepth(state: CongestionState): number {
+  switch (state) {
+    case "NORMAL":
+      return 0;
+    case "SHEDDING_T2":
+      return 1;
+    case "SHEDDING_T1":
+      return 2;
+    case "SHEDDING_SPATIAL":
+      return 3;
+    case "KEY_ONLY":
+      return 4;
+  }
+}
+
 function recordSpeech(
   speakers: readonly SpeakerActivity[],
   senderId: number,
@@ -483,39 +916,72 @@ function recordSpeech(
   return updated;
 }
 
-// --- 内部: 購読イベント処理 ---
-
-function handleSubscribe(state: ShardState, event: SubscribeEvent, _t: number): StepResult {
-  if (event.want) {
-    // 購読追加。既存の同一 (subscriberId, targetId) があれば更新
-    const filtered = state.subscriptions.filter(
-      (s) => !(s.subscriberId === event.from && s.targetId === event.to),
-    );
-    const newSub: Subscription = {
-      subscriberId: event.from,
-      targetId: event.to,
-      maxSpatialId: event.maxSpatialId,
-    };
-    const newSubscriptions = [...filtered, newSub].sort(subscriptionOrder);
-    return withEncoderTiers({ ...state, subscriptions: newSubscriptions });
+/**
+ * 受け取った位置を更新する。後戻りする値では更新しない。
+ * 順序は from, ch, sid の昇順に保つ（決定性のため）。
+ */
+function markReceived(state: ShardState, event: MediaEvent): ShardState {
+  if (event.seq <= 0) {
+    return state;
   }
-  // 購読解除
-  const newSubscriptions = state.subscriptions.filter(
-    (s) => !(s.subscriberId === event.from && s.targetId === event.to),
+  const existing = state.received.find(
+    (mark) => mark.from === event.from && mark.ch === event.ch && mark.sid === event.sid,
   );
-  return withEncoderTiers({ ...state, subscriptions: newSubscriptions });
+  if (existing !== undefined && existing.highestSeq >= event.seq) {
+    return state;
+  }
+  const rest = state.received.filter(
+    (mark) => !(mark.from === event.from && mark.ch === event.ch && mark.sid === event.sid),
+  );
+  const merged = [...rest, { from: event.from, ch: event.ch, sid: event.sid, highestSeq: event.seq }].sort(
+    (a, b) => (a.from !== b.from ? a.from - b.from : a.ch !== b.ch ? a.ch - b.ch : a.sid - b.sid),
+  );
+  return { ...state, received: merged };
+}
+
+/* ------------------------------------------------------------------------- */
+/* 購読                                                                      */
+/* ------------------------------------------------------------------------- */
+
+function handleSubscribe(state: ShardState, event: SubscribeEvent, t: number): StepResult {
+  const rest = state.subscriptions.filter(
+    (s) => !(s.subscriberId === event.from && s.targetId === event.to && s.channel === event.ch),
+  );
+  if (!event.want) {
+    return withEncoderTiers({ ...state, subscriptions: rest.sort(subscriptionOrder) });
+  }
+  const existing = state.subscriptions.find(
+    (s) => s.subscriberId === event.from && s.targetId === event.to && s.channel === event.ch,
+  );
+  // 購読を張り直したときは送信窓と輻輳状態を初期化する。再接続の直後に古い
+  // 未確認量が残っていると、窓が閉じたまま復帰できない。
+  const created: Subscription = {
+    subscriberId: event.from,
+    targetId: event.to,
+    channel: event.ch,
+    maxSpatialId: event.maxSpatialId,
+    maxTemporalId: event.maxTemporalId,
+    windowSid: existing?.windowSid ?? -1,
+    highestSent: existing?.highestSent ?? 0,
+    highestAcked: existing?.highestAcked ?? 0,
+    lastAckAtMs: t,
+    stalled: false,
+    congestion: existing?.congestion ?? "NORMAL",
+    congestionEnteredAt: existing?.congestionEnteredAt ?? t,
+    tierPenalty: existing?.tierPenalty ?? 0,
+  };
+  return withEncoderTiers({
+    ...state,
+    subscriptions: [...rest, created].sort(subscriptionOrder),
+  });
 }
 
 /**
- * 購読の和集合から送信者ごとの必要な上限層を求め、変化した送信者へ `setTier` を出す。
+ * 購読の和集合から送信者ごとの必要な上限段を求め、変化した送信者へ `setTier` を出す
+ * （ADR-0022）。
  *
- * 判断の規則:
- *   必要な上限層 = その送信者を購読している者の maxSpatialId の最大値
- *   購読者が居なくなった送信者には指令を出さない（記録のみ除去する）。
- *     指令の宛先が存在せず、送信側の設定は次の購読で決まるためである。
- *
- * 出力の順序は targetId の昇順に固定する。順序が実装で揺れると
- * トレースベクタの完全一致（conformance.md 4.4）が壊れる。
+ * 誰も高い段を要求していない送信者に高い段を作らせ続けると、送信側の負荷と上りの帯域が
+ * 無駄になる。購読者が居なくなった送信者には指令を出さない（宛先が無く、設定は次の購読で決まる）。
  */
 function withEncoderTiers(state: ShardState): StepResult {
   const targets: number[] = [];
@@ -544,88 +1010,197 @@ function withEncoderTiers(state: ShardState): StepResult {
   return { state: { ...state, encoderTiers: nextTiers }, commands };
 }
 
-// --- 内部: 参加イベント処理 ---
+function subscriptionOrder(a: Subscription, b: Subscription): number {
+  if (a.subscriberId !== b.subscriberId) {
+    return a.subscriberId - b.subscriberId;
+  }
+  if (a.targetId !== b.targetId) {
+    return a.targetId - b.targetId;
+  }
+  return a.channel - b.channel;
+}
 
-function handleJoin(state: ShardState, event: JoinEvent, _t: number): StepResult {
-  // 重複チェック
+/* ------------------------------------------------------------------------- */
+/* ack                                                                       */
+/* ------------------------------------------------------------------------- */
+
+function handleAck(state: ShardState, event: AckEvent, t: number): StepResult {
+  const target = state.subscriptions.find(
+    (s) => s.subscriberId === event.from && s.targetId === event.to && s.channel === event.ch,
+  );
+  if (target === undefined) {
+    return ignoreEvent(state, "ack");
+  }
+  if (event.sid !== target.windowSid) {
+    // 渡していない段への ack である。段を変えた直後に古い ack が届くことがある。
+    // 適用すると別の seq 空間の値が混ざるため無視する。
+    return ignoreEvent(state, "ack");
+  }
+  // 後戻りする ack は無視する。順序の逆転は TCP 上では起きないが、重複した ack は届く。
+  const highestAcked = event.highestSeq > target.highestAcked ? event.highestSeq : target.highestAcked;
+  const updated: Subscription = { ...target, highestAcked, lastAckAtMs: t, stalled: false };
+  const subscriptions = state.subscriptions
+    .filter((s) => s !== target)
+    .concat([updated])
+    .sort(subscriptionOrder);
+  // ack で未確認量が減るため、輻輳状態を再評価する。評価しないと回復方向の遷移が起きない。
+  return evaluateAll({ ...state, subscriptions }, t);
+}
+
+/* ------------------------------------------------------------------------- */
+/* streamAnnounce                                                            */
+/* ------------------------------------------------------------------------- */
+
+function handleStreamAnnounce(state: ShardState, event: StreamAnnounceEvent, t: number): StepResult {
+  const rungs = [...event.rungs].sort((a, b) => a.sid - b.sid);
+  const rest = state.ladders.filter((entry) => !(entry.from === event.from && entry.ch === event.ch));
+  const ladder: Ladder = { from: event.from, ch: event.ch, rungs, announced: true };
+  const ladders = [...rest, ladder].sort(ladderOrder);
+  // はしごが変わると選ぶ段と fps が変わるため、輻輳状態を再評価する。
+  return evaluateAll({ ...state, ladders }, t);
+}
+
+/**
+ * 観測からはしごを補う。
+ *
+ * 申告（streamAnnounce）が届く前でも、届いたユニットの spatialId から段の集合が分かる。
+ * これにより「ちょうど 1 段を選ぶ」判断を申告の前から行える。fps は観測では分からないため
+ * `announced` を false のままにし、送信窓は評価しない。
+ */
+function observeLadder(state: ShardState, event: MediaEvent): ShardState {
+  if (isAudioChannel(event.ch)) {
+    // 音声は段を持たない。
+    return state;
+  }
+  const existing = findLadder(state, event.from, event.ch);
+  if (existing !== undefined) {
+    if (existing.announced || existing.rungs.some((rung) => rung.sid === event.sid)) {
+      return state;
+    }
+    const rungs = [...existing.rungs, observedRung(event.sid)].sort((a, b) => a.sid - b.sid);
+    const rest = state.ladders.filter((entry) => !(entry.from === event.from && entry.ch === event.ch));
+    return {
+      ...state,
+      ladders: [...rest, { ...existing, rungs }].sort(ladderOrder),
+    };
+  }
+  const created: Ladder = {
+    from: event.from,
+    ch: event.ch,
+    rungs: [observedRung(event.sid)],
+    announced: false,
+  };
+  return { ...state, ladders: [...state.ladders, created].sort(ladderOrder) };
+}
+
+/** 観測のみで作る段。寸法とビットレートは不明であるため 0 とし、判断に使わない。 */
+function observedRung(sid: number): LadderRung {
+  return { sid, width: 0, height: 0, framerate: 0, temporalLayers: 0, targetBitrate: 0 };
+}
+
+function findLadder(state: ShardState, from: number, ch: number): Ladder | undefined {
+  return state.ladders.find((entry) => entry.from === from && entry.ch === ch);
+}
+
+function ladderOrder(a: Ladder, b: Ladder): number {
+  return a.from !== b.from ? a.from - b.from : a.ch - b.ch;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 参加と退出                                                                */
+/* ------------------------------------------------------------------------- */
+
+function handleJoin(state: ShardState, event: JoinEvent): StepResult {
   if (state.participants.includes(event.id)) {
     return { state, commands: [] };
   }
-  const newParticipants = [...state.participants, event.id].sort((a, b) => a - b);
   return {
-    state: { ...state, participants: newParticipants },
+    state: { ...state, participants: [...state.participants, event.id].sort((a, b) => a - b) },
     commands: [],
   };
 }
 
-// --- 内部: 退出イベント処理 ---
-
-function handleLeave(state: ShardState, event: LeaveEvent, _t: number): StepResult {
-  const newParticipants = state.participants.filter((id) => id !== event.id);
-  // 退出者に関する購読も除去する
-  const newSubscriptions = state.subscriptions.filter(
-    (s) => s.subscriberId !== event.id && s.targetId !== event.id,
-  );
-  // 退出者の遅延勾配と観測した spatialId も除去する。
-  // 残すと、居なくなった相手の古い観測が輻輳の判定に影響し続ける。
-  const newTrends = state.trends.filter((trend) => trend.subscriberId !== event.id);
-  const newMaxSpatial = state.maxSpatial.filter((entry) => entry.from !== event.id);
+function handleLeave(state: ShardState, event: LeaveEvent): StepResult {
+  // 退出者に関わるものはすべて除去する。残すと居なくなった相手の古い観測が
+  // 判定に影響し続ける（購読・勾配・はしご・指令の記録）。
   return withEncoderTiers({
     ...state,
-    participants: newParticipants,
-    subscriptions: newSubscriptions,
-    trends: newTrends,
-    maxSpatial: newMaxSpatial,
-    // 退出者への指令の記録も除去する。残すと再参加時に指令が出ない。
+    participants: state.participants.filter((id) => id !== event.id),
+    subscriptions: state.subscriptions.filter(
+      (s) => s.subscriberId !== event.id && s.targetId !== event.id,
+    ),
+    trends: state.trends.filter((trend) => trend.subscriberId !== event.id),
+    ladders: state.ladders.filter((entry) => entry.from !== event.id),
+    speakers: state.speakers.filter((entry) => entry.senderId !== event.id),
     encoderTiers: state.encoderTiers.filter((entry) => entry.targetId !== event.id),
+    received: state.received.filter((mark) => mark.from !== event.id),
   });
 }
 
-// --- 内部: リンクイベント処理 ---
-
-function handleLink(state: ShardState, _event: LinkEvent, _t: number): StepResult {
-  // 中継ノードの輻輳状態機械にはリンクイベントの遷移が定義されていない。
-  // state-machines.md 3 節の表に無いイベントは無視して記録する。
-  return {
-    state: {
-      ...state,
-      unexpectedEvents: [...state.unexpectedEvents, "link"],
-    },
-    commands: [],
-  };
-}
-
-// --- 内部: タイマーイベント処理 ---
+/* ------------------------------------------------------------------------- */
+/* タイマー・予算・報告                                                      */
+/* ------------------------------------------------------------------------- */
 
 function handleTimer(state: ShardState, t: number): StepResult {
-  // タイマーは窓のリセットと輻輳状態の再評価に使う。
-  // 送信が止まった場合、util は時間の経過だけで下がる。タイマーで再評価しないと
-  // 回復方向の遷移（表の 3 行目・5 行目・7 行目・8 行目）が起きない。
-  const newState = maybeResetWindow(state, t);
-  return evaluateCongestionTransition(newState, t);
+  const windowed = maybeResetWindow(state, t);
+  const stalled = detectAckTimeout(windowed, t);
+  const evaluated = evaluateAll(stalled.state, t);
+  // 上流（送信ノード）へ受信位置を返す。返さないと送信ノードの窓が開かない。
+  const acks: ShardCommand[] = evaluated.state.received.map((mark) => ({
+    kind: "ackUpstream" as const,
+    to: mark.from,
+    channel: mark.ch,
+    spatialId: mark.sid,
+    highestSeq: mark.highestSeq,
+  }));
+  return {
+    state: evaluated.state,
+    commands: [...stalled.commands, ...evaluated.commands, ...acks],
+  };
 }
 
-// --- 内部: 予算イベント処理 ---
+/**
+ * ack が途絶えた購読を検出する（congestion.md 7 節）。
+ *
+ * `ACK_TIMEOUT_MS` の間 `ack` が届かない購読は、切断されたものとして転送を止め、
+ * 接続を閉じる。閉じない場合、既に居ない相手へ送り続けてノードの予算を食う。
+ *
+ * **未確認の媒体が無い購読は対象にしない。** 何も渡していない相手には返すべき ack が無い。
+ * 対象にすると、まだ映像を送っていない参加者の接続を一斉に閉じてしまう。
+ */
+function detectAckTimeout(state: ShardState, t: number): StepResult {
+  const commands: ShardCommand[] = [];
+  const subscriptions: Subscription[] = [];
+  for (const sub of state.subscriptions) {
+    const outstanding = sub.highestSent > sub.highestAcked;
+    if (!sub.stalled && !outstanding) {
+      // **未確認が無い間は時計を進める**（ADR-0041）。
+      //
+      // 「無通信」と「無応答」は別である。購読してから長く媒体が流れない相手（音声が
+      // 後から始まる、話し始めるまで送らない）では `lastAckAtMs` が購読の時刻のまま
+      // 古くなる。そこへ最初の 1 件を渡すと、渡した直後に「`ACK_TIMEOUT_MS` の間 ack が
+      // 無い」と判定され、**1 件目で停止扱いになり以後すべて捨てられた**（実測: 音声が
+      // 40 秒後に流れ始めた購読が `stalled: true` になり、6 個のうち 1 個しか届かなかった。
+      // F-060）。時限は「未確認が生じた時点」から数えなければならない。
+      subscriptions.push({ ...sub, lastAckAtMs: t });
+      continue;
+    }
+    if (sub.stalled || t - sub.lastAckAtMs < ACK_TIMEOUT_MS) {
+      subscriptions.push(sub);
+      continue;
+    }
+    subscriptions.push({ ...sub, stalled: true });
+    commands.push({ kind: "disconnect", peer: sub.subscriberId });
+  }
+  // disconnect は購読者 ID の昇順で出す（購読の並びが昇順であるため自然に満たされる）。
+  return { state: { ...state, subscriptions }, commands };
+}
 
 function handleBudget(state: ShardState, event: BudgetEvent, t: number): StepResult {
-  const commands: ShardCommand[] = [];
-  const newState: ShardState = {
-    ...state,
-    budgetBytesPerSec: event.bytesPerSec,
-  };
-
-  // 予算更新に伴い輻輳状態の遷移を評価する
-  const result = evaluateCongestionTransition(newState, t);
-  if (result.commands.length > 0) {
-    commands.push(...result.commands);
-  }
-  return { state: result.state, commands };
+  return evaluateAll({ ...state, budgetBytesPerSec: event.bytesPerSec }, t);
 }
 
-// --- 内部: 測定報告の処理 ---
-
 function handleReport(state: ShardState, event: ReportEvent, t: number): StepResult {
-  // 遅延勾配は fixed.ts の整数演算で求める。浮動小数点を使わない（ADR-0017）。
   const slope: Slope = delaySlope(event.delayUs);
   const rest = state.trends.filter((entry) => entry.subscriberId !== event.from);
   const updated: ReceiverTrend = {
@@ -633,222 +1208,221 @@ function handleReport(state: ShardState, event: ReportEvent, t: number): StepRes
     numerator: slope.numerator,
     denominator: slope.denominator,
   };
-  // subscriberId の昇順で保持する。反復順序が結果に影響するため決定的にする必要がある。
   const trends = [...rest, updated].sort((a, b) => a.subscriberId - b.subscriberId);
-  return evaluateCongestionTransition({ ...state, trends }, t);
+  return evaluateAll({ ...state, trends }, t);
 }
 
-// --- 内部: 輻輳状態の遷移評価 ---
-// state-machines.md 3 節の表に一行ずつ対応する。
-// 遷移の入力は util（要求レート ÷ 予算）と maxTrend（受信者の遅延勾配の最大値）である。
-// 劣化側は「または」、回復側は「かつ」で結合する。
-// 比較は全て整数の交差乗算で行う（ADR-0017）。浮動小数点を使わない。
+/* ------------------------------------------------------------------------- */
+/* 輻輳状態の遷移（購読単位）                                                */
+/* ------------------------------------------------------------------------- */
 
-/** util > num/den を判定する。util = 送信メッセージ数 ÷ (窓の秒数 × 予算レート)。 */
-function utilGreater(state: ShardState, t: number, num: number, den: number): boolean {
-  const windowMs = t - state.windowStartMs;
-  if (windowMs <= 0) {
-    return false;
+/**
+ * すべての購読の輻輳状態を評価する。
+ *
+ * 購読ごとに独立に評価する。ある購読が KEY_ONLY でも、他の購読は NORMAL のままである
+ * （congestion.md 7 節、ADR-0025 の 3）。
+ */
+function evaluateAll(state: ShardState, t: number): StepResult {
+  const commands: ShardCommand[] = [];
+  const subscriptions: Subscription[] = [];
+  for (const sub of state.subscriptions) {
+    const result = evaluateSubscription(state, sub, t);
+    subscriptions.push(result.subscription);
+    commands.push(...result.commands);
   }
-  // util = sent × 1000 / (windowMs × maxMps)
-  // util > num/den ⇔ sent × 1000 × den > num × windowMs × maxMps
-  // 分母（windowMs × maxMps × den）は正であるため不等号の向きは変わらない。
-  return state.sentMessagesInWindow * 1000 * den > num * windowMs * NODE_MAX_OUT_MESSAGES_PER_SEC;
+  return { state: { ...state, subscriptions }, commands };
 }
 
-/** util < num/den を判定する。 */
-function utilLess(state: ShardState, t: number, num: number, den: number): boolean {
-  const windowMs = t - state.windowStartMs;
-  if (windowMs <= 0) {
-    // 窓が開いた直後は送信量が 0 であり、利用率は 0 とみなす。
-    return num > 0;
-  }
-  return state.sentMessagesInWindow * 1000 * den < num * windowMs * NODE_MAX_OUT_MESSAGES_PER_SEC;
+interface EvaluateResult {
+  readonly subscription: Subscription;
+  readonly commands: readonly ShardCommand[];
 }
 
-/** maxTrend > num/den を判定する。報告が無い場合は false（勾配が不明なら劣化と判定しない）。 */
-function trendGreater(state: ShardState, num: number, den: number): boolean {
-  for (const trend of state.trends) {
-    // trend > num/den ⇔ trend.numerator × den > num × trend.denominator
-    // denominator は delaySlope の定義により常に正である（conformance.md 3.3）。
-    if (trend.numerator * den > num * trend.denominator) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/** maxTrend < num/den を判定する。報告が 1 つも無い場合は回復条件を満たすとみなす。 */
-function trendLess(state: ShardState, num: number, den: number): boolean {
-  for (const trend of state.trends) {
-    if (!(trend.numerator * den < num * trend.denominator)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function evaluateCongestionTransition(state: ShardState, t: number): StepResult {
+function evaluateSubscription(state: ShardState, sub: Subscription, t: number): EvaluateResult {
   // ヒステリシス: 現状態に入ってから SHEDDING_HYSTERESIS_MS 以内は遷移しない。
   // 振動を防ぐためである（state-machines.md 3 節）。
-  if (t - state.congestionEnteredAt < SHEDDING_HYSTERESIS_MS) {
-    return { state, commands: [] };
+  if (t - sub.congestionEnteredAt < SHEDDING_HYSTERESIS_MS) {
+    return { subscription: sub, commands: [] };
   }
 
-  let next = state.congestion;
-  switch (state.congestion) {
+  let next = sub.congestion;
+  switch (sub.congestion) {
     case "NORMAL":
       if (
-        utilGreater(state, t, SHARD_UTIL_ENTER_T2_NUM, SHARD_UTIL_ENTER_T2_DEN) ||
-        trendGreater(state, SHARD_TREND_ENTER_T2_NUM, SHARD_TREND_ENTER_T2_DEN)
+        fillGreater(state, sub, SHARD_UTIL_ENTER_T2_NUM, SHARD_UTIL_ENTER_T2_DEN) ||
+        trendGreater(state, sub, SHARD_TREND_ENTER_T2_NUM, SHARD_TREND_ENTER_T2_DEN)
       ) {
         next = "SHEDDING_T2";
       }
       break;
     case "SHEDDING_T2":
       if (
-        utilGreater(state, t, SHARD_UTIL_ENTER_T1_NUM, SHARD_UTIL_ENTER_T1_DEN) ||
-        trendGreater(state, SHARD_TREND_ENTER_T1_NUM, SHARD_TREND_ENTER_T1_DEN)
+        fillGreater(state, sub, SHARD_UTIL_ENTER_T1_NUM, SHARD_UTIL_ENTER_T1_DEN) ||
+        trendGreater(state, sub, SHARD_TREND_ENTER_T1_NUM, SHARD_TREND_ENTER_T1_DEN)
       ) {
         next = "SHEDDING_T1";
       } else if (
-        utilLess(state, t, SHARD_UTIL_EXIT_T2_NUM, SHARD_UTIL_EXIT_T2_DEN) &&
-        trendLess(state, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
+        fillLess(state, sub, SHARD_UTIL_EXIT_T2_NUM, SHARD_UTIL_EXIT_T2_DEN) &&
+        trendLess(state, sub, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
       ) {
         next = "NORMAL";
       }
       break;
     case "SHEDDING_T1":
       if (
-        utilGreater(state, t, SHARD_UTIL_ENTER_SPATIAL_NUM, SHARD_UTIL_ENTER_SPATIAL_DEN) ||
-        trendGreater(state, SHARD_TREND_ENTER_SPATIAL_NUM, SHARD_TREND_ENTER_SPATIAL_DEN)
+        fillGreater(state, sub, SHARD_UTIL_ENTER_SPATIAL_NUM, SHARD_UTIL_ENTER_SPATIAL_DEN) ||
+        trendGreater(state, sub, SHARD_TREND_ENTER_SPATIAL_NUM, SHARD_TREND_ENTER_SPATIAL_DEN)
       ) {
         next = "SHEDDING_SPATIAL";
       } else if (
-        utilLess(state, t, SHARD_UTIL_EXIT_T1_NUM, SHARD_UTIL_EXIT_T1_DEN) &&
-        trendLess(state, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
+        fillLess(state, sub, SHARD_UTIL_EXIT_T1_NUM, SHARD_UTIL_EXIT_T1_DEN) &&
+        trendLess(state, sub, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
       ) {
         next = "SHEDDING_T2";
       }
       break;
     case "SHEDDING_SPATIAL":
       if (
-        utilGreater(state, t, SHARD_UTIL_ENTER_KEY_ONLY_NUM, SHARD_UTIL_ENTER_KEY_ONLY_DEN) ||
-        trendGreater(state, SHARD_TREND_ENTER_KEY_ONLY_NUM, SHARD_TREND_ENTER_KEY_ONLY_DEN)
+        fillGreater(state, sub, SHARD_UTIL_ENTER_KEY_ONLY_NUM, SHARD_UTIL_ENTER_KEY_ONLY_DEN) ||
+        trendGreater(state, sub, SHARD_TREND_ENTER_KEY_ONLY_NUM, SHARD_TREND_ENTER_KEY_ONLY_DEN)
       ) {
         next = "KEY_ONLY";
       } else if (
-        utilLess(state, t, SHARD_UTIL_EXIT_SPATIAL_NUM, SHARD_UTIL_EXIT_SPATIAL_DEN) &&
-        trendLess(state, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
+        fillLess(state, sub, SHARD_UTIL_EXIT_SPATIAL_NUM, SHARD_UTIL_EXIT_SPATIAL_DEN) &&
+        trendLess(state, sub, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
       ) {
         next = "SHEDDING_T1";
       }
       break;
     case "KEY_ONLY":
       if (
-        utilLess(state, t, SHARD_UTIL_EXIT_KEY_ONLY_NUM, SHARD_UTIL_EXIT_KEY_ONLY_DEN) &&
-        trendLess(state, SHARD_TREND_EXIT_KEY_ONLY_NUM, SHARD_TREND_EXIT_KEY_ONLY_DEN)
+        fillLess(state, sub, SHARD_UTIL_EXIT_KEY_ONLY_NUM, SHARD_UTIL_EXIT_KEY_ONLY_DEN) &&
+        trendLess(state, sub, SHARD_TREND_EXIT_KEY_ONLY_NUM, SHARD_TREND_EXIT_KEY_ONLY_DEN)
       ) {
         next = "SHEDDING_SPATIAL";
       }
       break;
   }
 
-  if (next === state.congestion) {
-    return { state, commands: [] };
+  if (next === sub.congestion) {
+    return { subscription: sub, commands: [] };
   }
 
+  // SHEDDING_SPATIAL 以降は段を 1 つ下げる。段を破棄すると画面が消える（ADR-0027 の 4）。
+  const penalty = next === "SHEDDING_SPATIAL" || next === "KEY_ONLY" ? 1 : 0;
+  const updated: Subscription = {
+    ...sub,
+    congestion: next,
+    congestionEnteredAt: t,
+    tierPenalty: penalty,
+  };
   const commands: ShardCommand[] = [];
-  if (next === "KEY_ONLY") {
-    // シャードの再分割が必要な水準である。制御系へ通知する（state-machines.md 3 節）。
-    commands.push({ kind: "notify", code: ERROR_DEFINITIONS.E_NODE_OVERLOADED.closeCode });
+  if (penalty !== sub.tierPenalty) {
+    // 渡す段が変わった。**購読者へ `setTier` を送ってはならない。**
+    // `setTier` は「送信者に作らせる段の上限」を意味する指令であり（ADR-0022、
+    // wire-format.md 2.7 の encoderDirective）、購読者に送ると「お前の符号化器を変えろ」
+    // という意味になる。以前は同じコマンドを両方の意味で使っていたため、輻輳で段を
+    // 下げると購読者の送信品質が落ちた。
+    //
+    // 購読者は段の変化を媒体そのものから知る（ヘッダの spatialId。復号器プールが
+    // 段の切替を検出してキーフレームを待つ）。したがって通知は不要である。
+    // 必要なのは送信者へのキーフレーム要求だけである（simulcast では別ストリームへ
+    // 切り替わるため、下げる向きでもキーフレームが必要。ADR-0027 の 4）。
+    commands.push({
+      kind: "keyframeRequest",
+      for: sub.targetId,
+      channel: sub.channel,
+      spatialId: chooseRung(state, updated),
+    });
+  }
+  return { subscription: updated, commands };
+}
+
+/**
+ * 送信窓の充填率が閾値を超えているか。
+ *
+ * 購読単位の輻輳の入力は「送信窓がどれだけ埋まっているか」である
+ * （congestion.md 7 節が接続ごとに `inFlightMs` を持つと定めている）。
+ * ノード全体の利用率を入力にしてはならない。遅い受信者 1 人が全体を落とすためである。
+ *
+ *   fill = inFlightMs / SEND_WINDOW_MS
+ *   fill > num/den ⇔ 未確認フレーム数 × 1000 × den > num × SEND_WINDOW_MS × fps
+ *
+ * fps が分からない間（申告が未着）は fill を 0 とみなす。勾配のみで判定する。
+ */
+function fillGreater(state: ShardState, sub: Subscription, num: number, den: number): boolean {
+  const framerate = framerateOf(state, sub);
+  if (framerate <= 0) {
+    return false;
+  }
+  const inFlight = inFlightFrames(sub, sub.highestSent);
+  return inFlight * 1000 * den > num * SEND_WINDOW_MS * framerate;
+}
+
+function fillLess(state: ShardState, sub: Subscription, num: number, den: number): boolean {
+  const framerate = framerateOf(state, sub);
+  if (framerate <= 0) {
+    // 充填率を評価できない。回復を妨げないため、条件を満たすとみなす。
+    return num > 0;
+  }
+  const inFlight = inFlightFrames(sub, sub.highestSent);
+  return inFlight * 1000 * den < num * SEND_WINDOW_MS * framerate;
+}
+
+/**
+ * この購読者の遅延勾配が閾値を超えているか。
+ *
+ * **他の購読者の勾配は見ない。** 見ると、回線の悪い 1 人が全員の品質を落とす
+ * （ADR-0025 の 4）。報告が無い場合は false（勾配が不明なら劣化と判定しない）。
+ */
+function trendGreater(state: ShardState, sub: Subscription, num: number, den: number): boolean {
+  const trend = state.trends.find((entry) => entry.subscriberId === sub.subscriberId);
+  if (trend === undefined) {
+    return false;
+  }
+  // denominator は delaySlope の定義により常に正である（conformance.md 3.3）。
+  return trend.numerator * den > num * trend.denominator;
+}
+
+/** 報告が無い場合は回復条件を満たすとみなす。 */
+function trendLess(state: ShardState, sub: Subscription, num: number, den: number): boolean {
+  const trend = state.trends.find((entry) => entry.subscriberId === sub.subscriberId);
+  if (trend === undefined) {
+    return true;
+  }
+  return trend.numerator * den < num * trend.denominator;
+}
+
+/* ------------------------------------------------------------------------- */
+/* ノード全体の予算                                                          */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * ノード全体の予算超過を制御系へ通知する（ADR-0025 の 5）。
+ *
+ * **転送の可否には使わない。** 超過はシャードの再分割が必要な水準であり、
+ * 個別の購読の問題ではない。同じ窓で繰り返し通知しない。
+ */
+function notifyNodeOverload(state: ShardState, t: number): StepResult {
+  if (state.overloadNotified) {
+    return { state, commands: [] };
+  }
+  const elapsed = t - state.windowStartMs;
+  if (elapsed <= 0) {
+    return { state, commands: [] };
+  }
+  const messagesOver = state.sentMessagesInWindow * 1000 > NODE_MAX_OUT_MESSAGES_PER_SEC * elapsed;
+  const bytesOver = state.sentBytesInWindow * 1000 > state.budgetBytesPerSec * elapsed;
+  if (!messagesOver && !bytesOver) {
+    return { state, commands: [] };
   }
   return {
-    state: { ...state, congestion: next, congestionEnteredAt: t },
-    commands,
+    state: { ...state, overloadNotified: true },
+    commands: [{ kind: "notify", code: ERROR_DEFINITIONS.E_NODE_OVERLOADED.closeCode }],
   };
 }
 
-// --- 内部: 輻輳状態に応じた破棄判定 ---
-
-function shouldDropInCongestion(
-  state: ShardState,
-  event: MediaEvent,
-  priority: number | null,
-): boolean {
-  // 破棄禁止のユニット（KEY / 音声）は常に転送する（wire-format.md 1.4）
-  if (priority === null) {
-    return false;
-  }
-
-  switch (state.congestion) {
-    case "NORMAL":
-      return false;
-    case "SHEDDING_T2":
-      // temporalId が最大の層を破棄する。最大層は送信側が DISCARDABLE を立てているため、
-      // 破棄可否の判断は flags 由来の優先順位（1〜3）で行う。
-      return priority <= 3;
-    case "SHEDDING_T1":
-      // temporalId >= 1 を破棄する。
-      return event.tid >= 1;
-    case "SHEDDING_SPATIAL":
-      // 最上位 spatialId のみを破棄する。全層を破棄するとサムネイルまで消えるため、
-      // (senderId, channel) ごとに観測した最大 spatialId と一致する場合に限る。
-      // 加えて SHEDDING_T1 の条件（temporalId >= 1）も維持する。
-      return event.sid >= maxSpatialFor(state, event.from, event.ch) || event.tid >= 1;
-    case "KEY_ONLY":
-      // KEY 以外を全て破棄する。priority !== null は KEY でないことを意味する。
-      return true;
-  }
-}
-
-/** (senderId, channel) について観測した最大 spatialId。未観測なら 0 を返す。 */
-function maxSpatialFor(state: ShardState, from: number, ch: number): number {
-  for (const entry of state.maxSpatial) {
-    if (entry.from === from && entry.ch === ch) {
-      return entry.sid;
-    }
-  }
-  return 0;
-}
-
-/** 観測した spatialId の最大値を更新する。順序は決定的（from, ch の昇順）に保つ。 */
-function updateMaxSpatial(state: ShardState, event: MediaEvent): ShardState {
-  const current = state.maxSpatial.find((e) => e.from === event.from && e.ch === event.ch);
-  if (current !== undefined && current.sid >= event.sid) {
-    return state;
-  }
-  const rest = state.maxSpatial.filter((e) => !(e.from === event.from && e.ch === event.ch));
-  const updated: MaxSpatial = { from: event.from, ch: event.ch, sid: event.sid };
-  const merged = [...rest, updated].sort((a, b) => (a.from !== b.from ? a.from - b.from : a.ch - b.ch));
-  return { ...state, maxSpatial: merged };
-}
-
-// --- 内部: 予算超過判定 ---
-
-function isOverBudget(
-  projectedMessages: number,
-  projectedBytes: number,
-  state: ShardState,
-  t: number,
-): boolean {
-  const windowDuration = t - state.windowStartMs;
-  if (windowDuration <= 0) {
-    return false;
-  }
-  // メッセージレート超過: projectedMessages * 1000 > NODE_MAX_OUT_MESSAGES_PER_SEC * windowDuration
-  const msgOver =
-    projectedMessages * 1000 > NODE_MAX_OUT_MESSAGES_PER_SEC * windowDuration;
-  // バイトレート超過: projectedBytes * 1000 > budgetBytesPerSec * windowDuration
-  const byteOver =
-    projectedBytes * 1000 > state.budgetBytesPerSec * windowDuration;
-  return msgOver || byteOver;
-}
-
-// --- 内部: 窓リセット ---
-
 function maybeResetWindow(state: ShardState, t: number): ShardState {
-  // 1 秒経過したら窓をリセットする
   const elapsed = t - state.windowStartMs;
   if (elapsed >= SHARD_UTIL_WINDOW_MS) {
     return {
@@ -856,16 +1430,37 @@ function maybeResetWindow(state: ShardState, t: number): ShardState {
       sentBytesInWindow: 0,
       sentMessagesInWindow: 0,
       windowStartMs: t,
+      overloadNotified: false,
     };
   }
   return state;
 }
 
-// --- 内部: 購読のソート順（決定性のため subscriberId, targetId の昇順） ---
+/* ------------------------------------------------------------------------- */
+/* 観測のための補助（判断には使わない）                                      */
+/* ------------------------------------------------------------------------- */
 
-function subscriptionOrder(a: Subscription, b: Subscription): number {
-  if (a.subscriberId !== b.subscriberId) {
-    return a.subscriberId - b.subscriberId;
-  }
-  return a.targetId - b.targetId;
+/** 指定した購読の現在の輻輳状態。試験と観測のために公開する。 */
+export function congestionOf(
+  state: ShardState,
+  subscriberId: number,
+  targetId: number,
+  channel: number,
+): CongestionState | undefined {
+  return state.subscriptions.find(
+    (s) => s.subscriberId === subscriberId && s.targetId === targetId && s.channel === channel,
+  )?.congestion;
+}
+
+/** 指定した購読へ現在渡している段。試験と観測のために公開する。 */
+export function chosenRungOf(
+  state: ShardState,
+  subscriberId: number,
+  targetId: number,
+  channel: number,
+): number | undefined {
+  const sub = state.subscriptions.find(
+    (s) => s.subscriberId === subscriberId && s.targetId === targetId && s.channel === channel,
+  );
+  return sub === undefined ? undefined : chooseRung(state, sub);
 }

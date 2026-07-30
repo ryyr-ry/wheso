@@ -13,24 +13,48 @@
 import {
   initialState,
   step,
+  type LadderRung,
   type ShardCommand,
   type ShardEvent,
   type ShardState,
 } from "@wheso/core/src/shard-core.ts";
 import { decodeMediaMessage, wireErrorCloseCode } from "@wheso/core/src/wire.ts";
 import { videoProfileForSpatialId } from "@wheso/core/src/profiles.ts";
-import { CHANNEL_VIDEO } from "@wheso/core/src/generated/wire-layout.ts";
+import {
+  CHANNEL_VIDEO,
+  FLAG_KEY,
+  MAX_TEMPORAL_ID,
+} from "@wheso/core/src/generated/wire-layout.ts";
 import { DELAY_TREND_WINDOW } from "@wheso/core/src/generated/constants.ts";
 import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
 
+/**
+ * 宛先の役割。
+ *
+ * **参加者 ID だけでは宛先が決まらない。** 1 人の参加者は送信ノード（`vs` / `as`）と
+ * 受信ノード（`vr` / `ar`）の両方から同じ中継部屋へ繋ぐ。参加者 ID は利用者 ID から
+ * 導くため両者で同じ値になる。役割を無視すると、送信者へ返すはずの `ack` が
+ * その人の受信ノードへ届き、**送信窓が永久に開かない**（実測: 30 枚のうち 4 枚しか
+ * 上流へ渡らなかった）。
+ */
+export type ShardTarget = "sender" | "receiver";
+
 /** 送信と切断の口。実装は Durable Object 側が与える。試験では偽物を渡す。 */
 export interface ShardTransport {
-  /** 参加者 ID へバイナリを送る。接続が無い場合は何もしない。 */
+  /**
+   * 破棄を記録する（観測のため。判断には使わない）。
+   *
+   * **なぜ必要か。** 「転送しなかった」ことの理由を外から区別できないと、原因の層を
+   * 取り違える。層の選択で渡さなかったのか、輻輳で捨てたのか、送信窓が閉じていたのかを
+   * 優先順位の内訳で見分ける。
+   */
+  noteDrop(priority: number, count: number): void;
+  /** 参加者の**受信ノード**へバイナリを送る。接続が無い場合は何もしない。 */
   sendBinary(participantId: number, bytes: Uint8Array): void;
-  /** 参加者 ID へテキスト（制御メッセージ）を送る。 */
-  sendText(participantId: number, text: string): void;
+  /** 参加者の指定した役割のノードへテキスト（制御メッセージ）を送る。 */
+  sendText(participantId: number, target: ShardTarget, text: string): void;
   /** 接続を閉じる。 */
-  close(participantId: number, code: number, reason: string): void;
+  close(participantId: number, target: ShardTarget, code: number, reason: string): void;
   /** 制御系（ctl 部屋）へ通知する。 */
   notifyControl(code: number): void;
 }
@@ -70,7 +94,7 @@ export function handleBinary(
   const decoded = decodeMediaMessage(bytes);
   if (!decoded.ok) {
     // 形式違反は接続を閉じる（wire-format.md 0 節の規則 3・4）。
-    transport.close(peer.participantId, wireErrorCloseCode(decoded.error.code), decoded.error.code);
+    transport.close(peer.participantId, "sender", wireErrorCloseCode(decoded.error.code), decoded.error.code);
     return state;
   }
 
@@ -83,9 +107,11 @@ export function handleBinary(
       ch: decoded.value.channel,
       sid: unit.spatialId,
       tid: unit.temporalId,
-      key: (unit.flags & 0x01) !== 0,
+      key: (unit.flags & FLAG_KEY) !== 0,
       bytes: unit.payload.length,
       flags: unit.flags,
+      // 送信窓（congestion.md 2 節）の計算に必要である。落としてはならない。
+      seq: unit.sequenceNumber,
     };
     const result = step(core, event, nowMs);
     core = result.state;
@@ -120,7 +146,7 @@ export function handleText(
   if (parsed === null) {
     return state;
   }
-  const events = toEvents(parsed, peer.participantId);
+  const events = toEvents(parsed, peer.participantId, state.core);
   let core = state.core;
   for (const event of events) {
     const result = step(core, event, nowMs);
@@ -170,6 +196,7 @@ function applyNonForward(command: ShardCommand, transport: ShardTransport): void
       return;
     case "drop":
       // 破棄は送らないことで表現される。記録は観測系の責務である。
+      transport.noteDrop(command.priority, command.count);
       return;
     case "notify":
       transport.notifyControl(command.code);
@@ -179,14 +206,28 @@ function applyNonForward(command: ShardCommand, transport: ShardTransport): void
       transport.notifyControl(command.code);
       return;
     case "keyframeRequest":
-      transport.sendText(command.for, JSON.stringify({ t: "keyframeRequest", senderId: command.for }));
+      // **規範の欄をすべて入れる**（wire-format.md 2.5）。`channel` と `spatialId` を
+      // 落とすと、受け取った送信ノードが必須検査で捨てるため要求が 1 度も通らない。
+      // 宛先は**送信者**である（その段を作る符号化器を持つのは送信側である）。
+      transport.sendText(
+        command.for,
+        "sender",
+        JSON.stringify({
+          t: "keyframeRequest",
+          senderId: command.for,
+          channel: command.channel,
+          spatialId: command.spatialId,
+        }),
+      );
       return;
     case "setTier": {
       // エンコーダ指令は規範（ワイヤ形式 2.7）の 5 フィールドをすべて満たす。
       // 値は tier に対応するプロファイルの定数から引く。数値を書かない。
       const profile = videoProfileForSpatialId(command.tier);
+      // エンコーダ指令の宛先は**送信者**である（ADR-0022、ADR-0033）。
       transport.sendText(
         command.for,
+        "sender",
         JSON.stringify({
           t: "encoderDirective",
           channel: CHANNEL_VIDEO,
@@ -200,9 +241,29 @@ function applyNonForward(command: ShardCommand, transport: ShardTransport): void
       return;
     }
     case "connect":
-    case "disconnect":
     case "schedule":
       // 上位のノード間接続とタイマーは Durable Object 側が扱う。
+      return;
+    case "ackUpstream":
+      // 受信位置を送信ノードへ返す（congestion.md 2 節）。宛先はその送信者のノードである。
+      // 宛先は**送信者**である。受信ノードへ送ると送信窓が永久に開かない。
+      transport.sendText(
+        command.to,
+        "sender",
+        JSON.stringify({
+          t: "ack",
+          senderId: command.to,
+          channel: command.channel,
+          spatialId: command.spatialId,
+          highestSeq: command.highestSeq,
+        }),
+      );
+      return;
+    case "disconnect":
+      // ack が途絶えた購読者の接続を閉じる（congestion.md 7 節）。
+      // 閉じないと、既に居ない相手へ送り続けてノードの予算を食う。
+      // ack が途絶えたのは**購読者**（受信ノード）である。
+      transport.close(command.peer, "receiver", ERROR_DEFINITIONS.E_ACK_TIMEOUT.closeCode, "E_ACK_TIMEOUT");
       return;
   }
 }
@@ -223,10 +284,16 @@ function parseJson(text: string): Record<string, unknown> | null {
 /**
  * 制御メッセージを入力イベント列へ翻訳する。
  *
- * subscribe は entries ごとに 1 個のイベントになる。
- * report は標本列を整数として渡す（ADR-0021）。
+ * `subscribe` は entries ごとに 1 個のイベントになる。
+ * `ack` は送信窓（congestion.md 2 節）の入力である。**落としてはならない。**
+ * `streamAnnounce` ははしごと fps の情報であり、段の選択と送信窓の両方に必要である。
+ * `report` は標本列を整数として渡す（ADR-0021）。
  */
-function toEvents(message: Record<string, unknown>, from: number): readonly ShardEvent[] {
+function toEvents(
+  message: Record<string, unknown>,
+  from: number,
+  core: ShardState,
+): readonly ShardEvent[] {
   const t = message["t"];
   if (t === "subscribe") {
     const entries = message["entries"];
@@ -234,6 +301,37 @@ function toEvents(message: Record<string, unknown>, from: number): readonly Shar
       return [];
     }
     const events: ShardEvent[] = [];
+    // **`entries` は「望む集合」である**（wire-format.md 2.4:「entries に含まれない
+    // (senderId, channel) の転送は停止する」）。含まれない購読は解除する。
+    //
+    // 以前は追加しか作らなかったため、購読解除が中継へ伝わらなかった。解除の意味を
+    // 実装しないと、要らなくなった映像が流れ続ける（F-056）。
+    for (const sub of core.subscriptions) {
+      if (sub.subscriberId !== from) {
+        continue;
+      }
+      const stillWanted = entries.some((entry) => {
+        if (typeof entry !== "object" || entry === null) {
+          return false;
+        }
+        const record: Record<string, unknown> = { ...entry };
+        const senderId = record["senderId"];
+        const channel = record["channel"];
+        const ch = isFiniteInteger(channel) ? channel : CHANNEL_VIDEO;
+        return isFiniteInteger(senderId) && senderId === sub.targetId && ch === sub.channel;
+      });
+      if (!stillWanted) {
+        events.push({
+          kind: "subscribe",
+          from,
+          to: sub.targetId,
+          ch: sub.channel,
+          want: false,
+          maxSpatialId: 0,
+          maxTemporalId: 0,
+        });
+      }
+    }
     for (const entry of entries) {
       if (typeof entry !== "object" || entry === null) {
         continue;
@@ -241,12 +339,99 @@ function toEvents(message: Record<string, unknown>, from: number): readonly Shar
       const record: Record<string, unknown> = { ...entry };
       const senderId = record["senderId"];
       const maxSpatialId = record["maxSpatialId"];
+      const channel = record["channel"];
+      const maxTemporalId = record["maxTemporalId"];
       if (!isFiniteInteger(senderId) || !isFiniteInteger(maxSpatialId)) {
         continue;
       }
-      events.push({ kind: "subscribe", from, to: senderId, want: true, maxSpatialId });
+      events.push({
+        kind: "subscribe",
+        from,
+        to: senderId,
+        // チャネルの指定が無い購読は映像とみなす。指定を落とすと映像の購読が
+        // 音声まで転送してしまう（購読は (subscriberId, targetId, channel) で一意）。
+        ch: isFiniteInteger(channel) ? channel : CHANNEL_VIDEO,
+        want: true,
+        maxSpatialId,
+        maxTemporalId: isFiniteInteger(maxTemporalId) ? maxTemporalId : MAX_TEMPORAL_ID,
+      });
     }
     return events;
+  }
+  if (t === "ack") {
+    const senderId = message["senderId"];
+    const channel = message["channel"];
+    const spatialId = message["spatialId"];
+    const highestSeq = message["highestSeq"];
+    if (!isFiniteInteger(senderId) || !isFiniteInteger(highestSeq)) {
+      return [];
+    }
+    return [
+      {
+        kind: "ack",
+        from,
+        to: senderId,
+        ch: isFiniteInteger(channel) ? channel : CHANNEL_VIDEO,
+        // 段の指定が無い ack は最下段に対するものとみなす。段ごとに seq の空間が
+        // 独立しているため、取り違えると未確認量の計算が壊れる。
+        sid: isFiniteInteger(spatialId) ? spatialId : 0,
+        highestSeq,
+      },
+    ];
+  }
+  if (t === "streamAnnounce") {
+    const streams = message["streams"];
+    if (!Array.isArray(streams)) {
+      return [];
+    }
+    // 同一チャネルの段をまとめて 1 個のイベントにする。チャネルごとに 1 個である。
+    const byChannel = new Map<number, LadderRung[]>();
+    for (const stream of streams) {
+      if (typeof stream !== "object" || stream === null) {
+        continue;
+      }
+      const record: Record<string, unknown> = { ...stream };
+      const channel = record["channel"];
+      const spatialId = record["spatialId"];
+      const framerate = record["framerate"];
+      if (!isFiniteInteger(channel) || !isFiniteInteger(spatialId) || !isFiniteInteger(framerate)) {
+        continue;
+      }
+      const rung: LadderRung = {
+        sid: spatialId,
+        width: isFiniteInteger(record["width"]) ? record["width"] : 0,
+        height: isFiniteInteger(record["height"]) ? record["height"] : 0,
+        framerate,
+        temporalLayers: isFiniteInteger(record["temporalLayers"]) ? record["temporalLayers"] : 0,
+        targetBitrate: isFiniteInteger(record["targetBitrate"]) ? record["targetBitrate"] : 0,
+      };
+      const existing = byChannel.get(channel);
+      if (existing === undefined) {
+        byChannel.set(channel, [rung]);
+        continue;
+      }
+      existing.push(rung);
+    }
+    const events: ShardEvent[] = [];
+    // チャネルの昇順で出す（決定性のため）。
+    for (const channel of [...byChannel.keys()].sort((a, b) => a - b)) {
+      const rungs = byChannel.get(channel);
+      if (rungs === undefined) {
+        continue;
+      }
+      events.push({ kind: "streamAnnounce", from, ch: channel, rungs });
+    }
+    return events;
+  }
+  if (t === "keyframeRequest") {
+    // 購読者（受信ノード）からの要求（ADR-0039）。全欄を実行時に検査する。
+    const senderId = message["senderId"];
+    const channel = message["channel"];
+    const spatialId = message["spatialId"];
+    if (!isFiniteInteger(senderId) || !isFiniteInteger(channel) || !isFiniteInteger(spatialId)) {
+      return [];
+    }
+    return [{ kind: "keyframeRequest", from, target: senderId, ch: channel, sid: spatialId }];
   }
   if (t === "report") {
     const samples = message["arrivalDelaySamplesUs"];

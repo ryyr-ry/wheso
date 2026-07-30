@@ -80,7 +80,7 @@ inline constexpr std::int64_t AUDIO_UNITS_PER_MESSAGE = 2;
 inline constexpr std::int64_t AUDIO_SELECTIVE_FORWARD_COUNT = 5;
 inline constexpr std::int64_t AUDIO_SPEAKER_HOLD_MS = 800;
 inline constexpr bool AUDIO_DTX_ENABLED = true;
-inline constexpr bool AUDIO_FEC_ENABLED = true;
+inline constexpr bool AUDIO_FEC_ENABLED = false;
 
 // shardCapacity
 inline constexpr std::int64_t V_SHARD_MAX_PARTICIPANTS = 35;
@@ -93,8 +93,8 @@ inline constexpr std::int64_t V_FULL_MESH_MAX_360P15 = 37;
 // congestion
 inline constexpr std::int64_t REPORT_INTERVAL_MS = 200;
 inline constexpr std::int64_t DELAY_TREND_WINDOW = 20;
-inline constexpr double DELAY_TREND_DEGRADE = 0.01;
-inline constexpr double DELAY_TREND_RECOVER = -0.005;
+inline constexpr std::int64_t DELAY_TREND_DEGRADE = 5000;
+inline constexpr std::int64_t DELAY_TREND_RECOVER = 1500;
 inline constexpr std::int64_t KEYFRAME_REQUEST_MIN_INTERVAL_MS = 500;
 inline constexpr std::int64_t AUDIO_STALL_RESET_MS = 500;
 inline constexpr std::int64_t VIDEO_STALL_RESET_MS = 1500;
@@ -103,17 +103,26 @@ inline constexpr std::int64_t SHEDDING_HYSTERESIS_MS = 500;
 inline constexpr std::int64_t SEND_WINDOW_MS = 200;
 inline constexpr std::int64_t ACK_INTERVAL_MS = 50;
 inline constexpr std::int64_t ACK_TIMEOUT_MS = 5000;
+inline constexpr std::int64_t UPLINK_DEGRADE_STREAK = 3;
+inline constexpr std::int64_t UPLINK_RECOVER_MS = 5000;
+inline constexpr std::int64_t UPLINK_UPGRADE_HOLD_MS = 10000;
+inline constexpr std::int64_t ENCODE_QUEUE_LIMIT = 3;
+inline constexpr std::int64_t ENCODE_QUEUE_HOLD_MS = 2000;
+inline constexpr std::int64_t THERMAL_UPGRADE_HOLD_MS = 30000;
 inline constexpr std::int64_t UPLINK_BACKLOG_BYTES = 100000;
 inline constexpr std::int64_t RATE_HOLD_MS = 1000;
 inline constexpr std::int64_t RATE_PROBE_BPS = 200000;
 inline constexpr std::int64_t RATE_RECOVER_STREAK = 3;
 inline constexpr double RATE_DECREASE_FACTOR = 0.85;
 inline constexpr std::int64_t LATE_FRAME_TOLERANCE_MS = 33;
-inline constexpr std::int64_t MIN_VIABLE_BPS = 232000;
-inline constexpr std::int64_t DELAY_TREND_DEGRADE_NUM = 1;
-inline constexpr std::int64_t DELAY_TREND_DEGRADE_DEN = 100;
-inline constexpr std::int64_t DELAY_TREND_RECOVER_NUM = -1;
-inline constexpr std::int64_t DELAY_TREND_RECOVER_DEN = 200;
+inline constexpr std::int64_t MIN_VIABLE_BPS = 244960;
+inline constexpr std::int64_t AUDIO_ONLY_ENTER_BPS = 244960;
+inline constexpr std::int64_t AUDIO_ONLY_EXIT_BPS = 448320;
+inline constexpr std::int64_t AUDIO_SELECTIVE_MIN_COUNT = 1;
+inline constexpr std::int64_t DELAY_TREND_DEGRADE_NUM = 5000;
+inline constexpr std::int64_t DELAY_TREND_DEGRADE_DEN = 1;
+inline constexpr std::int64_t DELAY_TREND_RECOVER_NUM = 1500;
+inline constexpr std::int64_t DELAY_TREND_RECOVER_DEN = 1;
 
 // jitterBuffer
 inline constexpr std::int64_t VIDEO_JITTER_MIN_FRAMES = 2;
@@ -121,7 +130,10 @@ inline constexpr std::int64_t VIDEO_JITTER_MAX_FRAMES = 10;
 inline constexpr std::int64_t AUDIO_JITTER_MIN_PACKETS = 2;
 inline constexpr std::int64_t AUDIO_JITTER_MAX_PACKETS = 8;
 inline constexpr std::int64_t AV_SKEW_TOLERANCE_MS = 20;
-inline constexpr std::int64_t AV_SKEW_RESYNC_MS = 200;
+inline constexpr std::int64_t AV_SKEW_AUDIO_LEAD_MAX_MS = 22;
+inline constexpr std::int64_t AV_SKEW_AUDIO_LAG_MAX_MS = 30;
+inline constexpr std::int64_t AV_DRIFT_STEP_US = 20;
+inline constexpr std::int64_t AV_RESYNC_GAP_MS = 1000;
 
 // timeouts
 inline constexpr std::int64_t NODE_CONNECT_TIMEOUT_MS = 5000;
@@ -148,7 +160,7 @@ inline constexpr std::int64_t FMIX32_C2 = 3266489909;
 // slo
 inline constexpr double STALL_RATIO_P95 = 0.005;
 inline constexpr double AUDIO_GAP_RATIO_P95 = 0.001;
-inline constexpr std::int64_t AV_SKEW_MS_P99 = 80;
+inline constexpr std::int64_t AV_SKEW_MS_P99 = 30;
 inline constexpr std::int64_t KEYFRAME_REQUEST_RATE_P95 = 1;
 inline constexpr std::int64_t GLASS_TO_GLASS_MS_P50 = 150;
 inline constexpr double NODE_UTILIZATION_P95 = 0.8;
@@ -188,17 +200,20 @@ inline constexpr std::int64_t SHARD_UTIL_EXIT_SPATIAL_NUM = 9;
 inline constexpr std::int64_t SHARD_UTIL_EXIT_SPATIAL_DEN = 10;
 inline constexpr std::int64_t SHARD_UTIL_EXIT_KEY_ONLY_NUM = 1;
 inline constexpr std::int64_t SHARD_UTIL_EXIT_KEY_ONLY_DEN = 1;
-inline constexpr std::int64_t SHARD_TREND_ENTER_T2_NUM = 1;
-inline constexpr std::int64_t SHARD_TREND_ENTER_T2_DEN = 100;
-inline constexpr std::int64_t SHARD_TREND_ENTER_T1_NUM = 3;
-inline constexpr std::int64_t SHARD_TREND_ENTER_T1_DEN = 100;
-inline constexpr std::int64_t SHARD_TREND_ENTER_SPATIAL_NUM = 3;
-inline constexpr std::int64_t SHARD_TREND_ENTER_SPATIAL_DEN = 50;
-inline constexpr std::int64_t SHARD_TREND_ENTER_KEY_ONLY_NUM = 1;
-inline constexpr std::int64_t SHARD_TREND_ENTER_KEY_ONLY_DEN = 10;
-inline constexpr std::int64_t SHARD_TREND_EXIT_NUM = -1;
-inline constexpr std::int64_t SHARD_TREND_EXIT_DEN = 200;
+inline constexpr std::int64_t SHARD_TREND_ENTER_T2_NUM = 5000;
+inline constexpr std::int64_t SHARD_TREND_ENTER_T2_DEN = 1;
+inline constexpr std::int64_t SHARD_TREND_ENTER_T1_NUM = 15000;
+inline constexpr std::int64_t SHARD_TREND_ENTER_T1_DEN = 1;
+inline constexpr std::int64_t SHARD_TREND_ENTER_SPATIAL_NUM = 30000;
+inline constexpr std::int64_t SHARD_TREND_ENTER_SPATIAL_DEN = 1;
+inline constexpr std::int64_t SHARD_TREND_ENTER_KEY_ONLY_NUM = 50000;
+inline constexpr std::int64_t SHARD_TREND_ENTER_KEY_ONLY_DEN = 1;
+inline constexpr std::int64_t SHARD_TREND_EXIT_NUM = 1500;
+inline constexpr std::int64_t SHARD_TREND_EXIT_DEN = 1;
 inline constexpr std::int64_t SHARD_TREND_EXIT_KEY_ONLY_NUM = 0;
 inline constexpr std::int64_t SHARD_TREND_EXIT_KEY_ONLY_DEN = 1;
+
+// observability
+inline constexpr std::int64_t MAX_UNEXPECTED_EVENTS = 64;
 
 }  // namespace wheso::constants

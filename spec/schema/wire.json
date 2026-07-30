@@ -48,7 +48,9 @@
     "maxUnitsPerMessage": 255,
     "maxMessageBytes": 16000000,
     "documentedReceiveLimitBytes": 33554432,
-    "$comment": "documentedReceiveLimitBytes は Cloudflare 公式ドキュメントの値（F-001）。maxMessageBytes は実測で成功した上限。"
+    "maxSpatialId": 3,
+    "maxTemporalId": 7,
+    "$comment": "documentedReceiveLimitBytes は Cloudflare 公式ドキュメントの値（F-001）。maxMessageBytes は実測で成功した上限。maxSpatialId と maxTemporalId は unitHeader の欄の max と同一であり、購読の既定値として参照する（数値をコードに書かないため）。"
   },
   "videoChannelRequiresSingleUnit": true,
   "dropPriority": {

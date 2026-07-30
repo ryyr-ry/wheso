@@ -13,7 +13,7 @@
  */
 
 import { shardCount } from "./naming.ts";
-import { V_SHARD_MAX_PARTICIPANTS } from "./generated/constants.ts";
+import { V_SHARD_MAX_PARTICIPANTS, MAX_UNEXPECTED_EVENTS } from "./generated/constants.ts";
 import { type ErrorName } from "./generated/errors.ts";
 
 /**
@@ -113,7 +113,7 @@ function handleLock(state: MetaState): MetaStepResult {
   if (state.lifecycle !== "OPEN") {
     // 表に無い遷移は無視して記録する（AGENTS 5.4）。
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "lock"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "lock") },
       commands: [],
     };
   }
@@ -124,7 +124,7 @@ function handleLock(state: MetaState): MetaStepResult {
 function handleUnlock(state: MetaState): MetaStepResult {
   if (state.lifecycle !== "LOCKED") {
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "unlock"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "unlock") },
       commands: [],
     };
   }
@@ -138,7 +138,7 @@ function handleUnlock(state: MetaState): MetaStepResult {
 function handleEnd(state: MetaState): MetaStepResult {
   if (state.lifecycle !== "OPEN" && state.lifecycle !== "LOCKED") {
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "end"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "end") },
       commands: [],
     };
   }
@@ -207,7 +207,7 @@ function recomputeShards(state: MetaState): MetaStepResult {
   const computed = shardCount(state.participants.length, V_SHARD_MAX_PARTICIPANTS, state.shards);
   if (!computed.ok) {
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "shardCount"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "shardCount") },
       commands: [{ kind: "notify", code: computed.error.code }],
     };
   }
@@ -226,7 +226,7 @@ function handleOverride(state: MetaState, participantId: number, shardIndex: num
   if (shardIndex < 0 || shardIndex >= state.shards) {
     // room-naming.md 3 節: 範囲外は Rendezvous の結果へ落とさず拒否する。
     return {
-      state: { ...state, unexpectedEvents: [...state.unexpectedEvents, "override"] },
+      state: { ...state, unexpectedEvents: appendUnexpected(state.unexpectedEvents, "override") },
       commands: [{ kind: "notify", code: "E_NAME_SHARD_INDEX" }],
     };
   }
@@ -243,4 +243,15 @@ function handleClearOverride(state: MetaState, participantId: number): MetaStepR
     return { state, commands: [] };
   }
   return { state: { ...state, overrides }, commands: [{ kind: "publishOverrides", epoch: state.epoch }] };
+}
+
+/**
+ * 表に無いイベントの記録に 1 件加える。**上限を超えたら古い側を捨てる。**
+ * 上限が無いと記録が無制限に伸び、Durable Object の記憶（128 MB。F-006）を食う。
+ */
+function appendUnexpected(events: readonly string[], name: string): readonly string[] {
+  const appended = [...events, name];
+  return appended.length > MAX_UNEXPECTED_EVENTS
+    ? appended.slice(appended.length - MAX_UNEXPECTED_EVENTS)
+    : appended;
 }

@@ -1,8 +1,5 @@
 // 受信ノード（receiver）の判断コア（Dart）。
 //
-// 規範: state-machines.md 2 節（購読と tier）、congestion.md 4.3（tier の選択）、
-// conformance.md 4 節（入力イベントと出力コマンド）。
-//
 // TypeScript の参照実装（packages/core/src/receiver-core.ts）と**同一の出力**を
 // 返さなければならない。照合は凍結トレース（spec/vectors/trace-receiver.jsonl）で行う。
 // 相違した場合はベクタではなく実装を直す（ADR-0012）。
@@ -11,6 +8,7 @@
 
 import 'fixed.dart' show delaySlope, truncDiv, Slope;
 import 'generated/constants.dart' as constants;
+import 'generated/wire_layout.dart' as wire_layout;
 
 /// 品質低下の警告。文言は利用側が国際化キーから作る（sdk-api.md 6 節）。
 const String _degradedWarning = 'W_DEGRADED';
@@ -18,10 +16,52 @@ const String _degradedWarning = 'W_DEGRADED';
 /// 受信者自身の識別子。転送先は常にこの 1 人である。
 const int receiverSelfId = 0;
 
-/// (senderId, channel) ごとの購読状態（state-machines.md 2 節）。
-enum StreamPhase { unsubscribed, subscribed, paused }
+// ---------------------------------------------------------------------------
+// 購読状態（state-machines.md 2 節）
+// ---------------------------------------------------------------------------
 
-/// 1 本のストリームの状態。
+/// AUDIO_ONLY は ADR-0029 で追加した。映像の購読を落として音声だけを維持する状態である。
+enum StreamPhase { unsubscribed, subscribed, paused, audioOnly }
+
+// ---------------------------------------------------------------------------
+// カタログ（ADR-0027）
+// ---------------------------------------------------------------------------
+
+/// カタログの 1 段。streamCatalog から取り込む。
+class CatalogRung {
+  const CatalogRung({
+    required this.sid,
+    required this.width,
+    required this.height,
+    required this.framerate,
+    required this.temporalLayers,
+    required this.targetBitrate,
+  });
+  final int sid;
+  final int width;
+  final int height;
+  final int framerate;
+  final int temporalLayers;
+  final int targetBitrate;
+}
+
+/// 送信者 1 人・1 チャネルのはしご。
+class CatalogLadder {
+  const CatalogLadder({
+    required this.senderId,
+    required this.channel,
+    required this.rungs,
+  });
+  final int senderId;
+  final int channel;
+  /// sid の昇順で保持する。
+  final List<CatalogRung> rungs;
+}
+
+// ---------------------------------------------------------------------------
+// ストリーム状態
+// ---------------------------------------------------------------------------
+
 class StreamState {
   const StreamState({
     required this.senderId,
@@ -34,13 +74,8 @@ class StreamState {
   final int senderId;
   final int channel;
   final StreamPhase phase;
-
-  /// 現在要求している最大 spatialId。
   final int spatialId;
-
-  /// 現在要求している最大 temporalId。
   final int temporalId;
-
   /// 利用側が申告した表示寸法（論理画素）。未申告は 0。
   final int displayWidth;
 
@@ -70,72 +105,78 @@ class ReceivedMark {
   final int highestSeq;
 }
 
+// ---------------------------------------------------------------------------
+// 受信者の状態
+// ---------------------------------------------------------------------------
+
 class ReceiverState {
   const ReceiverState({
     required this.streams,
+    required this.catalog,
     required this.visible,
     required this.targetBytesPerSec,
     required this.activeSpeakerId,
     required this.trend,
     required this.degraded,
-    required this.unexpectedEvents,
-    required this.received,
+    required this.audioOnly,
     required this.rateHoldUntilMs,
     required this.recoverStreak,
     required this.targetCeilingBytesPerSec,
+    required this.unexpectedEvents,
+    required this.received,
   });
 
-  /// senderId, channel の昇順で保持する。反復順序が判断に影響するため決定的にする。
   final List<StreamState> streams;
+  final List<CatalogLadder> catalog;
   final bool visible;
   final int targetBytesPerSec;
   final int? activeSpeakerId;
   final Slope trend;
   final bool degraded;
-  final List<String> unexpectedEvents;
-
-  /// senderId, channel, spatialId の昇順で保持する。
-  final List<ReceivedMark> received;
-
-  /// 次に減少の判定を行える時刻（AIMD。congestion 4.2）。
+  final bool audioOnly;
   final int rateHoldUntilMs;
-
-  /// 回復判定が連続した回数。規範は 3 回連続で加算的増加を許す。
   final int recoverStreak;
-
-  /// 目標ビットレートの上限（bytes/sec）。加算的増加はこれを超えない。
   final int targetCeilingBytesPerSec;
+  final List<String> unexpectedEvents;
+  final List<ReceivedMark> received;
 
   ReceiverState copyWith({
     List<StreamState>? streams,
+    List<CatalogLadder>? catalog,
     bool? visible,
     int? targetBytesPerSec,
     int? activeSpeakerId,
     bool clearActiveSpeaker = false,
     Slope? trend,
     bool? degraded,
-    List<String>? unexpectedEvents,
-    List<ReceivedMark>? received,
+    bool? audioOnly,
     int? rateHoldUntilMs,
     int? recoverStreak,
     int? targetCeilingBytesPerSec,
+    List<String>? unexpectedEvents,
+    List<ReceivedMark>? received,
   }) {
     return ReceiverState(
       streams: streams ?? List.of(this.streams),
+      catalog: catalog ?? this.catalog,
       visible: visible ?? this.visible,
       targetBytesPerSec: targetBytesPerSec ?? this.targetBytesPerSec,
-      // 発話者は null を取り得るため、消去を別の旗で表す（?? では消せない）。
       activeSpeakerId: clearActiveSpeaker ? null : (activeSpeakerId ?? this.activeSpeakerId),
       trend: trend ?? this.trend,
       degraded: degraded ?? this.degraded,
-      unexpectedEvents: unexpectedEvents ?? List.of(this.unexpectedEvents),
-      received: received ?? List.of(this.received),
+      audioOnly: audioOnly ?? this.audioOnly,
       rateHoldUntilMs: rateHoldUntilMs ?? this.rateHoldUntilMs,
       recoverStreak: recoverStreak ?? this.recoverStreak,
       targetCeilingBytesPerSec: targetCeilingBytesPerSec ?? this.targetCeilingBytesPerSec,
+      unexpectedEvents: unexpectedEvents ?? List.of(this.unexpectedEvents),
+      received: received ?? List.of(this.received),
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// 入力イベント
+// ---------------------------------------------------------------------------
 
 class SubscribeEntry {
   const SubscribeEntry({
@@ -150,7 +191,6 @@ class SubscribeEntry {
   final int maxTemporalId;
 }
 
-/// 入力イベント。sealed で閉じる（判定漏れを防ぐ）。
 sealed class ReceiverEvent {}
 
 class SubscribeListEvent implements ReceiverEvent {
@@ -168,6 +208,12 @@ class VisibilityEvent implements ReceiverEvent {
   final bool visible;
 }
 
+/// 観測した goodput。**目標を下げない**（congestion.md 4.1）。
+class GoodputEvent implements ReceiverEvent {
+  const GoodputEvent({required this.bytesPerSec});
+  final int bytesPerSec;
+}
+
 class BudgetEvent implements ReceiverEvent {
   const BudgetEvent({required this.bytesPerSec});
   final int bytesPerSec;
@@ -176,6 +222,11 @@ class BudgetEvent implements ReceiverEvent {
 class ActiveSpeakerEvent implements ReceiverEvent {
   const ActiveSpeakerEvent({required this.id});
   final int? id;
+}
+
+class CatalogEvent implements ReceiverEvent {
+  const CatalogEvent({required this.entries});
+  final List<CatalogLadder> entries;
 }
 
 class DisplaySizeEvent implements ReceiverEvent {
@@ -202,16 +253,30 @@ class MediaEvent implements ReceiverEvent {
   final int ch;
   final int sid;
   final int tid;
-
-  /// 受信した sequenceNumber。ack の算出に使う。既定は 0（不明）。
   final int seq;
+}
+
+/// 購読者からのキーフレーム要求（ADR-0039）。
+/// 要求をそのまま keyframeRequest コマンドに直す。状態は変えない。
+class KeyframeRequestEvent implements ReceiverEvent {
+  const KeyframeRequestEvent({
+    required this.senderId,
+    required this.channel,
+    required this.spatialId,
+  });
+  final int senderId;
+  final int channel;
+  final int spatialId;
 }
 
 class TimerEvent implements ReceiverEvent {
   const TimerEvent();
 }
 
-/// 出力コマンド。sealed で閉じる。
+// ---------------------------------------------------------------------------
+// 出力コマンド
+// ---------------------------------------------------------------------------
+
 sealed class ReceiverCommand {}
 
 class SubscribeChangeCommand implements ReceiverCommand {
@@ -282,24 +347,31 @@ class ReceiverStepResult {
   final List<ReceiverCommand> commands;
 }
 
-ReceiverState initialReceiverState(int targetBytesPerSec) {
+// ---------------------------------------------------------------------------
+// 初期状態と状態遷移
+// ---------------------------------------------------------------------------
+
+/// 初期状態。引数を取らない。目標は最低から始める。
+ReceiverState initialReceiverState() {
+  final floorResult = truncDiv(constants.MIN_VIABLE_BPS, 8);
+  final int floor = floorResult.isOk ? (floorResult.value ?? 0) : 0;
   return ReceiverState(
     streams: <StreamState>[],
+    catalog: <CatalogLadder>[],
     visible: true,
-    targetBytesPerSec: targetBytesPerSec,
+    targetBytesPerSec: floor,
     activeSpeakerId: null,
     trend: const Slope(0, 1),
     degraded: false,
-    unexpectedEvents: <String>[],
-    received: <ReceivedMark>[],
+    audioOnly: false,
     rateHoldUntilMs: 0,
     recoverStreak: 0,
-    // 初めに与えられた値が上限である。回復してもこれを超えて要求しない。
-    targetCeilingBytesPerSec: targetBytesPerSec,
+    targetCeilingBytesPerSec: floor,
+    unexpectedEvents: <String>[],
+    received: <ReceivedMark>[],
   );
 }
 
-/// 純関数の状態遷移。
 /// 純関数の状態遷移。時刻は AIMD の待ち（RATE_HOLD_MS）に使う。
 ReceiverStepResult receiverStep(ReceiverState state, ReceiverEvent event, [int t = 0]) {
   switch (event) {
@@ -310,21 +382,35 @@ ReceiverStepResult receiverStep(ReceiverState state, ReceiverEvent event, [int t
     case VisibilityEvent():
       return _handleVisibility(state, event.visible);
     case BudgetEvent():
-      return _reallocate(state.copyWith(targetBytesPerSec: event.bytesPerSec));
+      return _handleBudget(state, event.bytesPerSec);
+    case GoodputEvent():
+      return _handleGoodput(state, event.bytesPerSec);
     case ActiveSpeakerEvent():
       final id = event.id;
       return _reallocate(
         id == null ? state.copyWith(clearActiveSpeaker: true) : state.copyWith(activeSpeakerId: id),
       );
+    case CatalogEvent():
+      return _handleCatalog(state, event.entries);
     case DisplaySizeEvent():
       return _handleDisplaySize(state, event.senderId, event.channel, event.width);
     case ReportEvent():
       return _handleReport(state, event.delayUs, t);
     case MediaEvent():
       return _handleMedia(state, event);
+    case KeyframeRequestEvent():
+      // 判断は無い。要求をコマンドへ直すだけである（間隔制限は実行側）。
+      return ReceiverStepResult(
+        state: state,
+        commands: <ReceiverCommand>[
+          KeyframeRequestCommand(
+            targetId: event.senderId,
+            channel: event.channel,
+            spatialId: event.spatialId,
+          ),
+        ],
+      );
     case TimerEvent():
-      // ACK_INTERVAL_MS ごとに、受信済みの位置を ack として返す。
-      // 呼び出し側が周期を管理する（コアは時刻を持たない）。
       return ReceiverStepResult(
         state: state,
         commands: state.received
@@ -339,41 +425,137 @@ ReceiverStepResult receiverStep(ReceiverState state, ReceiverEvent event, [int t
   }
 }
 
-int _compareStreams(StreamState a, StreamState b) {
-  if (a.senderId != b.senderId) {
-    return a.senderId - b.senderId;
+// ---------------------------------------------------------------------------
+// 帯域とカタログ
+// ---------------------------------------------------------------------------
+
+/// goodput の観測。天井を押し上げるだけに使う（congestion.md 4.1）。
+/// 観測した goodput。天井を押し上げ、目標を上げる方向にだけ使う（congestion.md 4.1）。
+ReceiverStepResult _handleGoodput(ReceiverState state, int bytesPerSec) {
+  if (bytesPerSec <= 0) {
+    return ReceiverStepResult(state: state, commands: const []);
   }
-  return a.channel - b.channel;
+  final int ceiling =
+      bytesPerSec > state.targetCeilingBytesPerSec ? bytesPerSec : state.targetCeilingBytesPerSec;
+  final int raised = bytesPerSec > state.targetBytesPerSec ? bytesPerSec : state.targetBytesPerSec;
+  final int target = raised > ceiling ? ceiling : raised;
+  if (target == state.targetBytesPerSec && ceiling == state.targetCeilingBytesPerSec) {
+    return ReceiverStepResult(state: state, commands: const []);
+  }
+  return _reallocate(state.copyWith(targetBytesPerSec: target, targetCeilingBytesPerSec: ceiling));
 }
 
-int _compareEntries(SubscribeEntry a, SubscribeEntry b) {
-  if (a.senderId != b.senderId) {
-    return a.senderId - b.senderId;
-  }
-  return a.channel - b.channel;
+ReceiverStepResult _handleBudget(ReceiverState state, int bytesPerSec) {
+  final ceiling = bytesPerSec > state.targetCeilingBytesPerSec
+      ? bytesPerSec
+      : state.targetCeilingBytesPerSec;
+  return _reallocate(state.copyWith(
+    targetBytesPerSec: bytesPerSec,
+    targetCeilingBytesPerSec: ceiling,
+  ));
 }
 
-StreamState? _findStream(ReceiverState state, int senderId, int channel) {
-  for (final stream in state.streams) {
-    if (stream.senderId == senderId && stream.channel == channel) {
-      return stream;
+ReceiverStepResult _handleCatalog(ReceiverState state, List<CatalogLadder> entries) {
+  final normalized = entries
+      .map((entry) => CatalogLadder(
+            senderId: entry.senderId,
+            channel: entry.channel,
+            rungs: List.of(entry.rungs)..sort((a, b) => a.sid - b.sid),
+          ))
+      .toList()
+    ..sort((a, b) => a.senderId != b.senderId
+        ? a.senderId - b.senderId
+        : a.channel - b.channel);
+  // はしごが変わると段の上限と費用が変わるため、配分を作り直す。
+  return _reallocate(state.copyWith(catalog: normalized));
+}
+
+List<CatalogRung> _ladderOf(ReceiverState state, int senderId, int channel) {
+  for (final entry in state.catalog) {
+    if (entry.senderId == senderId && entry.channel == channel) {
+      return entry.rungs;
     }
   }
-  return null;
+  return const <CatalogRung>[];
 }
 
-/// spatialId の範囲は最低品質から最高品質までである。
-int _clampSpatial(int value) {
-  if (value < constants.V_360P15_SPATIAL_ID) {
-    return constants.V_360P15_SPATIAL_ID;
+/// 表示寸法から要求すべき段の上限を返す。表示幅以上の幅を持つ最小の段。
+int _rungCapFor(ReceiverState state, StreamState stream) {
+  final rungs = _ladderOf(state, stream.senderId, stream.channel);
+  if (rungs.isEmpty) {
+    return 0;
   }
-  if (value > constants.V_4K60_SPATIAL_ID) {
-    return constants.V_4K60_SPATIAL_ID;
+  CatalogRung? lowest;
+  CatalogRung? top;
+  for (final rung in rungs) {
+    if (lowest == null || rung.sid < lowest.sid) {
+      lowest = rung;
+    }
+    if (top == null || rung.sid > top.sid) {
+      top = rung;
+    }
   }
-  return value;
+  if (lowest == null || top == null) {
+    return 0;
+  }
+  if (stream.displayWidth <= 0) {
+    return lowest.sid;
+  }
+  CatalogRung? best;
+  for (final rung in rungs) {
+    if (rung.width < stream.displayWidth) {
+      continue;
+    }
+    if (best == null || rung.width < best.width) {
+      best = rung;
+    }
+  }
+  return best == null ? top.sid : best.sid;
 }
 
-/// 購読一覧の適用。表 1 行目と 2 行目に対応する。
+/// 段の費用（bits/sec）。申告が無ければ 0。
+int _costOf(ReceiverState state, StreamState stream, int sid) {
+  for (final rung in _ladderOf(state, stream.senderId, stream.channel)) {
+    if (rung.sid == sid) {
+      return rung.targetBitrate;
+    }
+  }
+  return 0;
+}
+
+/// はしごの最下段。カタログが無ければ 0。
+int _lowestRung(ReceiverState state, StreamState stream) {
+  final rungs = _ladderOf(state, stream.senderId, stream.channel);
+  int lowest = -1;
+  for (final rung in rungs) {
+    if (lowest < 0 || rung.sid < lowest) {
+      lowest = rung.sid;
+    }
+  }
+  return lowest < 0 ? 0 : lowest;
+}
+
+/// はしごの最上段。カタログが無ければ 0。
+int _highestRung(ReceiverState state, StreamState stream) {
+  final rungs = _ladderOf(state, stream.senderId, stream.channel);
+  int top = -1;
+  for (final rung in rungs) {
+    if (rung.sid > top) {
+      top = rung.sid;
+    }
+  }
+  return top < 0 ? 0 : top;
+}
+
+bool _isAudio(int channel) {
+  return channel == wire_layout.CHANNEL_AUDIO || channel == wire_layout.CHANNEL_SCREEN_AUDIO;
+}
+
+// ---------------------------------------------------------------------------
+// 購読
+// ---------------------------------------------------------------------------
+
+/// 購読一覧の適用。
 ReceiverStepResult _handleSubscribe(ReceiverState state, List<SubscribeEntry> entries) {
   final commands = <ReceiverCommand>[];
   final kept = <StreamState>[];
@@ -382,32 +564,43 @@ ReceiverStepResult _handleSubscribe(ReceiverState state, List<SubscribeEntry> en
   for (final entry in sorted) {
     final existing = _findStream(state, entry.senderId, entry.channel);
     if (existing == null || existing.phase == StreamPhase.unsubscribed) {
+      // 新規購読は最下段から始める。細い回線で初手に最上段を要求すると詰まる。
+      final start = _isAudio(entry.channel)
+          ? 0
+          : _lowestRung(state, StreamState(
+              senderId: entry.senderId,
+              channel: entry.channel,
+              phase: StreamPhase.subscribed,
+              spatialId: 0,
+              temporalId: 0,
+              displayWidth: 0,
+            ));
       commands.add(SubscribeChangeCommand(
         to: entry.senderId,
         channel: entry.channel,
         want: true,
-        maxSpatialId: entry.maxSpatialId,
+        maxSpatialId: start,
         maxTemporalId: entry.maxTemporalId,
       ));
       commands.add(KeyframeRequestCommand(
         targetId: entry.senderId,
         channel: entry.channel,
-        spatialId: entry.maxSpatialId,
+        spatialId: start,
       ));
       kept.add(StreamState(
         senderId: entry.senderId,
         channel: entry.channel,
         phase: StreamPhase.subscribed,
-        spatialId: entry.maxSpatialId,
+        spatialId: start,
         temporalId: entry.maxTemporalId,
-        displayWidth: existing == null ? 0 : existing.displayWidth,
+        displayWidth: existing?.displayWidth ?? 0,
       ));
       continue;
     }
     kept.add(existing.copyWith(phase: StreamPhase.subscribed));
   }
 
-  // 一覧から外れたものは購読解除する（表 2 行目）。
+  // 一覧から外れたものは購読解除する。
   for (final stream in state.streams) {
     var stillWanted = false;
     for (final entry in entries) {
@@ -435,18 +628,18 @@ ReceiverStepResult _handleSubscribe(ReceiverState state, List<SubscribeEntry> en
   );
 }
 
-/// 送信者の退出。表 6 行目に対応する。
+/// 送信者の退出。退出者のカタログも除去する。
 ReceiverStepResult _handleLeave(ReceiverState state, int id) {
   final streams = state.streams.where((stream) => stream.senderId != id).toList();
   if (streams.length == state.streams.length) {
     return ReceiverStepResult(state: state, commands: <ReceiverCommand>[]);
   }
-  // 退出者の受信位置も除去する。残すと居ない相手へ ack を返し続ける。
   final received = state.received.where((mark) => mark.senderId != id).toList();
-  return _reallocate(state.copyWith(streams: streams, received: received));
+  final catalog = state.catalog.where((entry) => entry.senderId != id).toList();
+  return _reallocate(state.copyWith(streams: streams, received: received, catalog: catalog));
 }
 
-/// 表示・非表示。表 7 行目と 8 行目に対応する。
+/// 表示・非表示。
 ReceiverStepResult _handleVisibility(ReceiverState state, bool visible) {
   if (visible == state.visible) {
     return ReceiverStepResult(state: state, commands: <ReceiverCommand>[]);
@@ -455,7 +648,6 @@ ReceiverStepResult _handleVisibility(ReceiverState state, bool visible) {
   final streams = <StreamState>[];
   for (final stream in state.streams) {
     if (!visible && stream.phase == StreamPhase.subscribed) {
-      // 非表示では購読を解除するが、状態は保持する（PAUSED）。
       commands.add(SubscribeChangeCommand(
         to: stream.senderId,
         channel: stream.channel,
@@ -490,10 +682,14 @@ ReceiverStepResult _handleVisibility(ReceiverState state, bool visible) {
   );
 }
 
-/// 表示寸法の申告。未申告の相手は最低品質に留める（ADR-0015）。
+/// 表示寸法の申告。
 ReceiverStepResult _handleDisplaySize(ReceiverState state, int senderId, int channel, int width) {
   if (_findStream(state, senderId, channel) == null) {
-    final unexpected = List.of(state.unexpectedEvents)..add('displaySize');
+    // 表に無いイベントの記録は上限を超えたら古い側を捨てる（ADR-0034）。
+    final appended = List.of(state.unexpectedEvents)..add('displaySize');
+    final unexpected = appended.length > constants.MAX_UNEXPECTED_EVENTS
+        ? appended.sublist(appended.length - constants.MAX_UNEXPECTED_EVENTS)
+        : appended;
     return ReceiverStepResult(
       state: state.copyWith(unexpectedEvents: unexpected),
       commands: <ReceiverCommand>[],
@@ -507,34 +703,37 @@ ReceiverStepResult _handleDisplaySize(ReceiverState state, int senderId, int cha
   return _reallocate(state.copyWith(streams: streams));
 }
 
-/// 測定報告。規範は 2 つの層を定めている。
-///
-/// 1. 状態機械（state-machines 3 節）: 勾配が劣化閾値を超えたら tier を 1 段下げ、
-///    回復閾値を下回ったら 1 段上げる
-/// 2. 輻輳制御（congestion 4.2 の AIMD）: target を劣化時に 0.85 倍し、回復が 3 回
-///    連続したら RATE_PROBE_BPS を加える（上限を超えない）
-///
-/// 0.85 は浮動小数点で計算しない。target * 17 / 20 の整数演算とし切り捨てる。
+// ---------------------------------------------------------------------------
+// 報告と AIMD
+// ---------------------------------------------------------------------------
+
+/// 遅延の報告に対する応答。tier と target の両方を更新する。
 ReceiverStepResult _handleReport(ReceiverState state, List<int> delayUs, int t) {
+  // 標本が 2 個未満では勾配が定まらない。定まらない値で AIMD を動かしてはならない。
+  if (delayUs.length < 2) {
+    return ReceiverStepResult(state: state, commands: const []);
+  }
   final trend = delaySlope(delayUs);
   final degrading = trend.numerator * constants.SHARD_TREND_ENTER_T2_DEN >
       constants.SHARD_TREND_ENTER_T2_NUM * trend.denominator;
   final recovering = trend.numerator * constants.SHARD_TREND_EXIT_DEN <
       constants.SHARD_TREND_EXIT_NUM * trend.denominator;
 
-  // --- AIMD。target を更新する ---
   int target = state.targetBytesPerSec;
   int holdUntil = state.rateHoldUntilMs;
   int streak = state.recoverStreak;
+
   if (degrading) {
     streak = 0;
-    // 待ちの間は減らさない。1 回の揺れで連続して落とさないためである。
     if (t >= state.rateHoldUntilMs) {
       final reduced = truncDiv(target * 17, 20);
       final reducedValue = reduced.value;
-      if (reduced.isOk && reducedValue != null) {
-        target = reducedValue;
-      }
+      final int lowered = (reduced.isOk && reducedValue != null) ? reducedValue : target;
+      // 予兆で最低成立点を割らない（ADR-0040）
+      final floorResult = truncDiv(constants.MIN_VIABLE_BPS, 8);
+      final floorValue = floorResult.value;
+      final int floor = (floorResult.isOk && floorValue != null) ? floorValue : 0;
+      target = lowered < floor ? floor : lowered;
       holdUntil = t + constants.RATE_HOLD_MS;
     }
   } else if (recovering) {
@@ -550,49 +749,46 @@ ReceiverStepResult _handleReport(ReceiverState state, List<int> delayUs, int t) 
     streak = 0;
   }
 
+  final afterRate = state.copyWith(
+    trend: trend,
+    targetBytesPerSec: target,
+    rateHoldUntilMs: holdUntil,
+    recoverStreak: streak,
+  );
+
   if (!degrading && !recovering) {
-    return ReceiverStepResult(
-      state: state.copyWith(
-        trend: trend,
-        targetBytesPerSec: target,
-        rateHoldUntilMs: holdUntil,
-        recoverStreak: streak,
-      ),
-      commands: <ReceiverCommand>[],
-    );
+    return ReceiverStepResult(state: afterRate, commands: <ReceiverCommand>[]);
   }
+
+  // tier を 1 段動かす。
   final delta = degrading ? -1 : 1;
   final commands = <ReceiverCommand>[];
   final streams = <StreamState>[];
-  for (final stream in state.streams) {
-    if (stream.phase != StreamPhase.subscribed) {
+  for (final stream in afterRate.streams) {
+    if (stream.phase != StreamPhase.subscribed || _isAudio(stream.channel)) {
+      // 音声には段が無い。輻輳でも音声の段を動かしてはならない。
       streams.add(stream);
       continue;
     }
-    final nextSpatial = _clampSpatial(stream.spatialId + delta);
+    final floor = _lowestRung(afterRate, stream);
+    final cap = _rungCapFor(afterRate, stream);
+    final raw = stream.spatialId + delta;
+    final nextSpatial = raw < floor ? floor : (raw > cap ? cap : raw);
     if (nextSpatial == stream.spatialId) {
       streams.add(stream);
       continue;
     }
     streams.add(stream.copyWith(spatialId: nextSpatial));
     commands.add(SetTierCommand(targetId: stream.senderId, channel: stream.channel, tier: nextSpatial));
-    // spatialId が変わる場合のみキーフレームを要求する（表 4 行目と 3 行目の違い）。
-    if (nextSpatial > stream.spatialId) {
-      commands.add(KeyframeRequestCommand(
-        targetId: stream.senderId,
-        channel: stream.channel,
-        spatialId: nextSpatial,
-      ));
-    }
+    // 段が変わるとキーフレームが必要である（simulcast では上下とも）。
+    commands.add(KeyframeRequestCommand(
+      targetId: stream.senderId,
+      channel: stream.channel,
+      spatialId: nextSpatial,
+    ));
   }
   return ReceiverStepResult(
-    state: state.copyWith(
-      trend: trend,
-      streams: streams,
-      targetBytesPerSec: target,
-      rateHoldUntilMs: holdUntil,
-      recoverStreak: streak,
-    ),
+    state: afterRate.copyWith(streams: streams),
     commands: commands,
   );
 }
@@ -609,11 +805,173 @@ ReceiverStepResult _handleMedia(ReceiverState state, MediaEvent event) {
       commands: <ReceiverCommand>[const DropCommand(priority: 1, count: 1)],
     );
   }
-  // 受信した位置を記録する。ack はタイマーでまとめて返す（congestion.md 2 節）。
   return ReceiverStepResult(
     state: _markReceived(state, event),
     commands: <ReceiverCommand>[const ForwardCommand(to: <int>[receiverSelfId])],
   );
+}
+
+// ---------------------------------------------------------------------------
+// 段の配分（congestion.md 4.3、ADR-0027、ADR-0029）
+// ---------------------------------------------------------------------------
+
+/// 帯域予算から段を配分する。
+ReceiverStepResult _reallocate(ReceiverState state) {
+  final commands = <ReceiverCommand>[];
+  // 回線の速度（bits/sec）。
+  final linkBps = state.targetBytesPerSec * 8;
+  // 段を買うための予算。10% をヘッダと制御に取る。
+  final budgetResult = truncDiv(linkBps * 9, 10);
+  final budgetBps = budgetResult.isOk ? (budgetResult.value ?? 0) : 0;
+
+  // 音声だけの状態への出入り（ヒステリシス。ADR-0029）。
+  // 判定は回線の速度そのもので行う。予算で判定すると余裕を二重に引くことになる。
+  final bool audioOnly = state.audioOnly
+      ? linkBps < constants.AUDIO_ONLY_EXIT_BPS
+      : linkBps < constants.AUDIO_ONLY_ENTER_BPS;
+
+  if (audioOnly) {
+    final streams = <StreamState>[];
+    for (final stream in state.streams) {
+      if (_isAudio(stream.channel)) {
+        streams.add(stream);
+        continue;
+      }
+      if (stream.phase == StreamPhase.subscribed) {
+        commands.add(SubscribeChangeCommand(
+          to: stream.senderId,
+          channel: stream.channel,
+          want: false,
+          maxSpatialId: 0,
+          maxTemporalId: 0,
+        ));
+        streams.add(stream.copyWith(phase: StreamPhase.audioOnly));
+        continue;
+      }
+      streams.add(stream);
+    }
+    if (!state.degraded) {
+      commands.add(const NotifyCommand(code: _degradedWarning));
+    }
+    streams.sort(_compareStreams);
+    return ReceiverStepResult(
+      state: state.copyWith(streams: streams, audioOnly: true, degraded: true),
+      commands: commands,
+    );
+  }
+
+  // 映像へ戻す（AUDIO_ONLY から復帰する）。
+  final revived = <StreamState>[];
+  for (final stream in state.streams) {
+    if (stream.phase == StreamPhase.audioOnly) {
+      final floor = _lowestRung(state, stream);
+      revived.add(stream.copyWith(phase: StreamPhase.subscribed, spatialId: floor));
+      commands.add(SubscribeChangeCommand(
+        to: stream.senderId,
+        channel: stream.channel,
+        want: true,
+        maxSpatialId: floor,
+        maxTemporalId: stream.temporalId,
+      ));
+      commands.add(KeyframeRequestCommand(
+        targetId: stream.senderId,
+        channel: stream.channel,
+        spatialId: floor,
+      ));
+      continue;
+    }
+    revived.add(stream);
+  }
+  final base = state.copyWith(streams: revived, audioOnly: false);
+
+  // 予算で段を買う。
+  final ordered = base.streams
+      .where((stream) => stream.phase == StreamPhase.subscribed)
+      .toList()
+    ..sort((a, b) => _priorityOrder(base, a, b));
+
+  final assigned = <String, int>{};
+  int remaining = budgetBps;
+  bool degraded = false;
+
+  for (final stream in ordered) {
+    if (_isAudio(stream.channel)) {
+      // 音声は段を持たない。費用は予算から引くが段の選択は行わない。
+      remaining -= _costOf(base, stream, 0);
+      continue;
+    }
+    final floor = _lowestRung(base, stream);
+    final cap = _rungCapFor(base, stream);
+    int chosen = floor;
+    // 上限から下へ降りて、予算に収まる最も高い段を選ぶ。
+    for (int sid = cap; sid >= floor; sid -= 1) {
+      final cost = _costOf(base, stream, sid);
+      if (cost <= remaining) {
+        chosen = sid;
+        break;
+      }
+    }
+    final chosenCost = _costOf(base, stream, chosen);
+    if (chosenCost > remaining) {
+      // 最下段さえ入らない。最低保証として最下段を維持し警告する。
+      degraded = true;
+    }
+    remaining -= chosenCost;
+    assigned[_streamKey(stream)] = chosen;
+  }
+
+  final streams = <StreamState>[];
+  for (final stream in base.streams) {
+    final next = assigned[_streamKey(stream)];
+    if (next == null || next == stream.spatialId) {
+      streams.add(stream);
+      continue;
+    }
+    commands.add(SetTierCommand(targetId: stream.senderId, channel: stream.channel, tier: next));
+    commands.add(KeyframeRequestCommand(
+      targetId: stream.senderId,
+      channel: stream.channel,
+      spatialId: next,
+    ));
+    streams.add(stream.copyWith(spatialId: next));
+  }
+
+  if (degraded && !base.degraded) {
+    commands.add(const NotifyCommand(code: _degradedWarning));
+  }
+
+  streams.sort(_compareStreams);
+  return ReceiverStepResult(
+    state: base.copyWith(streams: streams, degraded: degraded),
+    commands: commands,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 補助関数
+// ---------------------------------------------------------------------------
+
+/// 発話者を先に、音声を最優先。順序は決定的でなければならない。
+int _priorityOrder(ReceiverState state, StreamState a, StreamState b) {
+  // 音声を先に配分する（ADR-0029 の 4）。
+  final aAudio = _isAudio(a.channel) ? 0 : 1;
+  final bAudio = _isAudio(b.channel) ? 0 : 1;
+  if (aAudio != bAudio) {
+    return aAudio - bAudio;
+  }
+  final aSpeaker = state.activeSpeakerId == a.senderId ? 0 : 1;
+  final bSpeaker = state.activeSpeakerId == b.senderId ? 0 : 1;
+  if (aSpeaker != bSpeaker) {
+    return aSpeaker - bSpeaker;
+  }
+  if (a.senderId != b.senderId) {
+    return a.senderId - b.senderId;
+  }
+  return a.channel - b.channel;
+}
+
+String _streamKey(StreamState stream) {
+  return '${stream.senderId}:${stream.channel}';
 }
 
 /// 受信した位置を更新する。後戻りする値では更新しない。
@@ -652,89 +1010,25 @@ ReceiverState _markReceived(ReceiverState state, MediaEvent event) {
   return state.copyWith(received: merged);
 }
 
-/// 発話者を先に、次に senderId の昇順で並べる。順序は決定的でなければならない。
-int _comparePriority(ReceiverState state, StreamState a, StreamState b) {
-  final aSpeaker = state.activeSpeakerId == a.senderId ? 0 : 1;
-  final bSpeaker = state.activeSpeakerId == b.senderId ? 0 : 1;
-  if (aSpeaker != bSpeaker) {
-    return aSpeaker - bSpeaker;
-  }
+int _compareStreams(StreamState a, StreamState b) {
   if (a.senderId != b.senderId) {
     return a.senderId - b.senderId;
   }
   return a.channel - b.channel;
 }
 
-/// 帯域予算から tier を配分する（congestion.md 4.3）。
-///
-/// 除算は整数で行い、切り捨てる。浮動小数点を使わない（ADR-0017）。
-ReceiverStepResult _reallocate(ReceiverState state) {
-  final commands = <ReceiverCommand>[];
-  final budgetResult = truncDiv(state.targetBytesPerSec * 8 * 9, 10);
-  final budgetBps = budgetResult.isOk ? budgetResult.value ?? 0 : 0;
-  final highQualityResult = truncDiv(budgetBps, constants.V_4K60_TARGET_BITRATE);
-  final highQualityCount = highQualityResult.isOk ? highQualityResult.value ?? 0 : 0;
-  final thumbnailCost = constants.V_360P15_TARGET_BITRATE;
+int _compareEntries(SubscribeEntry a, SubscribeEntry b) {
+  if (a.senderId != b.senderId) {
+    return a.senderId - b.senderId;
+  }
+  return a.channel - b.channel;
+}
 
-  final ordered = state.streams.where((stream) => stream.phase == StreamPhase.subscribed).toList()
-    ..sort((a, b) => _comparePriority(state, a, b));
-
-  final streams = <StreamState>[];
-  var assignedHigh = 0;
-  var remaining = budgetBps;
-  var degraded = false;
-
+StreamState? _findStream(ReceiverState state, int senderId, int channel) {
   for (final stream in state.streams) {
-    if (stream.phase != StreamPhase.subscribed) {
-      streams.add(stream);
-      continue;
+    if (stream.senderId == senderId && stream.channel == channel) {
+      return stream;
     }
-    var rank = -1;
-    for (var index = 0; index < ordered.length; index += 1) {
-      final candidate = ordered[index];
-      if (candidate.senderId == stream.senderId && candidate.channel == stream.channel) {
-        rank = index;
-        break;
-      }
-    }
-    final int nextSpatial;
-    if (stream.displayWidth == 0) {
-      // 表示寸法の申告が無い相手は最低品質に留める（ADR-0015）。
-      nextSpatial = constants.DISPLAY_SIZE_UNSPECIFIED_SPATIAL_ID;
-    } else if (assignedHigh < highQualityCount && rank < highQualityCount) {
-      nextSpatial = constants.V_4K60_SPATIAL_ID;
-      assignedHigh += 1;
-      remaining -= constants.V_4K60_TARGET_BITRATE;
-    } else if (remaining >= thumbnailCost) {
-      nextSpatial = constants.V_360P15_SPATIAL_ID;
-      remaining -= thumbnailCost;
-    } else {
-      // 予算が尽きた。発話者のサムネイルのみを維持する（最低保証）。
-      nextSpatial = constants.V_360P15_SPATIAL_ID;
-      degraded = true;
-    }
-    if (nextSpatial != stream.spatialId) {
-      commands.add(SetTierCommand(targetId: stream.senderId, channel: stream.channel, tier: nextSpatial));
-      if (nextSpatial > stream.spatialId) {
-        // spatialId が上がる場合はエンコーダ出力が切り替わるためキーフレームが必要である。
-        commands.add(KeyframeRequestCommand(
-          targetId: stream.senderId,
-          channel: stream.channel,
-          spatialId: nextSpatial,
-        ));
-      }
-    }
-    streams.add(stream.copyWith(spatialId: nextSpatial));
   }
-
-  if (degraded && !state.degraded) {
-    // 最低保証（発話者のサムネイル 1 本と全員の音声）を下回った。利用側へ警告する。
-    commands.add(const NotifyCommand(code: _degradedWarning));
-  }
-
-  streams.sort(_compareStreams);
-  return ReceiverStepResult(
-    state: state.copyWith(streams: streams, degraded: degraded),
-    commands: commands,
-  );
+  return null;
 }

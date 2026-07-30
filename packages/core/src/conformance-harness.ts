@@ -61,7 +61,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** ShardEvent の型ガード。全フィールドの検査は行わず kind の存在を確認する。 */
+/**
+ * ShardEvent の型ガード。全フィールドの検査は行わず kind の存在を確認する。
+ *
+ * **新しい種を追加したらここにも追加する。** 追加を忘れると、その種の行が黙って
+ * 読み飛ばされ、出力行数が合わずにトレース照合が失敗する（原因が分かりにくい）。
+ */
 function isShardEvent(value: unknown): value is ShardEvent {
   if (!isRecord(value)) {
     return false;
@@ -70,12 +75,15 @@ function isShardEvent(value: unknown): value is ShardEvent {
   return (
     kind === "media" ||
     kind === "subscribe" ||
+    kind === "ack" ||
+    kind === "streamAnnounce" ||
     kind === "join" ||
     kind === "leave" ||
     kind === "link" ||
     kind === "timer" ||
     kind === "budget" ||
-    kind === "report"
+    kind === "report" ||
+    kind === "keyframeRequest"
   );
 }
 

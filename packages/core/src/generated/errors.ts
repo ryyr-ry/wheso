@@ -38,6 +38,7 @@ export const ERROR_DEFINITIONS = {
   E_RATE_LIMIT_CONNECT: { closeCode: 4031, recoverable: true, autoReconnect: true, i18nKey: "error.rate.connect" },
   E_NODE_OVERLOADED: { closeCode: 4032, recoverable: true, autoReconnect: true, i18nKey: "error.node.overloaded" },
   E_ROOM_FULL: { closeCode: 4033, recoverable: false, autoReconnect: false, i18nKey: "error.room.full" },
+  E_ACK_TIMEOUT: { closeCode: 4034, recoverable: true, autoReconnect: true, i18nKey: "error.node.ackTimeout" },
   E_EPOCH_STALE: { closeCode: 4040, recoverable: true, autoReconnect: true, i18nKey: "error.epoch.stale" },
   E_MEETING_ENDED: { closeCode: 4041, recoverable: false, autoReconnect: false, i18nKey: "error.meeting.ended" },
   E_EVICTED: { closeCode: 4042, recoverable: false, autoReconnect: false, i18nKey: "error.meeting.evicted" },

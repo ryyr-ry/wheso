@@ -234,9 +234,9 @@ final class ConformanceTests: XCTestCase {
         var flat: [Int64] = []
         var falling: [Int64] = []
         for index in 0..<20 {
-            rising.append(10_000 + Int64(index) * 1_000)
+            rising.append(10_000 + Int64(index) * 60_000)
             flat.append(10_000)
-            falling.append(30_000 - Int64(index) * 1_000)
+            falling.append(1_200_000 - Int64(index) * 60_000)
         }
         XCTAssertTrue(whesoDelaySlope(rising).numerator > 0)
         XCTAssertEqual(whesoDelaySlope(flat).numerator, 0)

@@ -188,9 +188,9 @@ void testSlope() {
   std::vector<std::int64_t> flat;
   std::vector<std::int64_t> falling;
   for (std::int64_t index = 0; index < 20; index += 1) {
-    rising.push_back(10000 + index * 1000);
+    rising.push_back(10000 + index * 60000);
     flat.push_back(10000);
-    falling.push_back(30000 - index * 1000);
+    falling.push_back(1200000 - index * 60000);
   }
   expect(wheso::delay_slope(rising).numerator > 0, "slope: 増加は正");
   expect(wheso::delay_slope(flat).numerator == 0, "slope: 一定は 0");
@@ -198,6 +198,8 @@ void testSlope() {
   expect(wheso::delay_slope(rising).denominator > 0, "slope: 分母は常に正");
   expect(wheso::is_degrading(wheso::delay_slope(rising)), "slope: 増加は劣化");
   expect(!wheso::is_degrading(wheso::delay_slope(flat)), "slope: 一定は劣化でない");
+  // 平坦は回復である（待ち行列が伸びていない）。単位はマイクロ秒/標本（ADR-0037）。
+  expect(wheso::is_recovering(wheso::delay_slope(flat)), "slope: 一定は回復");
   expect(wheso::is_recovering(wheso::delay_slope(falling)), "slope: 減少は回復");
 }
 

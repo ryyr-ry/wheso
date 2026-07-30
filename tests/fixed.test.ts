@@ -11,8 +11,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { delaySlope, isDegrading, isRecovering, wrap32, truncDiv } from "../packages/core/src/fixed.ts";
-import type { Slope } from "../packages/core/src/fixed.ts";
+import { delaySlope, wrap32, truncDiv } from "../packages/core/src/fixed.ts";
 
 /* ------------------------------------------------------------------------- */
 /* delaySlope                                                                */
@@ -80,63 +79,10 @@ test("delaySlope: n=20 線形列で numerator = 13300 * 傾き", () => {
 // 境界: numerator = 133, denominator = 13300 → 13300 > 13300 → false
 //        numerator = 134, denominator = 13300 → 13400 > 13300 → true
 
-test("isDegrading: 境界のちょうど下（= 閾値と等しい）で false", () => {
-  const slope: Slope = { numerator: 133, denominator: 13300 };
-  assert.equal(isDegrading(slope), false);
-});
-
-test("isDegrading: 境界のちょうど上で true", () => {
-  const slope: Slope = { numerator: 134, denominator: 13300 };
-  assert.equal(isDegrading(slope), true);
-});
-
-test("isDegrading: 分子 0 で false", () => {
-  const slope: Slope = { numerator: 0, denominator: 13300 };
-  assert.equal(isDegrading(slope), false);
-});
-
-test("isDegrading: 負の分子で false", () => {
-  const slope: Slope = { numerator: -1000, denominator: 13300 };
-  assert.equal(isDegrading(slope), false);
-});
-
 // DELAY_TREND_RECOVER = -0.005 = -1/200
 // isRecovering: numerator * 200 < denominator * (-1)
 // 境界: numerator = -66, denominator = 13300 → -13200 < -13300 → false
 //        numerator = -67, denominator = 13300 → -13400 < -13300 → true
-
-test("isRecovering: 境界のちょうど上（= 閾値より大きい）で false", () => {
-  const slope: Slope = { numerator: -66, denominator: 13300 };
-  assert.equal(isRecovering(slope), false);
-});
-
-test("isRecovering: 境界のちょうど下で true", () => {
-  const slope: Slope = { numerator: -67, denominator: 13300 };
-  assert.equal(isRecovering(slope), true);
-});
-
-test("isRecovering: 分子 0 で false", () => {
-  const slope: Slope = { numerator: 0, denominator: 13300 };
-  assert.equal(isRecovering(slope), false);
-});
-
-test("isRecovering: 正の分子で false", () => {
-  const slope: Slope = { numerator: 1000, denominator: 13300 };
-  assert.equal(isRecovering(slope), false);
-});
-
-test("isDegrading と isRecovering は同時に true にならない", () => {
-  // ヒステリシスにより、どの勾配でも両方 true になることはない
-  for (let num = -200; num <= 200; num += 1) {
-    const slope: Slope = { numerator: num, denominator: 13300 };
-    const deg = isDegrading(slope);
-    const rec = isRecovering(slope);
-    assert.ok(
-      !(deg && rec),
-      `numerator=${num} で isDegrading と isRecovering が同時に true`,
-    );
-  }
-});
 
 /* ------------------------------------------------------------------------- */
 /* wrap32                                                                     */

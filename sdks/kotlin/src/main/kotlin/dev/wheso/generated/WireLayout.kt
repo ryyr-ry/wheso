@@ -10,6 +10,8 @@ public const val MESSAGE_HEADER_BYTES: Int = 8
 public const val UNIT_HEADER_BYTES: Int = 20
 public const val MAX_UNITS_PER_MESSAGE: Int = 255
 public const val MAX_MESSAGE_BYTES: Int = 16000000
+public const val MAX_SPATIAL_ID: Int = 3
+public const val MAX_TEMPORAL_ID: Int = 7
 
 public const val CHANNEL_VIDEO: Int = 1
 public const val CHANNEL_AUDIO: Int = 2

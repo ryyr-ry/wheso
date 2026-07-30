@@ -10,6 +10,8 @@ pub const MESSAGE_HEADER_BYTES: usize = 8;
 pub const UNIT_HEADER_BYTES: usize = 20;
 pub const MAX_UNITS_PER_MESSAGE: u32 = 255;
 pub const MAX_MESSAGE_BYTES: usize = 16000000;
+pub const MAX_SPATIAL_ID: u8 = 3;
+pub const MAX_TEMPORAL_ID: u8 = 7;
 
 pub const CHANNEL_VIDEO: u8 = 1;
 pub const CHANNEL_AUDIO: u8 = 2;

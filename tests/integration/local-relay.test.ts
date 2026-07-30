@@ -53,7 +53,31 @@ async function sendNodeHello(socket: globalThis.WebSocket, room: string, role: s
   const window = nodeAuthTimeWindow(Math.trunc(Date.now() / 1000));
   const tag = await nodeAuthTag(secret.value, room, role, window);
   assert.equal(tag.ok, true, "authTag を作れる");
-  socket.send(JSON.stringify({ t: "nodeHello", role, nodeId: room, authTag: tag.ok ? tag.value : "" }));
+  // **受理の通知を待つ。** 待たずに送ると認証前の媒体として黙って捨てられ、
+  // 形式違反の検出（接続を閉じる）が走らない。時間で待つのは競合の元である。
+  const accepted = new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), 10_000);
+    const onMessage = (event: MessageEvent): void => {
+      if (typeof event.data === "string" && event.data.includes("nodeHelloAck")) {
+        clearTimeout(timer);
+        socket.removeEventListener("message", onMessage);
+        resolve(true);
+      }
+    };
+    socket.addEventListener("message", onMessage);
+  });
+  const hello = JSON.stringify({ t: "nodeHello", role, nodeId: room, authTag: tag.ok ? tag.value : "" });
+  socket.send(hello);
+  // **1 度で通らないことがある。** 部屋が起き上がる最中に届いた hello は応答が遅れる。
+  // 待つだけでなく送り直す（冪等である）。
+  const retry = setTimeout(() => {
+    if (socket.readyState === socket.OPEN) {
+      socket.send(hello);
+    }
+  }, 3000);
+  const ok = await accepted;
+  clearTimeout(retry);
+  assert.equal(ok, true, "nodeHelloAck が返る");
 }
 
 before(async () => {
@@ -200,6 +224,26 @@ test("実行環境で tier を超える spatialId は転送されない", { time
   const sender = await connectReady(3, room);
   await sendNodeHello(sender, room, "sender");
 
+  // **はしごを申告する。** 申告が無いと中継ノードは存在する段を知らず、
+  // 「要求に合う段が無ければ存在する最下段を通す」安全弁が働く（ADR-0027 の 3）。
+  // 実際の送信ノードは必ず申告するため、申告のある状態で段の上限を検査する。
+  sender.send(
+    JSON.stringify({
+      t: "streamAnnounce",
+      streams: [0, 1, 2, 3].map((spatialId) => ({
+        channel: CHANNEL_VIDEO,
+        spatialId,
+        codec: "av01.0.08M.08",
+        scalabilityMode: "L1T3",
+        spatialLayers: 1,
+        temporalLayers: 3,
+        width: 320 * (spatialId + 1),
+        height: 180 * (spatialId + 1),
+        framerate: 30,
+        targetBitrate: 200000 * (spatialId + 1),
+      })),
+    }),
+  );
   subscriber.send(
     JSON.stringify({
       t: "subscribe",

@@ -8,13 +8,18 @@
 // 浮動小数点を使わない。例外を投げない。反復順序は決定的にする。
 package dev.wheso
 
+import dev.wheso.generated.ACK_TIMEOUT_MS
+import dev.wheso.generated.MAX_UNEXPECTED_EVENTS
 import dev.wheso.generated.AUDIO_SELECTIVE_FORWARD_COUNT
+import dev.wheso.generated.AUDIO_SELECTIVE_MIN_COUNT
 import dev.wheso.generated.AUDIO_SPEAKER_HOLD_MS
 import dev.wheso.generated.CHANNEL_AUDIO
+import dev.wheso.generated.CHANNEL_SCREEN_AUDIO
 import dev.wheso.generated.Errors
 import dev.wheso.generated.FLAG_ACTIVE_SPEAKER
 import dev.wheso.generated.NODE_MAX_OUT_BYTES_PER_SEC
 import dev.wheso.generated.NODE_MAX_OUT_MESSAGES_PER_SEC
+import dev.wheso.generated.SEND_WINDOW_MS
 import dev.wheso.generated.SHARD_TREND_ENTER_KEY_ONLY_DEN
 import dev.wheso.generated.SHARD_TREND_ENTER_KEY_ONLY_NUM
 import dev.wheso.generated.SHARD_TREND_ENTER_SPATIAL_DEN
@@ -46,7 +51,8 @@ import dev.wheso.generated.SHARD_UTIL_EXIT_T2_NUM
 import dev.wheso.generated.SHARD_UTIL_WINDOW_MS
 import dev.wheso.generated.SHEDDING_HYSTERESIS_MS
 
-/** 輻輳状態（state-machines.md 3 節）。 */
+// --- 輻輳状態（state-machines.md 3 節） ---
+
 public enum class Congestion(public val label: String) {
     NORMAL("NORMAL"),
     SHEDDING_T2("SHEDDING_T2"),
@@ -55,444 +61,584 @@ public enum class Congestion(public val label: String) {
     KEY_ONLY("KEY_ONLY"),
 }
 
-/** 購読 1 件。 */
-public data class Subscription(val subscriberId: Long, val targetId: Long, val maxSpatialId: Long)
+// --- はしごの 1 段（ADR-0026） ---
 
-/** 受信者ごとの遅延勾配。分子と分母の整数対で持つ（ADR-0017）。 */
-public data class ReceiverTrend(val subscriberId: Long, val numerator: Long, val denominator: Long)
+public data class LadderRung(
+    val sid: Long,
+    val width: Long,
+    val height: Long,
+    val framerate: Long,
+    val temporalLayers: Long,
+    val targetBitrate: Long,
+)
 
-/** 送信者とチャネルごとの最大 spatialId。 */
-public data class MaxSpatial(val from: Long, val ch: Long, val sid: Long)
+// --- 購読 1 本の状態。判断はすべてここに閉じる（ADR-0025） ---
 
-/** 送信者 1 人に指令したエンコーダの上限層（ADR-0022）。 */
-public data class EncoderTier(val targetId: Long, val tier: Long)
-
-public data class ShardState(
+public data class Subscription(
+    val subscriberId: Long,
+    val targetId: Long,
+    val channel: Long,
+    val maxSpatialId: Long,
+    val maxTemporalId: Long,
+    val windowSid: Long,
+    val highestSent: Long,
+    val highestAcked: Long,
+    val lastAckAtMs: Long,
+    val stalled: Boolean,
     val congestion: Congestion,
     val congestionEnteredAt: Long,
+    val tierPenalty: Long,
+)
+
+public data class Ladder(
+    val from: Long,
+    val ch: Long,
+    val rungs: List<LadderRung>,
+    val announced: Boolean,
+)
+
+public data class ReceiverTrend(val subscriberId: Long, val numerator: Long, val denominator: Long)
+
+public data class SpeakerActivity(val senderId: Long, val lastSpeechAtMs: Long)
+
+public data class EncoderTier(val targetId: Long, val tier: Long)
+
+/** 受け取った位置。ackUpstream の内容になる（受信ノードの ReceivedMark とは別の型である）。 */
+public data class ShardReceivedMark(val from: Long, val ch: Long, val sid: Long, val highestSeq: Long)
+
+public data class ShardState(
     val participants: List<Long>,
     val subscriptions: List<Subscription>,
+    val ladders: List<Ladder>,
+    val trends: List<ReceiverTrend>,
+    val speakers: List<SpeakerActivity>,
+    val encoderTiers: List<EncoderTier>,
     val budgetBytesPerSec: Long,
     val sentBytesInWindow: Long,
     val sentMessagesInWindow: Long,
     val windowStartMs: Long,
+    val overloadNotified: Boolean,
+    val received: List<ShardReceivedMark>,
     val unexpectedEvents: List<String>,
-    val trends: List<ReceiverTrend>,
-    val maxSpatial: List<MaxSpatial>,
-    val encoderTiers: List<EncoderTier>,
-    /**
-     * 送信者ごとの直近の発話時刻。音声の選別転送に使う（ADR-0024）。
-     * senderId の昇順で保持する（決定性のため）。
-     */
-    val speakers: List<SpeakerActivity>,
 )
 
-/** 送信者ごとの直近の発話時刻（ADR-0024）。 */
-public data class SpeakerActivity(
-    val senderId: Long,
-    /** 最後に ACTIVE_SPEAKER=1 の音声が届いた時刻。 */
-    val lastSpeechAtMs: Long,
-)
+// --- 入力イベント ---
 
-/** 入力イベント。sealed で閉じる（判定漏れを防ぐ）。 */
 public sealed interface ShardEvent {
     public data class Media(
-        val from: Long,
-        val ch: Long,
-        val sid: Long,
-        val tid: Long,
-        val key: Boolean,
-        val bytes: Long,
-        val flags: Long,
+        val from: Long, val ch: Long, val sid: Long, val tid: Long,
+        val key: Boolean, val bytes: Long, val flags: Long, val seq: Long,
     ) : ShardEvent
 
     public data class Subscribe(
-        val from: Long,
-        val to: Long,
-        val want: Boolean,
-        val maxSpatialId: Long,
+        val from: Long, val to: Long, val ch: Long, val want: Boolean,
+        val maxSpatialId: Long, val maxTemporalId: Long,
     ) : ShardEvent
 
+    public data class Ack(
+        val from: Long, val to: Long, val ch: Long, val sid: Long, val highestSeq: Long,
+    ) : ShardEvent
+
+    public data class StreamAnnounce(val from: Long, val ch: Long, val rungs: List<LadderRung>) : ShardEvent
+
     public data class Join(val id: Long) : ShardEvent
-
     public data class Leave(val id: Long) : ShardEvent
-
     public data class Link(val peer: Long, val state: String) : ShardEvent
-
     public object Timer : ShardEvent
-
     public data class Budget(val bytesPerSec: Long) : ShardEvent
-
     public data class Report(val from: Long, val delayUs: List<Long>) : ShardEvent
+
+    /// 購読者からのキーフレーム要求（ADR-0039）。
+    /// 購読していない相手への要求は無視して記録する。
+    public data class KeyframeRequest(val from: Long, val target: Long, val ch: Long, val sid: Long) : ShardEvent
 }
 
-/** 出力コマンド。 */
+// --- 出力コマンド ---
+
 public sealed interface ShardCommand {
     public data class Forward(val to: List<Long>) : ShardCommand
-
     public data class Drop(val priority: Long, val count: Long) : ShardCommand
-
-    public data class Notify(val code: Long) : ShardCommand
-
     public data class SetTier(val targetId: Long, val tier: Long) : ShardCommand
+    /** キーフレームの要求。段ごとに符号化器が別であるため channel と spatialId を持つ（ADR-0033）。 */
+    public data class KeyframeRequest(val targetId: Long, val channel: Long, val spatialId: Long) : ShardCommand
+
+    /** 上流（送信ノード）へ返す受信位置。これが無いと送信ノードの送信窓が開かない。 */
+    public data class AckUpstream(
+        val to: Long,
+        val channel: Long,
+        val spatialId: Long,
+        val highestSeq: Long,
+    ) : ShardCommand
+    public data class Connect(val peer: Long) : ShardCommand
+    public data class Disconnect(val peer: Long) : ShardCommand
+    public data class Schedule(val at: Long) : ShardCommand
+    public data class Close(val code: Long) : ShardCommand
+    public data class Notify(val code: Long) : ShardCommand
 }
 
 public data class ShardStepResult(val state: ShardState, val commands: List<ShardCommand>)
 
-/** 初期状態。トレースの最初の時刻を渡す。 */
 public fun initialShardState(t: Long): ShardState = ShardState(
-    congestion = Congestion.NORMAL,
-    congestionEnteredAt = t,
-    participants = emptyList(),
-    subscriptions = emptyList(),
-    budgetBytesPerSec = NODE_MAX_OUT_BYTES_PER_SEC,
-    sentBytesInWindow = 0L,
-    sentMessagesInWindow = 0L,
-    windowStartMs = t,
+    participants = emptyList(), subscriptions = emptyList(), ladders = emptyList(),
+    trends = emptyList(), speakers = emptyList(), encoderTiers = emptyList(),
+    budgetBytesPerSec = NODE_MAX_OUT_BYTES_PER_SEC, sentBytesInWindow = 0L,
+    sentMessagesInWindow = 0L, windowStartMs = t, overloadNotified = false,
+    received = emptyList(),
     unexpectedEvents = emptyList(),
-    trends = emptyList(),
-    maxSpatial = emptyList(),
-    encoderTiers = emptyList(),
-    speakers = emptyList(),
 )
 
-/** 1 ステップの状態遷移。 */
 public fun shardStep(state: ShardState, event: ShardEvent, t: Long): ShardStepResult = when (event) {
     is ShardEvent.Media -> handleMedia(state, event, t)
-    is ShardEvent.Subscribe -> handleSubscribe(state, event)
+    is ShardEvent.Subscribe -> handleSubscribe(state, event, t)
+    is ShardEvent.Ack -> handleAck(state, event, t)
+    is ShardEvent.StreamAnnounce -> handleStreamAnnounce(state, event, t)
     is ShardEvent.Join -> handleJoin(state, event.id)
     is ShardEvent.Leave -> handleLeave(state, event.id)
-    // 表に無いイベントは無視して記録する。
-    is ShardEvent.Link -> ShardStepResult(
-        state.copy(unexpectedEvents = state.unexpectedEvents + "link"),
-        emptyList(),
-    )
-    is ShardEvent.Timer -> evaluateCongestion(maybeResetWindow(state, t), t)
-    is ShardEvent.Budget -> evaluateCongestion(state.copy(budgetBytesPerSec = event.bytesPerSec), t)
-    is ShardEvent.Report -> handleReport(state, event.from, event.delayUs, t)
+    is ShardEvent.Link -> ignoreEvent(state, "link")
+    is ShardEvent.Timer -> handleTimer(state, t)
+    is ShardEvent.Budget -> handleBudget(state, event, t)
+    is ShardEvent.Report -> handleReport(state, event, t)
+    is ShardEvent.KeyframeRequest -> handleKeyframeRequest(state, event)
 }
 
-/**
- * メディアの転送。
- *
- * 判定の順序を参照実装に揃える。順序を変えると出力が変わる。
- *   1. 窓の更新と観測した最大 spatialId の更新
- *   2. 輻輳状態による破棄
- *   3. 購読者の抽出（tier を満たす者のみ、昇順）
- *   4. 予算超過なら破棄可能なものを破棄
- *   5. 転送し、計数を進めてから輻輳を再評価する
- */
-/**
- * 音声の選別転送の判断（ADR-0024）。
- *
- * 転送対象は「直近に ACTIVE_SPEAKER=1 の音声が届いた時刻」が新しい上位
- * AUDIO_SELECTIVE_FORWARD_COUNT 名である。保持時間の内側に居る発話者だけを候補とし、
- * 時刻が同じ場合は senderId の昇順とする（決定性のため）。
- */
-private fun isAudioForwarded(state: ShardState, senderId: Long, t: Long): Boolean {
-    val active = state.speakers.filter { t - it.lastSpeechAtMs <= AUDIO_SPEAKER_HOLD_MS }
-    if (active.size.toLong() <= AUDIO_SELECTIVE_FORWARD_COUNT) {
-        return true
+private fun ignoreEvent(state: ShardState, name: String): ShardStepResult =
+    ShardStepResult(state.copy(unexpectedEvents = appendUnexpected(state.unexpectedEvents, name)), emptyList())
+
+/// 購読者のキーフレーム要求を送信者への要求へ直す（ADR-0039）。
+/// 購読が無い相手への要求は無視して記録する。
+private fun handleKeyframeRequest(state: ShardState, event: ShardEvent.KeyframeRequest): ShardStepResult {
+    val subscribed = state.subscriptions.any {
+        it.subscriberId == event.from && it.targetId == event.target && it.channel == event.ch
     }
-    val ordered = active.sortedWith(
-        compareByDescending<SpeakerActivity> { it.lastSpeechAtMs }.thenBy { it.senderId },
+    if (!subscribed) return ignoreEvent(state, "keyframeRequest")
+    return ShardStepResult(
+        state,
+        listOf(ShardCommand.KeyframeRequest(event.target, event.ch, event.sid)),
     )
-    return ordered.take(AUDIO_SELECTIVE_FORWARD_COUNT.toInt()).any { it.senderId == senderId }
 }
 
-/** 発話の記録を更新する。senderId の昇順を保つ（決定性のため）。 */
-private fun recordSpeech(speakers: List<SpeakerActivity>, senderId: Long, t: Long): List<SpeakerActivity> {
-    val updated = mutableListOf<SpeakerActivity>()
-    var replaced = false
-    for (entry in speakers) {
-        if (entry.senderId == senderId) {
-            updated.add(SpeakerActivity(senderId, t))
-            replaced = true
-            continue
+private fun isAudioChannel(ch: Long): Boolean =
+    ch == CHANNEL_AUDIO.toLong() || ch == CHANNEL_SCREEN_AUDIO.toLong()
+
+private fun handleMedia(state: ShardState, event: ShardEvent.Media, t: Long): ShardStepResult {
+    val windowed = observeLadder(maybeResetWindow(state, t), event)
+    val audio = isAudioChannel(event.ch)
+    val speaking = (event.flags and FLAG_ACTIVE_SPEAKER.toLong()) != 0L
+    val withSpeech = if (audio && speaking) {
+        windowed.copy(speakers = recordSpeech(windowed.speakers, event.from, t))
+    } else windowed
+
+    val priority = dropPriority(event.ch.toInt(), event.flags.toInt())?.toLong()
+    // 受け取った位置を記録する。ack はタイマーでまとめて返す（congestion.md 2 節）。
+    val marked = markReceived(withSpeech, event)
+    val targets = mutableListOf<Long>()
+    val dropped = mutableMapOf<Long, Long>()
+    val nextSubs = mutableListOf<Subscription>()
+
+    for (sub in marked.subscriptions) {
+        if (sub.targetId != event.from || sub.channel != event.ch) {
+            nextSubs.add(sub); continue
         }
-        updated.add(entry)
-    }
-    if (!replaced) {
-        updated.add(SpeakerActivity(senderId, t))
-        updated.sortBy { it.senderId }
-    }
-    return updated
-}
-
-private fun handleMedia(state: ShardState, unit: ShardEvent.Media, t: Long): ShardStepResult {
-    val windowed = maybeResetWindow(state, t)
-    val updated = updateMaxSpatial(windowed, unit.from, unit.ch, unit.sid)
-
-    // 音声で ACTIVE_SPEAKER が立っていれば発話時刻を記録する（選別転送。ADR-0024）。
-    // 記録は選別の前に行う。今まさに発話している者の音声は通す必要がある。
-    val isAudio = unit.ch == CHANNEL_AUDIO.toLong()
-    val isSpeaking = (unit.flags and FLAG_ACTIVE_SPEAKER.toLong()) != 0L
-    val next = if (isAudio && isSpeaking) {
-        updated.copy(speakers = recordSpeech(updated.speakers, unit.from, t))
-    } else {
-        updated
+        val d = decideForSubscription(marked, sub, event, priority, t)
+        nextSubs.add(d.subscription)
+        if (d.forward) { targets.add(sub.subscriberId) }
+        else if (d.dropPriority != null) { dropped[d.dropPriority] = (dropped[d.dropPriority] ?: 0L) + 1L }
     }
 
-    // 上限に入らない送信者の音声は破棄する。輻輳ではないため priority は 0 とする。
-    if (isAudio && !isAudioForwarded(next, unit.from, t)) {
-        return ShardStepResult(next, listOf(ShardCommand.Drop(0L, 1L)))
+    targets.sort()
+    val commands = mutableListOf<ShardCommand>()
+    for (key in dropped.keys.sorted()) {
+        val count = dropped[key]
+        if (count != null && count > 0L) commands.add(ShardCommand.Drop(key, count))
     }
-
-    val priority = dropPriority(unit.ch.toInt(), unit.flags.toInt())?.toLong()
-
-    if (shouldDropInCongestion(next, unit.sid, unit.tid, unit.from, unit.ch, priority)) {
-        return ShardStepResult(next, listOf(ShardCommand.Drop(priority ?: 0L, 1L)))
-    }
-
-    val targets = next.subscriptions
-        .filter { it.targetId == unit.from && unit.sid <= it.maxSpatialId }
-        .map { it.subscriberId }
-        .sorted()
 
     if (targets.isEmpty()) {
-        return ShardStepResult(next, emptyList())
+        return ShardStepResult(marked.copy(subscriptions = nextSubs), commands)
     }
+    commands.add(ShardCommand.Forward(targets.toList()))
 
-    val msgCost = targets.size.toLong()
-    val byteCost = msgCost * unit.bytes
-    val projectedMessages = next.sentMessagesInWindow + msgCost
-    val projectedBytes = next.sentBytesInWindow + byteCost
-
-    if (isOverBudget(projectedMessages, projectedBytes, next, t) && priority != null) {
-        return ShardStepResult(next, listOf(ShardCommand.Drop(priority, 1L)))
-    }
-
-    val afterForward = next.copy(
-        sentBytesInWindow = next.sentBytesInWindow + byteCost,
-        sentMessagesInWindow = next.sentMessagesInWindow + msgCost,
+    val accounted = marked.copy(
+        subscriptions = nextSubs,
+        sentMessagesInWindow = marked.sentMessagesInWindow + targets.size.toLong(),
+        sentBytesInWindow = marked.sentBytesInWindow + targets.size.toLong() * event.bytes,
     )
-    val evaluated = evaluateCongestion(afterForward, t)
-    return ShardStepResult(
-        evaluated.state,
-        listOf<ShardCommand>(ShardCommand.Forward(targets)) + evaluated.commands,
-    )
+    val overload = notifyNodeOverload(accounted, t)
+    return ShardStepResult(overload.state, commands + overload.commands)
 }
 
-private fun handleSubscribe(state: ShardState, event: ShardEvent.Subscribe): ShardStepResult {
-    val filtered = state.subscriptions.filterNot {
-        it.subscriberId == event.from && it.targetId == event.to
+private data class SubscriptionDecision(val subscription: Subscription, val forward: Boolean, val dropPriority: Long?)
+
+private fun decideForSubscription(
+    state: ShardState, sub: Subscription, event: ShardEvent.Media, priority: Long?, t: Long,
+): SubscriptionDecision {
+    if (sub.stalled) return SubscriptionDecision(sub, false, null)
+
+    // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
+    // 本数は購読者ごとに決める。帯域が細い購読者へ多数の音声を送ると映像の余地が無くなる。
+    if (isAudioChannel(event.ch) && !isAudioForwarded(state, sub, event.from, t)) {
+        // 輻輳による破棄ではないため priority は 0 とする（ADR-0024 の 5）。
+        return SubscriptionDecision(sub, false, 0L)
     }
-    val next = if (event.want) {
-        (filtered + Subscription(event.from, event.to, event.maxSpatialId))
-            .sortedWith(compareBy({ it.subscriberId }, { it.targetId }))
-    } else {
-        filtered
+
+    if (!isAudioChannel(event.ch)) {
+        val chosen = chooseRung(state, sub)
+        if (event.sid != chosen) return SubscriptionDecision(sub, false, null)
+        if (event.tid > sub.maxTemporalId) return SubscriptionDecision(sub, false, null)
     }
-    return withEncoderTiers(state.copy(subscriptions = next))
-}
 
-/**
- * 購読の和集合から送信者ごとの必要な上限層を求め、変化した送信者へ setTier を出す。
- * 出力の順序は targetId の昇順に固定する（conformance.md 4.4 の完全一致）。
- */
-private fun withEncoderTiers(state: ShardState): ShardStepResult {
-    val targets = state.subscriptions.map { it.targetId }.distinct().sorted()
-    val nextTiers = mutableListOf<EncoderTier>()
-    val commands = mutableListOf<ShardCommand>()
-    for (targetId in targets) {
-        var tier = 0L
-        for (sub in state.subscriptions) {
-            if (sub.targetId == targetId && sub.maxSpatialId > tier) {
-                tier = sub.maxSpatialId
-            }
-        }
-        nextTiers.add(EncoderTier(targetId, tier))
-        val previous = state.encoderTiers.firstOrNull { it.targetId == targetId }
-        // 購読者が居なくなった送信者には指令を出さない（記録のみ除去する）。
-        if (previous == null || previous.tier != tier) {
-            commands.add(ShardCommand.SetTier(targetId, tier))
-        }
+    val mustForward = priority == null
+    if (!mustForward && shouldDropInCongestion(sub, event, priority)) {
+        return SubscriptionDecision(sub, false, priority)
     }
-    return ShardStepResult(state.copy(encoderTiers = nextTiers), commands)
-}
-
-private fun handleJoin(state: ShardState, id: Long): ShardStepResult {
-    if (state.participants.contains(id)) {
-        return ShardStepResult(state, emptyList())
+    if (!mustForward && isWindowClosed(state, sub, event)) {
+        return SubscriptionDecision(sub, false, priority)
     }
-    return ShardStepResult(state.copy(participants = (state.participants + id).sorted()), emptyList())
-}
 
-private fun handleLeave(state: ShardState, id: Long): ShardStepResult {
-    val next = state.copy(
-        participants = state.participants.filterNot { it == id },
-        subscriptions = state.subscriptions.filterNot { it.subscriberId == id || it.targetId == id },
-        // 退出者の遅延勾配と観測した spatialId も除去する。
-        // 残すと、居なくなった相手の古い観測が輻輳の判定に影響し続ける。
-        trends = state.trends.filterNot { it.subscriberId == id },
-        maxSpatial = state.maxSpatial.filterNot { it.from == id },
-        // 退出者への指令の記録も除去する。残すと再参加時に指令が出ない。
-        encoderTiers = state.encoderTiers.filterNot { it.targetId == id },
-    )
-    return withEncoderTiers(next)
-}
-
-private fun handleReport(state: ShardState, from: Long, delayUs: List<Long>, t: Long): ShardStepResult {
-    val slope = delaySlope(delayUs)
-    val trends = (state.trends.filterNot { it.subscriberId == from } +
-        ReceiverTrend(from, slope.numerator, slope.denominator)).sortedBy { it.subscriberId }
-    return evaluateCongestion(state.copy(trends = trends), t)
-}
-
-private fun maybeResetWindow(state: ShardState, t: Long): ShardState {
-    if (t - state.windowStartMs >= SHARD_UTIL_WINDOW_MS) {
-        return state.copy(sentBytesInWindow = 0L, sentMessagesInWindow = 0L, windowStartMs = t)
+    val chosen = if (isAudioChannel(event.ch)) 0L else chooseRung(state, sub)
+    if (chosen != sub.windowSid) {
+        // 渡す段が変わった。seq 空間が変わるため窓を作り直す。
+        val updated = sub.copy(windowSid = chosen, highestSent = event.seq, highestAcked = event.seq - 1L)
+        return SubscriptionDecision(updated, true, null)
     }
-    return state
+    val highestSent = if (event.seq > sub.highestSent) event.seq else sub.highestSent
+    return SubscriptionDecision(sub.copy(highestSent = highestSent), true, null)
 }
 
-private fun updateMaxSpatial(state: ShardState, from: Long, ch: Long, sid: Long): ShardState {
-    val existing = state.maxSpatial.firstOrNull { it.from == from && it.ch == ch }
-    if (existing != null && existing.sid >= sid) {
-        return state
+private fun chooseRung(state: ShardState, sub: Subscription): Long {
+    val wanted = sub.maxSpatialId - sub.tierPenalty
+    val effective = if (wanted < 0L) 0L else wanted
+    val ladder = findLadder(state, sub.targetId, sub.channel)
+    if (ladder == null || ladder.rungs.isEmpty()) return effective
+    var best = -1L
+    var lowest = -1L
+    for (rung in ladder.rungs) {
+        if (lowest < 0L || rung.sid < lowest) lowest = rung.sid
+        if (rung.sid <= effective && rung.sid > best) best = rung.sid
     }
-    val merged = (state.maxSpatial.filterNot { it.from == from && it.ch == ch } + MaxSpatial(from, ch, sid))
-        .sortedWith(compareBy({ it.from }, { it.ch }))
-    return state.copy(maxSpatial = merged)
+    return if (best >= 0L) best else if (lowest < 0L) effective else lowest
 }
 
-private fun maxSpatialFor(state: ShardState, from: Long, ch: Long): Long =
-    state.maxSpatial.firstOrNull { it.from == from && it.ch == ch }?.sid ?: 0L
+private fun isWindowClosed(state: ShardState, sub: Subscription, event: ShardEvent.Media): Boolean {
+    val framerate = framerateOf(state, sub)
+    if (framerate <= 0L) return false
+    // 窓がまだこの連番の空間に無いときは評価しない（ADR-0038）。
+    val chosen = if (isAudioChannel(event.ch)) 0L else chooseRung(state, sub)
+    if (chosen != sub.windowSid) return false
+    val inFlight = inFlightFrames(sub, event.seq)
+    return inFlight * 1000L > SEND_WINDOW_MS * framerate
+}
 
-/**
- * 輻輳状態による破棄の判定。
- *
- * 破棄禁止（優先順位が無い = 音声とキーフレーム）は常に転送する。
- */
-private fun shouldDropInCongestion(
-    state: ShardState,
-    sid: Long,
-    tid: Long,
-    from: Long,
-    ch: Long,
-    priority: Long?,
-): Boolean {
-    if (priority == null) {
-        return false
-    }
-    return when (state.congestion) {
+private fun inFlightFrames(sub: Subscription, seq: Long): Long {
+    val highest = if (seq > sub.highestSent) seq else sub.highestSent
+    val inFlight = highest - sub.highestAcked - 1L
+    return if (inFlight < 0L) 0L else inFlight
+}
+
+private fun framerateOf(state: ShardState, sub: Subscription): Long {
+    val ladder = findLadder(state, sub.targetId, sub.channel)
+    if (ladder == null || !ladder.announced) return 0L
+    val chosen = chooseRung(state, sub)
+    for (rung in ladder.rungs) { if (rung.sid == chosen) return rung.framerate }
+    return 0L
+}
+
+private fun shouldDropInCongestion(sub: Subscription, event: ShardEvent.Media, priority: Long?): Boolean {
+    if (priority == null) return false
+    return when (sub.congestion) {
         Congestion.NORMAL -> false
         Congestion.SHEDDING_T2 -> priority <= 3L
-        Congestion.SHEDDING_T1 -> tid >= 1L
-        // (送信者, チャネル) ごとの最大 spatialId のみを破棄する。
-        // 全層を破棄すると受信側の復号が完全に止まる。
-        Congestion.SHEDDING_SPATIAL -> sid >= maxSpatialFor(state, from, ch) || tid >= 1L
+        Congestion.SHEDDING_T1 -> event.tid >= 1L
+        Congestion.SHEDDING_SPATIAL -> event.tid >= 1L
         Congestion.KEY_ONLY -> true
     }
 }
 
-/** 窓内の予算を超えるか。時刻の差で正規化する（浮動小数点を使わない）。 */
-private fun isOverBudget(
-    projectedMessages: Long,
-    projectedBytes: Long,
-    state: ShardState,
-    t: Long,
-): Boolean {
-    val window = t - state.windowStartMs
-    if (window <= 0L) {
-        return false
-    }
-    val messageOver = projectedMessages * 1000L > NODE_MAX_OUT_MESSAGES_PER_SEC * window
-    val byteOver = projectedBytes * 1000L > state.budgetBytesPerSec * window
-    return messageOver || byteOver
+private fun isAudioForwarded(state: ShardState, sub: Subscription, senderId: Long, t: Long): Boolean {
+    val limit = audioLimitFor(sub)
+    val active = state.speakers.filter { t - it.lastSpeechAtMs <= AUDIO_SPEAKER_HOLD_MS }
+    if (active.size.toLong() <= limit) return true
+    val ordered = active.sortedWith(compareByDescending<SpeakerActivity> { it.lastSpeechAtMs }.thenBy { it.senderId })
+    return ordered.take(limit.toInt()).any { it.senderId == senderId }
 }
 
-private fun utilGreater(state: ShardState, t: Long, num: Long, den: Long): Boolean {
-    val window = t - state.windowStartMs
-    if (window <= 0L) {
-        return false
-    }
-    return state.sentMessagesInWindow * 1000L * den > num * window * NODE_MAX_OUT_MESSAGES_PER_SEC
+/**
+ * この購読者へ同時に転送する音声の本数（ADR-0029 の 2）。
+ * 輻輳の段が深いほど減らす。1 本は必ず残す。
+ */
+private fun audioLimitFor(sub: Subscription): Long {
+    val reduced = AUDIO_SELECTIVE_FORWARD_COUNT - congestionDepth(sub.congestion)
+    return if (reduced < AUDIO_SELECTIVE_MIN_COUNT) AUDIO_SELECTIVE_MIN_COUNT else reduced
 }
 
-private fun utilLess(state: ShardState, t: Long, num: Long, den: Long): Boolean {
-    val window = t - state.windowStartMs
-    if (window <= 0L) {
-        // 窓が始まっていない場合は利用率 0 とみなす。閾値が正なら下回る。
-        return num > 0L
-    }
-    return state.sentMessagesInWindow * 1000L * den < num * window * NODE_MAX_OUT_MESSAGES_PER_SEC
+/** 輻輳の深さ。NORMAL が 0 で、段が深くなるほど大きい。 */
+private fun congestionDepth(state: Congestion): Long = when (state) {
+    Congestion.NORMAL -> 0L
+    Congestion.SHEDDING_T2 -> 1L
+    Congestion.SHEDDING_T1 -> 2L
+    Congestion.SHEDDING_SPATIAL -> 3L
+    Congestion.KEY_ONLY -> 4L
 }
 
-/** 1 人でも閾値を超えるか（劣化は OR で評価する）。 */
-private fun trendGreater(state: ShardState, num: Long, den: Long): Boolean =
-    state.trends.any { it.numerator * den > num * it.denominator }
+private fun recordSpeech(speakers: List<SpeakerActivity>, senderId: Long, t: Long): List<SpeakerActivity> {
+    val updated = mutableListOf<SpeakerActivity>()
+    var replaced = false
+    for (entry in speakers) {
+        if (entry.senderId == senderId) { updated.add(SpeakerActivity(senderId, t)); replaced = true; continue }
+        updated.add(entry)
+    }
+    if (!replaced) { updated.add(SpeakerActivity(senderId, t)); updated.sortBy { it.senderId } }
+    return updated
+}
 
-/** 全員が閾値を下回るか（回復は AND で評価する）。記録が無い場合は真とする。 */
-private fun trendLess(state: ShardState, num: Long, den: Long): Boolean =
-    state.trends.all { it.numerator * den < num * it.denominator }
+private fun handleSubscribe(state: ShardState, event: ShardEvent.Subscribe, t: Long): ShardStepResult {
+    val rest = state.subscriptions.filter {
+        !(it.subscriberId == event.from && it.targetId == event.to && it.channel == event.ch)
+    }
+    if (!event.want) return withEncoderTiers(state.copy(subscriptions = rest.sortedWith(subscriptionOrder)))
+    val existing = state.subscriptions.find {
+        it.subscriberId == event.from && it.targetId == event.to && it.channel == event.ch
+    }
+    val created = Subscription(
+        subscriberId = event.from, targetId = event.to, channel = event.ch,
+        maxSpatialId = event.maxSpatialId, maxTemporalId = event.maxTemporalId,
+        windowSid = existing?.windowSid ?: -1L, highestSent = existing?.highestSent ?: 0L,
+        highestAcked = existing?.highestAcked ?: 0L, lastAckAtMs = t, stalled = false,
+        congestion = existing?.congestion ?: Congestion.NORMAL,
+        congestionEnteredAt = existing?.congestionEnteredAt ?: t,
+        tierPenalty = existing?.tierPenalty ?: 0L,
+    )
+    return withEncoderTiers(state.copy(subscriptions = (rest + created).sortedWith(subscriptionOrder)))
+}
 
-/** 輻輳状態の評価（state-machines.md 3 節）。ヒステリシスの間は遷移しない。 */
-private fun evaluateCongestion(state: ShardState, t: Long): ShardStepResult {
-    if (t - state.congestionEnteredAt < SHEDDING_HYSTERESIS_MS) {
-        return ShardStepResult(state, emptyList())
-    }
-    val nextPhase = when (state.congestion) {
-        Congestion.NORMAL ->
-            if (utilGreater(state, t, SHARD_UTIL_ENTER_T2_NUM, SHARD_UTIL_ENTER_T2_DEN) ||
-                trendGreater(state, SHARD_TREND_ENTER_T2_NUM, SHARD_TREND_ENTER_T2_DEN)
-            ) {
-                Congestion.SHEDDING_T2
-            } else {
-                Congestion.NORMAL
-            }
-        Congestion.SHEDDING_T2 ->
-            if (utilGreater(state, t, SHARD_UTIL_ENTER_T1_NUM, SHARD_UTIL_ENTER_T1_DEN) ||
-                trendGreater(state, SHARD_TREND_ENTER_T1_NUM, SHARD_TREND_ENTER_T1_DEN)
-            ) {
-                Congestion.SHEDDING_T1
-            } else if (utilLess(state, t, SHARD_UTIL_EXIT_T2_NUM, SHARD_UTIL_EXIT_T2_DEN) &&
-                trendLess(state, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
-            ) {
-                Congestion.NORMAL
-            } else {
-                Congestion.SHEDDING_T2
-            }
-        Congestion.SHEDDING_T1 ->
-            if (utilGreater(state, t, SHARD_UTIL_ENTER_SPATIAL_NUM, SHARD_UTIL_ENTER_SPATIAL_DEN) ||
-                trendGreater(state, SHARD_TREND_ENTER_SPATIAL_NUM, SHARD_TREND_ENTER_SPATIAL_DEN)
-            ) {
-                Congestion.SHEDDING_SPATIAL
-            } else if (utilLess(state, t, SHARD_UTIL_EXIT_T1_NUM, SHARD_UTIL_EXIT_T1_DEN) &&
-                trendLess(state, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
-            ) {
-                Congestion.SHEDDING_T2
-            } else {
-                Congestion.SHEDDING_T1
-            }
-        Congestion.SHEDDING_SPATIAL ->
-            if (utilGreater(state, t, SHARD_UTIL_ENTER_KEY_ONLY_NUM, SHARD_UTIL_ENTER_KEY_ONLY_DEN) ||
-                trendGreater(state, SHARD_TREND_ENTER_KEY_ONLY_NUM, SHARD_TREND_ENTER_KEY_ONLY_DEN)
-            ) {
-                Congestion.KEY_ONLY
-            } else if (utilLess(state, t, SHARD_UTIL_EXIT_SPATIAL_NUM, SHARD_UTIL_EXIT_SPATIAL_DEN) &&
-                trendLess(state, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)
-            ) {
-                Congestion.SHEDDING_T1
-            } else {
-                Congestion.SHEDDING_SPATIAL
-            }
-        Congestion.KEY_ONLY ->
-            if (utilLess(state, t, SHARD_UTIL_EXIT_KEY_ONLY_NUM, SHARD_UTIL_EXIT_KEY_ONLY_DEN) &&
-                trendLess(state, SHARD_TREND_EXIT_KEY_ONLY_NUM, SHARD_TREND_EXIT_KEY_ONLY_DEN)
-            ) {
-                Congestion.SHEDDING_SPATIAL
-            } else {
-                Congestion.KEY_ONLY
-            }
-    }
-    if (nextPhase == state.congestion) {
-        return ShardStepResult(state, emptyList())
-    }
+private fun withEncoderTiers(state: ShardState): ShardStepResult {
+    val targets = mutableListOf<Long>()
+    for (sub in state.subscriptions) { if (!targets.contains(sub.targetId)) targets.add(sub.targetId) }
+    targets.sort()
+    val nextTiers = mutableListOf<EncoderTier>()
     val commands = mutableListOf<ShardCommand>()
-    if (nextPhase == Congestion.KEY_ONLY) {
-        // 過負荷を制御系へ知らせる。接続は閉じない。
-        commands.add(ShardCommand.Notify(Errors.E_NODE_OVERLOADED_CLOSE_CODE))
+    for (targetId in targets) {
+        var tier = 0L
+        for (sub in state.subscriptions) { if (sub.targetId == targetId && sub.maxSpatialId > tier) tier = sub.maxSpatialId }
+        nextTiers.add(EncoderTier(targetId, tier))
+        val previous = state.encoderTiers.find { it.targetId == targetId }
+        if (previous == null || previous.tier != tier) commands.add(ShardCommand.SetTier(targetId, tier))
     }
-    return ShardStepResult(state.copy(congestion = nextPhase, congestionEnteredAt = t), commands)
+    return ShardStepResult(state.copy(encoderTiers = nextTiers), commands)
+}
+
+private val subscriptionOrder: Comparator<Subscription> =
+    compareBy<Subscription> { it.subscriberId }.thenBy { it.targetId }.thenBy { it.channel }
+
+private fun handleAck(state: ShardState, event: ShardEvent.Ack, t: Long): ShardStepResult {
+    val target = state.subscriptions.find {
+        it.subscriberId == event.from && it.targetId == event.to && it.channel == event.ch
+    }
+    if (target == null) return ignoreEvent(state, "ack")
+    if (event.sid != target.windowSid) return ignoreEvent(state, "ack")
+    val highestAcked = if (event.highestSeq > target.highestAcked) event.highestSeq else target.highestAcked
+    val updated = target.copy(highestAcked = highestAcked, lastAckAtMs = t, stalled = false)
+    val subs = (state.subscriptions.filter { it !== target } + updated).sortedWith(subscriptionOrder)
+    return evaluateAll(state.copy(subscriptions = subs), t)
+}
+
+private fun handleStreamAnnounce(state: ShardState, event: ShardEvent.StreamAnnounce, t: Long): ShardStepResult {
+    val rungs = event.rungs.sortedBy { it.sid }
+    val rest = state.ladders.filter { !(it.from == event.from && it.ch == event.ch) }
+    val ladder = Ladder(from = event.from, ch = event.ch, rungs = rungs, announced = true)
+    return evaluateAll(state.copy(ladders = (rest + ladder).sortedWith(ladderOrder)), t)
+}
+
+private fun observeLadder(state: ShardState, event: ShardEvent.Media): ShardState {
+    if (isAudioChannel(event.ch)) return state
+    val existing = findLadder(state, event.from, event.ch)
+    if (existing != null) {
+        if (existing.announced || existing.rungs.any { it.sid == event.sid }) return state
+        val rungs = (existing.rungs + observedRung(event.sid)).sortedBy { it.sid }
+        val rest = state.ladders.filter { !(it.from == event.from && it.ch == event.ch) }
+        return state.copy(ladders = (rest + existing.copy(rungs = rungs)).sortedWith(ladderOrder))
+    }
+    val created = Ladder(event.from, event.ch, listOf(observedRung(event.sid)), false)
+    return state.copy(ladders = (state.ladders + created).sortedWith(ladderOrder))
+}
+
+private fun observedRung(sid: Long): LadderRung = LadderRung(sid, 0L, 0L, 0L, 0L, 0L)
+
+private fun findLadder(state: ShardState, from: Long, ch: Long): Ladder? =
+    state.ladders.find { it.from == from && it.ch == ch }
+
+private val ladderOrder: Comparator<Ladder> = compareBy<Ladder> { it.from }.thenBy { it.ch }
+
+private fun handleJoin(state: ShardState, id: Long): ShardStepResult {
+    if (state.participants.contains(id)) return ShardStepResult(state, emptyList())
+    return ShardStepResult(state.copy(participants = (state.participants + id).sorted()), emptyList())
+}
+
+private fun handleLeave(state: ShardState, id: Long): ShardStepResult {
+    return withEncoderTiers(state.copy(
+        participants = state.participants.filter { it != id },
+        subscriptions = state.subscriptions.filter { it.subscriberId != id && it.targetId != id },
+        trends = state.trends.filter { it.subscriberId != id },
+        ladders = state.ladders.filter { it.from != id },
+        speakers = state.speakers.filter { it.senderId != id },
+        encoderTiers = state.encoderTiers.filter { it.targetId != id },
+        received = state.received.filter { it.from != id },
+    ))
+}
+
+private fun handleTimer(state: ShardState, t: Long): ShardStepResult {
+    val windowed = maybeResetWindow(state, t)
+    val stalled = detectAckTimeout(windowed, t)
+    val evaluated = evaluateAll(stalled.state, t)
+    // 上流（送信ノード）へ受信位置を返す。返さないと送信ノードの窓が開かない。
+    val acks = evaluated.state.received.map {
+        ShardCommand.AckUpstream(it.from, it.ch, it.sid, it.highestSeq)
+    }
+    return ShardStepResult(evaluated.state, stalled.commands + evaluated.commands + acks)
+}
+
+/** 受け取った位置を更新する。後戻りする値では更新しない。順序は from, ch, sid の昇順。 */
+private fun markReceived(state: ShardState, event: ShardEvent.Media): ShardState {
+    if (event.seq <= 0L) return state
+    val existing = state.received.firstOrNull {
+        it.from == event.from && it.ch == event.ch && it.sid == event.sid
+    }
+    if (existing != null && existing.highestSeq >= event.seq) return state
+    val rest = state.received.filter {
+        !(it.from == event.from && it.ch == event.ch && it.sid == event.sid)
+    }
+    val merged = (rest + ShardReceivedMark(event.from, event.ch, event.sid, event.seq))
+        .sortedWith(compareBy({ it.from }, { it.ch }, { it.sid }))
+    return state.copy(received = merged)
+}
+
+private fun detectAckTimeout(state: ShardState, t: Long): ShardStepResult {
+    val commands = mutableListOf<ShardCommand>()
+    val subs = mutableListOf<Subscription>()
+    for (sub in state.subscriptions) {
+        val outstanding = sub.highestSent > sub.highestAcked
+        if (!sub.stalled && !outstanding) {
+            // 未確認が無い間は時計を進める（ADR-0041）。
+            // 「無通信」と「無応答」を区別するため、未確認の媒体が無い購読は
+            // lastAckAtMs を現在時刻で更新する。
+            subs.add(sub.copy(lastAckAtMs = t))
+            continue
+        }
+        if (sub.stalled || t - sub.lastAckAtMs < ACK_TIMEOUT_MS) { subs.add(sub); continue }
+        subs.add(sub.copy(stalled = true))
+        commands.add(ShardCommand.Disconnect(sub.subscriberId))
+    }
+    return ShardStepResult(state.copy(subscriptions = subs), commands)
+}
+
+private fun handleBudget(state: ShardState, event: ShardEvent.Budget, t: Long): ShardStepResult =
+    evaluateAll(state.copy(budgetBytesPerSec = event.bytesPerSec), t)
+
+private fun handleReport(state: ShardState, event: ShardEvent.Report, t: Long): ShardStepResult {
+    val slope = delaySlope(event.delayUs)
+    val rest = state.trends.filter { it.subscriberId != event.from }
+    val updated = ReceiverTrend(event.from, slope.numerator, slope.denominator)
+    return evaluateAll(state.copy(trends = (rest + updated).sortedBy { it.subscriberId }), t)
+}
+
+private fun evaluateAll(state: ShardState, t: Long): ShardStepResult {
+    val commands = mutableListOf<ShardCommand>()
+    val subs = mutableListOf<Subscription>()
+    for (sub in state.subscriptions) {
+        val r = evaluateSubscription(state, sub, t)
+        subs.add(r.first); commands.addAll(r.second)
+    }
+    return ShardStepResult(state.copy(subscriptions = subs), commands)
+}
+
+private fun evaluateSubscription(state: ShardState, sub: Subscription, t: Long): Pair<Subscription, List<ShardCommand>> {
+    if (t - sub.congestionEnteredAt < SHEDDING_HYSTERESIS_MS) return Pair(sub, emptyList())
+    var next = sub.congestion
+    when (sub.congestion) {
+        Congestion.NORMAL -> {
+            if (fillGreater(state, sub, SHARD_UTIL_ENTER_T2_NUM, SHARD_UTIL_ENTER_T2_DEN) ||
+                trendGreater(state, sub, SHARD_TREND_ENTER_T2_NUM, SHARD_TREND_ENTER_T2_DEN)) next = Congestion.SHEDDING_T2
+        }
+        Congestion.SHEDDING_T2 -> {
+            if (fillGreater(state, sub, SHARD_UTIL_ENTER_T1_NUM, SHARD_UTIL_ENTER_T1_DEN) ||
+                trendGreater(state, sub, SHARD_TREND_ENTER_T1_NUM, SHARD_TREND_ENTER_T1_DEN)) next = Congestion.SHEDDING_T1
+            else if (fillLess(state, sub, SHARD_UTIL_EXIT_T2_NUM, SHARD_UTIL_EXIT_T2_DEN) &&
+                trendLess(state, sub, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)) next = Congestion.NORMAL
+        }
+        Congestion.SHEDDING_T1 -> {
+            if (fillGreater(state, sub, SHARD_UTIL_ENTER_SPATIAL_NUM, SHARD_UTIL_ENTER_SPATIAL_DEN) ||
+                trendGreater(state, sub, SHARD_TREND_ENTER_SPATIAL_NUM, SHARD_TREND_ENTER_SPATIAL_DEN)) next = Congestion.SHEDDING_SPATIAL
+            else if (fillLess(state, sub, SHARD_UTIL_EXIT_T1_NUM, SHARD_UTIL_EXIT_T1_DEN) &&
+                trendLess(state, sub, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)) next = Congestion.SHEDDING_T2
+        }
+        Congestion.SHEDDING_SPATIAL -> {
+            if (fillGreater(state, sub, SHARD_UTIL_ENTER_KEY_ONLY_NUM, SHARD_UTIL_ENTER_KEY_ONLY_DEN) ||
+                trendGreater(state, sub, SHARD_TREND_ENTER_KEY_ONLY_NUM, SHARD_TREND_ENTER_KEY_ONLY_DEN)) next = Congestion.KEY_ONLY
+            else if (fillLess(state, sub, SHARD_UTIL_EXIT_SPATIAL_NUM, SHARD_UTIL_EXIT_SPATIAL_DEN) &&
+                trendLess(state, sub, SHARD_TREND_EXIT_NUM, SHARD_TREND_EXIT_DEN)) next = Congestion.SHEDDING_T1
+        }
+        Congestion.KEY_ONLY -> {
+            if (fillLess(state, sub, SHARD_UTIL_EXIT_KEY_ONLY_NUM, SHARD_UTIL_EXIT_KEY_ONLY_DEN) &&
+                trendLess(state, sub, SHARD_TREND_EXIT_KEY_ONLY_NUM, SHARD_TREND_EXIT_KEY_ONLY_DEN)) next = Congestion.SHEDDING_SPATIAL
+        }
+    }
+    if (next == sub.congestion) return Pair(sub, emptyList())
+    val penalty = if (next == Congestion.SHEDDING_SPATIAL || next == Congestion.KEY_ONLY) 1L else 0L
+    val updated = sub.copy(congestion = next, congestionEnteredAt = t, tierPenalty = penalty)
+    val commands = mutableListOf<ShardCommand>()
+    if (penalty != sub.tierPenalty) {
+        // 購読者へ setTier を送ってはならない（ADR-0033）。段の変化は媒体の spatialId で伝わる。
+        commands.add(ShardCommand.KeyframeRequest(sub.targetId, sub.channel, chooseRung(state, updated)))
+    }
+    return Pair(updated, commands)
+}
+
+private fun fillGreater(state: ShardState, sub: Subscription, num: Long, den: Long): Boolean {
+    val framerate = framerateOf(state, sub)
+    if (framerate <= 0L) return false
+    val inFlight = inFlightFrames(sub, sub.highestSent)
+    return inFlight * 1000L * den > num * SEND_WINDOW_MS * framerate
+}
+
+private fun fillLess(state: ShardState, sub: Subscription, num: Long, den: Long): Boolean {
+    val framerate = framerateOf(state, sub)
+    if (framerate <= 0L) return num > 0L
+    val inFlight = inFlightFrames(sub, sub.highestSent)
+    return inFlight * 1000L * den < num * SEND_WINDOW_MS * framerate
+}
+
+private fun trendGreater(state: ShardState, sub: Subscription, num: Long, den: Long): Boolean {
+    val trend = state.trends.find { it.subscriberId == sub.subscriberId } ?: return false
+    return trend.numerator * den > num * trend.denominator
+}
+
+private fun trendLess(state: ShardState, sub: Subscription, num: Long, den: Long): Boolean {
+    val trend = state.trends.find { it.subscriberId == sub.subscriberId } ?: return true
+    return trend.numerator * den < num * trend.denominator
+}
+
+private fun notifyNodeOverload(state: ShardState, t: Long): ShardStepResult {
+    if (state.overloadNotified) return ShardStepResult(state, emptyList())
+    val elapsed = t - state.windowStartMs
+    if (elapsed <= 0L) return ShardStepResult(state, emptyList())
+    val messagesOver = state.sentMessagesInWindow * 1000L > NODE_MAX_OUT_MESSAGES_PER_SEC * elapsed
+    val bytesOver = state.sentBytesInWindow * 1000L > state.budgetBytesPerSec * elapsed
+    if (!messagesOver && !bytesOver) return ShardStepResult(state, emptyList())
+    return ShardStepResult(state.copy(overloadNotified = true), listOf(ShardCommand.Notify(Errors.E_NODE_OVERLOADED_CLOSE_CODE)))
+}
+
+private fun maybeResetWindow(state: ShardState, t: Long): ShardState {
+    if (t - state.windowStartMs >= SHARD_UTIL_WINDOW_MS) {
+        return state.copy(sentBytesInWindow = 0L, sentMessagesInWindow = 0L, windowStartMs = t, overloadNotified = false)
+    }
+    return state
+}
+
+/**
+ * 表に無いイベントの記録に 1 件加える。上限を超えたら古い側を捨てる（ADR-0034）。
+ * 上限が無いと記録が無制限に伸び、Durable Object の記憶（128 MB。F-006）を食う。
+ */
+private fun appendUnexpected(events: List<String>, name: String): List<String> {
+    val appended = events + name
+    val limit = MAX_UNEXPECTED_EVENTS.toInt()
+    return if (appended.size > limit) appended.subList(appended.size - limit, appended.size) else appended
 }

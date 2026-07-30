@@ -164,19 +164,6 @@ export function releaseSender(state: DecoderPoolState, senderId: number): Decode
   };
 }
 
-/** 特定のストリームだけを解放する。 */
-export function releaseStream(state: DecoderPoolState, senderId: number, channel: number): DecoderPoolResult {
-  if (find(state, senderId, channel) === undefined) {
-    return { state, actions: [] };
-  }
-  return {
-    state: {
-      ...state,
-      entries: state.entries.filter((entry) => !(entry.senderId === senderId && entry.channel === channel)),
-    },
-    actions: [{ kind: "close", senderId, channel }],
-  };
-}
 
 /**
  * 復号の失敗を受けた場合。キーフレーム待ちへ戻す。
