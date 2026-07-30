@@ -23,6 +23,7 @@ public object Errors {
     public const val E_AUTH_AUDIENCE_CLOSE_CODE: Long = 4022L
     public const val E_NODE_AUTH_CLOSE_CODE: Long = 4023L
     public const val E_FORBIDDEN_CLOSE_CODE: Long = 4024L
+    public const val E_HELLO_TIMEOUT_CLOSE_CODE: Long = 4025L
     public const val E_AUTH_ROOM_CLOSE_CODE: Long = 4022L
     public const val E_AUTH_KIND_CLOSE_CODE: Long = 4020L
     public const val E_RATE_LIMIT_MESSAGES_CLOSE_CODE: Long = 4030L

@@ -25,6 +25,7 @@ inline constexpr std::int64_t E_AUTH_EXPIRED_CLOSE_CODE = 4021;
 inline constexpr std::int64_t E_AUTH_AUDIENCE_CLOSE_CODE = 4022;
 inline constexpr std::int64_t E_NODE_AUTH_CLOSE_CODE = 4023;
 inline constexpr std::int64_t E_FORBIDDEN_CLOSE_CODE = 4024;
+inline constexpr std::int64_t E_HELLO_TIMEOUT_CLOSE_CODE = 4025;
 inline constexpr std::int64_t E_AUTH_ROOM_CLOSE_CODE = 4022;
 inline constexpr std::int64_t E_AUTH_KIND_CLOSE_CODE = 4020;
 inline constexpr std::int64_t E_RATE_LIMIT_MESSAGES_CLOSE_CODE = 4030;

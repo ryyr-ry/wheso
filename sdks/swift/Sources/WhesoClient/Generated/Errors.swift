@@ -22,6 +22,7 @@ public enum WhesoErrors {
     public static let E_AUTH_AUDIENCE_CLOSE_CODE: Int64 = 4022
     public static let E_NODE_AUTH_CLOSE_CODE: Int64 = 4023
     public static let E_FORBIDDEN_CLOSE_CODE: Int64 = 4024
+    public static let E_HELLO_TIMEOUT_CLOSE_CODE: Int64 = 4025
     public static let E_AUTH_ROOM_CLOSE_CODE: Int64 = 4022
     public static let E_AUTH_KIND_CLOSE_CODE: Int64 = 4020
     public static let E_RATE_LIMIT_MESSAGES_CLOSE_CODE: Int64 = 4030
