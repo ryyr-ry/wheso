@@ -777,7 +777,9 @@ test("**A/V 同期が規範の許容に収まる**（判定 D-1 に実測を与�
       spatialId: 0,
       temporalId: index % 3,
       temporalLayers: 3,
-      isKey: index === 0,
+      // **要求に応える。** 受け手は連番の飛びを見るとキーフレームを待つ（ADR-0049）。
+      // 応えないと、1 度の破棄で以後 1 枚も提示されず、対が揃わない。
+      isKey: index === 0 || a.takeKeyframeRequest(),
       captureTimestampUs: captureUs,
       payload: new Uint8Array([index, 0x11, 0x22]),
     });
