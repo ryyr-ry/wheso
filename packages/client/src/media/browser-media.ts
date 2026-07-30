@@ -49,6 +49,13 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
   // 提示の門。映像だけに使う（音声は待たせない）。
   const gate = createPresentGate({ now: options.now, scheduleAt: options.scheduleAt });
   const videos = new Map<string, VideoEntry>();
+  /**
+   * 復号器ごとに、**最後に渡した枠の取得時刻**（マイクロ秒）。
+   *
+   * 復号器を作り直したとき、古い実体の枠が新しい実体の出力より後に出てくる。後戻りを
+   * 渡さないための印である（受入条件 A-3）。購読を捨てるときに忘れる。
+   */
+  const presentedUs = new Map<string, number>();
   const audio = createAudioSink();
 
   const videoDecoderCtor = Reflect.get(globalThis, "VideoDecoder");
@@ -93,6 +100,9 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
     closeDecoder: (senderId, channel): void => {
       // 順序の記録も捨てる。残すと退出した相手の予定時刻に縛られる。
       gate.release(senderId);
+      // **作り直し（ADR-0047）では消さない。** 消すと古い実体の枠を再び通してしまう。
+      // ここは購読を捨てる経路であり、相手が入り直したときに取得時刻が戻り得る。
+      presentedUs.delete(keyOf(senderId, channel));
       closeVideo(videos, keyOf(senderId, channel));
     },
 
@@ -161,6 +171,21 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
     const decoder = construct(videoDecoderCtor, [
       {
         output: (frame: DecodedFrame): void => {
+          // **描画は後戻りしない**（受入条件 A-3）。
+          //
+          // 復号器を作り直すとき（復号の失敗の後。ADR-0047）、古い実体が抱えていた枠が
+          // 新しい実体の出力より後に出てくることがある。そのまま渡すと画が巻き戻る
+          // （実測: 段 E で「260 の次に 259」「899 の次に 891」）。取得時刻が前へ
+          // 進んでいないものは捨てる。**枠は必ず閉じる**（閉じないと資源が尽きる）。
+          const stamp = frameTimestampUs(frame);
+          const seen = presentedUs.get(key);
+          if (stamp !== undefined && seen !== undefined && stamp <= seen) {
+            closeFrame(frame);
+            return;
+          }
+          if (stamp !== undefined) {
+            presentedUs.set(key, stamp);
+          }
           options.onFrame(senderId, frame);
           // **`VideoFrame` は明示的に閉じる。** 閉じないと復号器の資源が尽き、
           // 数百枚で復号が止まる（WebCodecs の要件）。利用側は同期に使い終える。
@@ -189,6 +214,20 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
 }
 
 /** `VideoFrame` / `AudioData` を明示的に閉じる。閉じないと資源が漏れる。 */
+/**
+ * 復号できた枠の取得時刻（マイクロ秒）を読む。読めなければ `undefined`。
+ *
+ * **型定義を信用しない**（AGENTS 5.4 の 3）。実行環境によっては `timestamp` を持たない
+ * 実装があり得るため、数であることを実行時に確かめる。
+ */
+function frameTimestampUs(frame: unknown): number | undefined {
+  if (typeof frame !== "object" || frame === null) {
+    return undefined;
+  }
+  const value: unknown = Reflect.get(frame, "timestamp");
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function closeFrame(frame: unknown): void {
   callMethod(frame, "close", []);
 }

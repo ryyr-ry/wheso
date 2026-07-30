@@ -169,6 +169,64 @@ test("**連番の飛びを見たら復号へ渡さず、キーフレームを要
   assert.ok(state.decoders.entries.length > 0);
 });
 
+test("**遅れて届いた古いユニットを復号へ渡さない**（受入条件 A-3）", () => {
+  // 予備の接続へ切り替えたときや張り直したときに、上流が自分の位置から送り直す。
+  // 既に描いた番号より古いものを渡すと描画が巻き戻り、参照先も既に置き換わっている。
+  const clock = { ms: 1000 };
+  const { deps, log } = recorder(clock);
+  let state = createPipeline(4, clock.ms);
+  state = handleMedia(state, mediaBytes({ key: true, seq: 100, captureUs: 0 }), deps);
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 101, captureUs: 66_000 }), deps);
+  assert.equal(log.decoded.length, 2);
+
+  // 100 番台を描いた後に 99 が届く（切替で送り直された）。
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 99, captureUs: 33_000 }), deps);
+  assert.equal(log.decoded.length, 2, "**渡さない**（逆行させない）");
+
+  // 同じ番号が 2 度届いても渡さない（重複も A-3 の不合格である）。
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 101, captureUs: 66_000 }), deps);
+  assert.equal(log.decoded.length, 2, "重複も渡さない");
+
+  // 続きは通る（古いものを覚え直していない）。
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 102, captureUs: 132_000 }), deps);
+  assert.equal(log.decoded.length, 3, "前へ進むものは通る");
+
+  // **キーフレームは古い番号でも通す**（送り手が番号を作り直した場合に詰まらせない）。
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: true, seq: 5, captureUs: 198_000 }), deps);
+  assert.equal(log.decoded.length, 4, "キーフレームは自己完結しているため通す");
+});
+
+test("**連番が 2^32 で戻っても古いと読まない**（wire-format.md 1.2）", () => {
+  // 単純な大小比較だと巻き戻した直後に「古い」と読み、長い通話で映像が二度と出なくなる。
+  const clock = { ms: 1000 };
+  const { deps, log } = recorder(clock);
+  let state = createPipeline(4, clock.ms);
+  const last = 4_294_967_295;
+  state = handleMedia(state, mediaBytes({ key: true, seq: last - 1, captureUs: 0 }), deps);
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: false, seq: last, captureUs: 66_000 }), deps);
+  assert.equal(log.decoded.length, 2);
+
+  // 巻き戻して 1 へ戻る（0 は使わない）。飛びとしても逆行としても扱ってはならない。
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 1, captureUs: 132_000 }), deps);
+  assert.equal(log.decoded.length, 3, "巻き戻しの次を渡す");
+  clock.ms += 66;
+  const beforeTail = log.decoded.length;
+  const controlBefore = log.control.length;
+  state = handleMedia(state, mediaBytes({ key: false, seq: 2, captureUs: 198_000 }), deps);
+  assert.equal(
+    log.decoded.length,
+    4,
+    `その続きも渡す（前 ${String(beforeTail)} / 制御 ${JSON.stringify(log.control.slice(controlBefore))}）`,
+  );
+});
+
 test("連番が飛んでいなければ何もしない（誤検知しない）", () => {
   const clock = { ms: 1000 };
   const { deps, log } = recorder(clock);

@@ -35,6 +35,8 @@ export interface ObservedSentVideo {
   readonly isKey: boolean;
   readonly captureUs: number;
   readonly atMs: number;
+  /** ワイヤへ出た本文の大きさ（バイト）。無ければ 0。 */
+  readonly bytes?: number;
 }
 
 export interface ObservedSentAudio {
@@ -356,6 +358,17 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     }
   }
 
+  // **復号器へ渡せた枠の一覧**（受入条件 A-2 はこれで判定する）。提示の集合ではない:
+  // 出力が入れ替わったとき順序を守るために後戻りした枠を捨てるため（A-3）、提示だけを
+  // 見ると「参照が無い」と誤読する。
+  const decodedIndexes: number[] = [];
+  for (const entry of run.decoded) {
+    const frameIndex = indexByCapture.get(entry.captureUs);
+    if (frameIndex !== undefined) {
+      decodedIndexes.push(frameIndex);
+    }
+  }
+
   let droppedForNoAudio = 0;
   for (const entry of run.received) {
     const frameIndex = indexByCapture.get(entry.captureUs);
@@ -471,6 +484,7 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
       keyframeRequests: countRequestBursts(run.keyframeRequestAtMs),
       closures: fatal,
       arrived: arrivedIndexes,
+      decodedIndexes,
     },
     switches,
     judgedSent: sent.length,

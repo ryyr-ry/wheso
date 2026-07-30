@@ -74,6 +74,15 @@ export interface DegradeRecord {
    * received を使う（合成した記録で判定そのものを試験するときに使う）。
    */
   readonly arrived?: readonly number[];
+  /**
+   * 復号器へ渡せた frameIndex の一覧（分かる場合）。
+   *
+   * **依存構造の判定はここで行う**（受入条件 A-2）。参照が欠けたまま復号器へ渡すと画が
+   * 壊れる。提示の集合で判定してはならない: 復号器の出力が入れ替わったとき、順序を守る
+   * ために後戻りした枠を捨てる（A-3）。捨てた枠は「復号はできたが描かなかった」だけで
+   * あり、依存構造の違反ではない。
+   */
+  readonly decodedIndexes?: readonly number[];
 }
 
 export interface Violation {
@@ -390,7 +399,10 @@ export function judgeAvSkew(
  * 判定には送信側の記録（層とキーフレームの旗）を使う。提示の記録は `frameIndex` で引く。
  */
 export function judgeDependencies(record: DegradeRecord): readonly Violation[] {
-  const presentedIndexes = new Set(record.received.map((entry) => entry.frameIndex));
+  // 復号器へ渡せた集合が分かるならそれを見る（分からない器では提示の集合で代用する）。
+  const presentedIndexes = new Set(
+    record.decodedIndexes ?? record.received.map((entry) => entry.frameIndex),
+  );
   const violations: Violation[] = [];
   /**
    * 層ごとの「直近に送られたフレーム」の位置と、それが提示されたか。

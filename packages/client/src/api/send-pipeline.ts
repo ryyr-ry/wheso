@@ -90,15 +90,25 @@ function nextSequence(
   const found = state.sequences.find((mark) => mark.channel === channel && mark.spatialId === spatialId);
   const value = found === undefined ? 1 : found.next;
   const rest = state.sequences.filter((mark) => !(mark.channel === channel && mark.spatialId === spatialId));
-  // **2^32 で 1 に戻る**（wire-format.md 1.2）。0 は使わない（未設定と区別できなくなる）。
-  // 巻き戻しを実装しないと、長時間の通話で `sequenceNumber` が u32 を超えて符号化に失敗し、
-  // 映像が止まる。切り詰めは `fixed.ts` の 1 箇所に置く。
-  const advanced = wrap32(value + 1);
-  const next = advanced === 0 ? 1 : advanced;
+  const next = advanceSequence(value);
   const merged = [...rest, { channel, spatialId, next }].sort((a, b) =>
     a.channel !== b.channel ? a.channel - b.channel : a.spatialId - b.spatialId,
   );
   return { value, state: { ...state, sequences: merged } };
+}
+
+/**
+ * `sequenceNumber` の次の値（wire-format.md 1.2）。
+ *
+ * **2^32 で 1 に戻る。0 は使わない**（未設定と区別できなくなる）。巻き戻しを実装しないと、
+ * 長時間の通話で u32 を超えて符号化に失敗し、映像が止まる。切り詰めは `fixed.ts` に任せる。
+ *
+ * **受信側の「飛びの検出」も同じ規則を使う。** 別々に書くと、巻き戻した瞬間に受信側が
+ * 「飛んだ」と誤読し、キーフレームを待って映像が止まる（実測: 単体試験で検出した）。
+ */
+export function advanceSequence(value: number): number {
+  const advanced = wrap32(value + 1);
+  return advanced === 0 ? 1 : advanced;
 }
 
 /** 送出したバイト数を計上する。窓が満了したら bits/sec を確定する。 */

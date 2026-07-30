@@ -26,7 +26,8 @@ import {
   OPUS_FRAME_MS,
   REPORT_INTERVAL_MS,
 } from "@wheso/core/src/generated/constants.ts";
-import { delaySlope } from "@wheso/core/src/fixed.ts";
+import { delaySlope, wrap32 } from "@wheso/core/src/fixed.ts";
+import { advanceSequence } from "./send-pipeline.ts";
 import {
   audioPresentAtMs,
   decidePresent,
@@ -195,6 +196,17 @@ export function createPipeline(maxDecoders: number, nowMs: number): PipelineStat
     skewSamplesMs: [],
     reportedSamples: -1,
   };
+}
+
+/**
+ * `sequenceNumber` の「新しいか」を巻き戻しに耐える形で比べる（wire-format.md 1.2）。
+ *
+ * 番号は 2^32 で 1 へ戻る。単純な大小比較では、戻った直後に「古い」と読んでしまい、
+ * **長い通話で映像が二度と出なくなる**。差を符号付き 32 bit として読むことで、
+ * 半周までの差を正しく扱える。切り詰めは `wrap32` の 1 箇所に任せる。
+ */
+function isNewerSeq(candidate: number, known: number): boolean {
+  return (wrap32(candidate - known) | 0) > 0;
 }
 
 function isAudio(channel: number): boolean {
@@ -375,15 +387,32 @@ function handleVideoUnit(
   const seenSeq = observationOf(next, senderId).lastVideoSeq.find(
     (entry) => entry.spatialId === unit.spatialId,
   );
-  const missed = seenSeq !== undefined && unit.sequenceNumber > seenSeq.seq + 1;
-  next = replaceObservation(next, {
-    ...observationOf(next, senderId),
-    lastVideoSeq: rememberSeq(
-      observationOf(next, senderId).lastVideoSeq,
-      unit.spatialId,
-      unit.sequenceNumber,
-    ),
-  });
+  const missed = seenSeq !== undefined && isNewerSeq(unit.sequenceNumber, advanceSequence(seenSeq.seq));
+  // **遅れて届いた古いユニットを渡してはならない**（受入条件 A-3）。
+  //
+  // 予備の接続へ切り替えたときや、接続を張り直したときに、上流が自分の位置から送り直す。
+  // すると既に描いた番号より古いものが後から届く。渡すと (1) 描画が巻き戻り（A-3 の逆行）、
+  // (2) 参照先の枠が既に置き換わっていて `Decoding error` になる（ADR-0047 で復号器が閉じる）。
+  // **キーフレームは例外である。** 自己完結しており、送り手が番号を作り直した場合
+  // （頁の再読込など）に受け取り続けられなくなるのを避ける。
+  const regressed =
+    seenSeq !== undefined &&
+    !isNewerSeq(unit.sequenceNumber, seenSeq.seq) &&
+    (unit.flags & FLAG_KEY) === 0;
+  if (regressed) {
+    return { ...next, reporter: recordVideoDrop(next.reporter) };
+  }
+  // 覚えるのは前へ進んだときだけである。古い番号を覚えると次の判定が壊れる。
+  if (seenSeq === undefined || isNewerSeq(unit.sequenceNumber, seenSeq.seq)) {
+    next = replaceObservation(next, {
+      ...observationOf(next, senderId),
+      lastVideoSeq: rememberSeq(
+        observationOf(next, senderId).lastVideoSeq,
+        unit.spatialId,
+        unit.sequenceNumber,
+      ),
+    });
+  }
   if (missed && (unit.flags & FLAG_KEY) === 0) {
     const gapResult = noteGap(next.decoders, senderId, channel);
     next = { ...next, decoders: gapResult.state, reporter: recordVideoDrop(next.reporter) };
@@ -504,7 +533,10 @@ function rememberSeq(
 ): readonly { readonly spatialId: number; readonly seq: number }[] {
   const rest = list.filter((entry) => entry.spatialId !== spatialId);
   const found = list.find((entry) => entry.spatialId === spatialId);
-  const kept = found !== undefined && found.seq > seq ? found.seq : seq;
+  // **大小ではなく「新しいか」で選ぶ。** 数の大小で選ぶと、2^32 で巻き戻した瞬間に
+  // 印が 0xFFFFFFFF に貼り付き、以後すべてが「飛び」に見えて映像が二度と出ない
+  // （実測: 単体試験で検出した）。
+  const kept = found !== undefined && !isNewerSeq(seq, found.seq) ? found.seq : seq;
   return [...rest, { spatialId, seq: kept }].sort((a, b) => a.spatialId - b.spatialId);
 }
 

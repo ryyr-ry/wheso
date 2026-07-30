@@ -307,6 +307,16 @@ test("**段 E: 再デプロイと切断を挟んでも送受信が続き、自�
 
   const senderRaw = asRecord(await sender.finished);
   const receiverRaw = asRecord(await receiver.finished);
+  // **節点の側の状態を、頁を閉じる前に読む。** 復旧しなかったとき、原因が
+  // 「クライアントが購読を送り直していない」のか「節点が上流を張れていない」のかは、
+  // 節点の購読表（`streams`）と上流の状態を見なければ区別できない。
+  const receiverNode = await nodeCounters(
+    liveRef.host,
+    meetingId,
+    "receiver",
+    "receiver",
+    `vr-${meetingId}-${USER_RECEIVER}`,
+  );
   await sender.tab.close();
   await receiver.tab.close();
   await sender.browser.close();
@@ -343,6 +353,7 @@ test("**段 E: 再デプロイと切断を挟んでも送受信が続き、自�
           return `${String(item["kind"])} 開 ${String(num(item["opened"]))} 閉 ${String(num(item["closed"]))} 最後 ${String(num(item["lastCode"]))}`;
         })
         .join(" / ")}` +
+      ` / 節点 ${receiverNode}` +
       ` / 戻れない切断 ${(built.record.closures ?? []).join(", ") || "なし"}` +
       ` / 戻れた切断 ${built.transientClosures.join(", ") || "なし"}\n`,
   );
@@ -407,21 +418,40 @@ test("**段 E: 再デプロイと切断を挟んでも送受信が続き、自�
   // 「対応する音声が無い」と言っても、それは同期の失敗ではなく経路の断である。規範の
   // 再生クロックも不連続として作り直す（ADR-0028、`noteAudio` の resync）。切断の時刻は
   // 試験が知っているため、その窓を外して測る。**外すのは D-1 だけ**である。
-  const outageFrom = dropDoneAtMs;
-  const outageTo = dropDoneAtMs + recoveredAfterMs + 3000;
-  const outsideOutage = (atMs: number): boolean => atMs < outageFrom || atMs > outageTo;
+  // **試験が起こした中断は 2 つある**（切断だけではない）。再デプロイは実行環境の全ノードを
+  // 作り直すため、同じだけ媒体が途切れる。**片方だけ外すと、外し忘れた側のずれが違反として
+  // 現れる**（実測: 再デプロイ直後の 1 組だけで D-1 が赤になった）。復旧に要した時間は
+  // 切断について測っているため、再デプロイ側は同じ幅を使う（どちらも全ノードの作り直しで
+  // ある）。3 秒はクロックの作り直しが落ち着くまでの余裕である（ADR-0028）。
+  const settleMs = recoveredAfterMs + 3000;
+  const interruptions: readonly { readonly from: number; readonly to: number }[] = [
+    { from: redeployAtMs, to: redeployDoneAtMs + settleMs },
+    { from: dropDoneAtMs, to: dropDoneAtMs + settleMs },
+  ];
+  // **音声の側を間引いてはならない。** D-1 は「映像 1 枚に対応する音声が鳴ったか」を見る。
+  // 両方を同じ窓で間引くと、窓の外の映像に対応する音声だけが消え、**健全な組が違反として
+  // 現れる**（実測: 中断の境目で frameIndex 321〜330 の 10 組が「音声が無い」と読まれた）。
+  // 判定するのは映像の側だけを間引き、対応先の音声は全部残す。境目の組も外れるように、
+  // 映像の窓は前後へ `settleMs` ぶん広げる。
   const syncRecord = {
     ...built.record,
-    presentedVideo: (built.record.presentedVideo ?? []).filter((entry) => outsideOutage(entry.atMs)),
-    playedAudio: (built.record.playedAudio ?? []).filter((entry) => outsideOutage(entry.atMs)),
+    presentedVideo: (built.record.presentedVideo ?? []).filter(
+      (entry) =>
+        !interruptions.some(
+          (window) => entry.atMs >= window.from - settleMs && entry.atMs <= window.to + settleMs,
+        ),
+    ),
   };
   const skew = judgeAvSkew(syncRecord, AV_SKEW_AUDIO_LEAD_MAX_MS, AV_SKEW_AUDIO_LAG_MAX_MS);
   assert.deepEqual(
     skew.map((entry) => `${entry.judgement}: ${entry.detail}`),
     [],
-    `切断の窓の外では音声と映像のずれが許容の内側である（対 ${String(
+    `中断の窓の外では音声と映像のずれが許容の内側である（対 ${String(
       syncRecord.presentedVideo?.length ?? 0,
-    )} 組）`,
+    )} 組・違反 ${String(skew.length)} 件・最初の 3 件 ${skew
+      .slice(0, 3)
+      .map((entry) => entry.detail)
+      .join(" / ")}）`,
   );
 
   const drops = violations.filter((entry) => entry.judgement === "B-2");

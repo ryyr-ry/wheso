@@ -149,6 +149,31 @@ test("**A-2: 低い層を落としたまま高い層を描いたら違反であ�
   assert.equal(violations[0]?.judgement, "A-2");
 });
 
+test("**A-2 は復号できた集合で判定する**（提示の集合ではない）", () => {
+  // 復号器の出力が入れ替わったとき、順序を守るために後戻りした枠を捨てる（A-3）。
+  // 捨てた枠は「復号はできたが描かなかった」だけであり、依存構造の違反ではない。
+  const base = healthyRecord(30);
+  const layerOne = base.sent.find((entry) => !entry.isKey && entry.temporalId === 1);
+  assert.ok(layerOne !== undefined);
+  const dropped = base.sent.find((entry) => entry.frameIndex === layerOne.frameIndex - 1);
+  assert.ok(dropped !== undefined, "1 つ前の枠がある");
+
+  // 提示からは落ちているが、復号器へは渡せていた記録。
+  const record = {
+    ...base,
+    received: base.received.filter((entry) => entry.frameIndex !== dropped.frameIndex),
+    decodedIndexes: base.received.map((entry) => entry.frameIndex),
+  };
+  assert.deepEqual(judgeDependencies(record), [], "復号できていれば違反ではない");
+
+  // 復号器へも渡っていなければ違反である。
+  const missing = {
+    ...record,
+    decodedIndexes: record.decodedIndexes.filter((index) => index !== dropped.frameIndex),
+  };
+  assert.ok(judgeDependencies(missing).length > 0, "復号できていなければ違反である");
+});
+
 test("A-2: 健全な記録では違反が無い", () => {
   assert.deepEqual(judgeDependencies(healthyRecord(30)), []);
   // 最上位の層だけを落とした記録も有効である（破棄可能であり参照されない）。

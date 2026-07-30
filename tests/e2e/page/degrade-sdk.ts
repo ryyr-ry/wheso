@@ -46,6 +46,8 @@ interface SentVideo {
   readonly isKey: boolean;
   readonly captureUs: number;
   readonly atMs: number;
+  /** ワイヤへ出た本文の大きさ（バイト）。申告ビットレートとの比較に使う。 */
+  readonly bytes: number;
 }
 
 /** 送った音声ユニット 1 件。映像との対応付けは取得時刻で行う（送信側の真実）。 */
@@ -520,6 +522,7 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
                 isKey: (unit.flags & FLAG_KEY) !== 0,
                 captureUs: Number(unit.captureTimestampUs),
                 atMs: recorder.lastSentAtMs,
+                bytes: unit.payload.length,
               });
             }
           }
