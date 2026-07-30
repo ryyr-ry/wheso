@@ -47,9 +47,21 @@ export function createPresentGate(deps: PresentGateDeps): PresentGate {
       const ordered = previous === undefined || presentAtMs > previous ? presentAtMs : previous + 1;
       const waitMs = ordered - now;
       if (waitMs > MAX_WAIT_MS) {
-        // 予定が遠すぎる。写像が壊れている可能性がある。待たずに渡す（映像を止めない）。
-        lastAtMs.set(senderId, now);
-        run();
+        // 予定が遠すぎる。対応付けを作り直した直後は、まだ経路にある古い映像が未来へ
+        // 写ることがある（実測: 予定が 2.5 秒先になった）。**待たずに出すが、順序は守る。**
+        //
+        // 以前はここで `lastAtMs` を現在時刻に落として直ちに渡していた。すると、先に
+        // 予約済みの（より早い予定の）フレームより前に出てしまい、**復号器へ入る順序が
+        // 入れ替わる**。実測では判定 A-3（frameIndex の逆行）と判定 C-1（描画の間隔が
+        // 4.8 秒）が同時に出た。間隔が実際より長く見えたのは、順序が入れ替わった記録を
+        // そのまま差で測ったためである。
+        const immediate = previous === undefined || now > previous ? now : previous + 1;
+        lastAtMs.set(senderId, immediate);
+        if (immediate <= now) {
+          run();
+          return;
+        }
+        deps.scheduleAt(immediate, run);
         return;
       }
       lastAtMs.set(senderId, ordered);

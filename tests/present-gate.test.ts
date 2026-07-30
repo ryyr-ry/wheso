@@ -86,7 +86,30 @@ test("送信者が違えば互いに影響しない", () => {
   assert.deepEqual(order, ["b1", "a1"]);
 });
 
-test("予定が遠すぎるときは待たない（映像を止めない）", () => {
+test("**予定が遠すぎても順序を壊さない**（対応付けを作り直した直後）", () => {
+  // 対応付けを作り直すと、まだ経路にある古い映像が未来へ写ることがある（実測: 2.5 秒先）。
+  // そこで待たずに出すのは正しいが、**先に予約済みのフレームより前に出してはならない**。
+  // 出すと復号器へ入る順序が入れ替わり、判定 A-3（frameIndex の逆行）と判定 C-1（描画の
+  // 間隔）が同時に出る（実測: 間隔が 4.8 秒と読まれた）。
+  const c = clock(1000);
+  const gate = createPresentGate(c.deps);
+  const order: string[] = [];
+  // 1 枚目は 500 ms 先に予約される（待つ）。
+  gate.submit(1, 1500, () => order.push("待つ"));
+  assert.deepEqual(order, [] as readonly string[], "まだ出ない");
+  assert.equal(c.pending.length, 1, "予約されている");
+
+  // 2 枚目は写像の作り直しで 5 秒先になった。待たないが、1 枚目より後でなければならない。
+  gate.submit(1, 1000 + 5000, () => order.push("遠い"));
+  assert.deepEqual(order, [] as readonly string[], "**1 枚目を追い越さない**");
+  assert.equal(c.pending.length, 2, "順序を保つため予約する");
+
+  // 時計を進めると、予約された順に出る。
+  c.advanceTo(1600);
+  assert.deepEqual(order, ["待つ", "遠い"], "予約の順に出る");
+});
+
+test("予定が遠すぎるとき、先行が無ければ直ちに渡す（映像を止めない）", () => {
   const c = clock(1000);
   const gate = createPresentGate(c.deps);
   const order: number[] = [];

@@ -224,6 +224,7 @@ function readParticipant(value: unknown): ParticipantView {
           temporalId: num(item["temporalId"]),
           isKey: item["isKey"] === true,
           atMs: num(item["atMs"]),
+          presentAtMs: num(item["presentAtMs"]),
         };
       }),
       playedAudio: list(record["playedAudio"]).map((entry) => {

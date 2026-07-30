@@ -69,6 +69,15 @@ interface DecodedVideo {
   readonly temporalId: number;
   readonly isKey: boolean;
   readonly atMs: number;
+  /**
+   * 提示の予定時刻（`DecodeInput.presentAtMs`）。
+   *
+   * **停止の原因を切り分けるために持つ。** `atMs − presentAtMs` は再生クロックから見た
+   * ずれ（`skewMs`）であり、これが大きく跳べば対応付けを作り直した合図である。予定が
+   * 未来なら提示の門が待つ（`sync/present-gate.ts`）。数が無いと、停止が経路のものか
+   * 同期の判断のものか区別できない。
+   */
+  readonly presentAtMs: number;
 }
 
 /** 再生待ち行列へ入れた音声 1 件。 */
@@ -437,6 +446,7 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
           temporalId: input.temporalId,
           isKey: input.key,
           atMs: Date.now(),
+          presentAtMs: input.presentAtMs,
         });
         base.media.decodeVideo(input);
       },

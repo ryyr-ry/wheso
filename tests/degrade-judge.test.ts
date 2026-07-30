@@ -95,6 +95,26 @@ test("C-1: 描画が止まった記録を検出する", () => {
   assert.equal(violations[0]?.judgement, "C-1");
 });
 
+test("**C-1 は記録の並びではなく時刻の順で間隔を測る**（逆行で間隔を誤らない）", () => {
+  // 提示の順序が入れ替わる不具合があると、記録の並びのままでは間隔が実際より長く見える。
+  // 実測: 真の最悪が 782 ms のところを 2,490 ms と読んだ（約 2.5 秒の逆行が 1 件）。
+  // 順序の異常は判定 A-3 が見る。C-1 は間隔だけを見る。
+  const base = healthyRecord(40);
+  const received = [...base.received];
+  const last = received[received.length - 1];
+  assert.ok(last !== undefined);
+  // 最後の 1 件を先頭付近へ移す。並びのまま測ると 2 秒を超える跳びが 2 度現れる。
+  received.splice(received.length - 1, 1);
+  received.splice(1, 0, last);
+  const spanMs = (received[received.length - 1]?.atMs ?? 0) - (received[0]?.atMs ?? 0);
+  assert.ok(spanMs > 1000, `記録の長さが 1 秒を超える（${String(spanMs)} ms）`);
+  assert.deepEqual(
+    judgeContinuity({ ...base, received, lastSentAtMs: 100_000 }, 1000),
+    [],
+    "並びを入れ替えても間隔の判定は変わらない",
+  );
+});
+
 test("C-1: 送信を止めた後の空白は違反にしない", () => {
   const base = healthyRecord(10);
   // 最後の受信だけが 3 秒後に来る。送信は既に終わっている。

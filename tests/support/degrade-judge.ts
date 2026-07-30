@@ -122,12 +122,17 @@ export function judgeHashes(record: DegradeRecord): readonly Violation[] {
 /**
  * 判定 C-1 / C-2: 連続する描画の間隔が上限を超えない。
  * 送信が終わった後の受信は評価に入れない（送信を止めれば描画も止まる）。
+ *
+ * **時刻の順に見る。** 記録は提示の順に並ぶが、順序が入れ替わる不具合があると、記録の
+ * 並びのままでは間隔が実際より長く見える（実測: 真の最悪が 782 ms のところを 2,490 ms と
+ * 読んだ。約 2.5 秒の逆行が 1 件あったためである）。順序の異常は判定 A-3 が見る。
+ * C-1 は**間隔だけ**を見る。
  */
 export function judgeContinuity(record: DegradeRecord, maxGapMs: number): readonly Violation[] {
   let previous: number | undefined;
   let worst = 0;
   let worstAt = 0;
-  for (const entry of record.received) {
+  for (const entry of [...record.received].sort((a, b) => a.atMs - b.atMs)) {
     if (entry.atMs > record.lastSentAtMs) {
       break;
     }

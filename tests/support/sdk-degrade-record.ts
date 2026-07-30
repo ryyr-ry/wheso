@@ -51,6 +51,8 @@ export interface ObservedDecoded {
   readonly temporalId: number;
   readonly isKey: boolean;
   readonly atMs: number;
+  /** 提示の予定時刻（`DecodeInput.presentAtMs`）。停止の切り分けに使う。 */
+  readonly presentAtMs?: number;
 }
 
 export interface ObservedPlayedAudio {
