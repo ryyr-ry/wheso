@@ -395,7 +395,8 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
       droppedForNoAudio += 1;
       continue;
     }
-    if (audioInterrupted(playedByCapture, entry.captureUs)) {
+    // **断の判定も対になる音声の取得時刻で行う**（映像の時刻ではない。上と同じ理由）。
+    if (audioInterrupted(playedByCapture, audioKey)) {
       // **音声の経路が途切れていた期間は同期を測らない。**
       //
       // 経路が切れている間、音声は流れない（届かないのであって捨てたのではない）。その期間の

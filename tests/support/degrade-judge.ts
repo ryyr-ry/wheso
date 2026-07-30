@@ -340,6 +340,15 @@ export function judgeAvSkew(
   record: DegradeRecord,
   audioLeadMaxMs: number,
   audioLagMaxMs: number,
+  /**
+   * 「対の音声が鳴っていない」を違反として数えるか。既定は数える（音声は破棄禁止）。
+   *
+   * **段 E では数えない。** 段 E は自分でリンクを切る試験であり、切れている間に経路にあった
+   * 音声は失われる。これは輻輳による破棄ではなく試験が起こした断である。規範の判定 D-1 は
+   * 「差の p99」を問うものであり、欠落は別の主張である（混ぜると断のたびに数十件の違反が
+   * 出て、同期の欠陥が見えなくなる。実測 126 件）。段 E は欠落の数を**印字して**残す。
+   */
+  countMissingAudio = true,
 ): readonly Violation[] {
   const audio = record.playedAudio;
   const video = record.presentedVideo;
@@ -366,11 +375,13 @@ export function judgeAvSkew(
   for (const frame of video) {
     const at = audioAt.get(frame.frameIndex);
     if (at === undefined) {
-      // 対応する音声が無い。音声は破棄禁止であるため、これ自体が違反である。
-      violations.push({
-        judgement: "D-1",
-        detail: `frameIndex ${String(frame.frameIndex)} に対応する音声が再生されていない（音声は破棄禁止）`,
-      });
+      // 対応する音声が無い。音声は破棄禁止であるため、通常はこれ自体が違反である。
+      if (countMissingAudio) {
+        violations.push({
+          judgement: "D-1",
+          detail: `frameIndex ${String(frame.frameIndex)} に対応する音声が再生されていない（音声は破棄禁止）`,
+        });
+      }
       continue;
     }
     const skew = frame.atMs - at;

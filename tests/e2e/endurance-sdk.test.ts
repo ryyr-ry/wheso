@@ -485,7 +485,28 @@ test("**段 E: 再デプロイと切断を挟んでも送受信が続き、自�
       return audioAt === undefined || !insideInterruption(audioAt);
     }),
   };
-  const skew = judgeAvSkew(syncRecord, AV_SKEW_AUDIO_LEAD_MAX_MS, AV_SKEW_AUDIO_LAG_MAX_MS);
+  // **欠落は数えない**（この試験は自分でリンクを切る。理由は `judgeAvSkew` の注記）。
+  // 代わりに数を印字して残す。
+  const audioAt = new Map<number, number>();
+  for (const entry of built.record.playedAudio ?? []) {
+    if (!audioAt.has(entry.frameIndex)) {
+      audioAt.set(entry.frameIndex, entry.atMs);
+    }
+  }
+  const missingAudio = (syncRecord.presentedVideo ?? []).filter(
+    (entry) => !audioAt.has(entry.frameIndex),
+  ).length;
+  process.stdout.write(
+    `段 E の同期: 組 ${String(syncRecord.presentedVideo?.length ?? 0)} / 音声の無い組 ${String(
+      missingAudio,
+    )}（試験が起こした断の分）\n`,
+  );
+  const skew = judgeAvSkew(
+    syncRecord,
+    AV_SKEW_AUDIO_LEAD_MAX_MS,
+    AV_SKEW_AUDIO_LAG_MAX_MS,
+    false,
+  );
   assert.deepEqual(
     skew.map((entry) => `${entry.judgement}: ${entry.detail}`),
     [],
