@@ -628,15 +628,40 @@ inline StepResult handle_display_size(const State& state, std::int64_t sender_id
 ///    連続したら RATE_PROBE_BPS を加える（上限を超えない）
 ///
 /// 0.85 は浮動小数点で計算しない。target * 17 / 20 の整数演算とし切り捨てる。
+/// いま望んでいる品質を全部受け取るのに要する量（bytes/sec）。
+///
+/// 規範 4.2 は加算的増加の上限を「現在のプロファイルの目標ビットレート」と定める。
+/// 購読が複数あるため、望む段（rung_cap_for）の申告ビットレートの合計を上限とする。
+/// 音声は段を持たないため、申告があるものをそのまま数える。
+///
+/// **観測した goodput を上限にしてはならない**（規範 4.1）。中継ノードは目標の分しか
+/// 転送しないため、goodput は目標を超えない。goodput で上限を作ると
+/// 「目標 ≤ goodput ≤ 目標」の輪が閉じ、目標は最低成立点から一生上がらない。
+inline std::int64_t desired_cost_bytes_per_sec(const State& state) {
+  std::int64_t bits = 0;
+  for (const StreamState& stream : state.streams) {
+    if (stream.phase != StreamPhase::Subscribed) continue;
+    if (is_audio(stream.channel)) {
+      bits += cost_of(state, stream, stream.spatial_id);
+      continue;
+    }
+    bits += cost_of(state, stream, rung_cap_for(state, stream));
+  }
+  const Result<std::int64_t> bytes = trunc_div(bits, 8);
+  return bytes.ok ? bytes.value : 0;
+}
+
 /// 観測した goodput。天井を押し上げ、目標を上げる方向にだけ使う（congestion.md 4.1）。
 inline StepResult handle_goodput(const State& state, std::int64_t bytes_per_sec) {
   if (bytes_per_sec <= 0) return StepResult{state, {}};
   const std::int64_t ceiling = bytes_per_sec > state.target_ceiling_bytes_per_sec
                                    ? bytes_per_sec
                                    : state.target_ceiling_bytes_per_sec;
-  const std::int64_t raised =
+  // 規範 4.1: available = max(goodput, 現在の目標レート)。天井で切らない。
+  // 中継ノードは目標の分しか転送しないため goodput は常に目標以下に留まる。
+  // ここで切ると目標は最低成立点から一生上がらない（実測で確認済み）。
+  const std::int64_t target =
       bytes_per_sec > state.target_bytes_per_sec ? bytes_per_sec : state.target_bytes_per_sec;
-  const std::int64_t target = raised > ceiling ? ceiling : raised;
   if (target == state.target_bytes_per_sec && ceiling == state.target_ceiling_bytes_per_sec) {
     return StepResult{state, {}};
   }
@@ -644,6 +669,18 @@ inline StepResult handle_goodput(const State& state, std::int64_t bytes_per_sec)
   next.target_bytes_per_sec = target;
   next.target_ceiling_bytes_per_sec = ceiling;
   return reallocate(next);
+}
+
+/// いまの目標が音声だけの状態の境界を跨いでいるか（ADR-0029 のヒステリシス）。
+///
+/// 跨いでいる場合だけ配分をやり直す。判定は reallocate と同じ式でなければならないため
+/// 回線の速度（目標 × 8）で見る。予算（9/10）で見ると余裕を二重に引くことになる。
+inline bool crosses_audio_only(const State& state) {
+  const std::int64_t link_bps = state.target_bytes_per_sec * 8;
+  const bool wanted = state.audio_only
+    ? link_bps < constants::AUDIO_ONLY_EXIT_BPS
+    : link_bps < constants::AUDIO_ONLY_ENTER_BPS;
+  return wanted != state.audio_only;
 }
 
 inline StepResult handle_report(const State& state, const std::vector<std::int64_t>& delay_us,
@@ -678,7 +715,16 @@ inline StepResult handle_report(const State& state, const std::vector<std::int64
     if (streak >= constants::RATE_RECOVER_STREAK) {
       const Result<std::int64_t> increment = trunc_div(constants::RATE_PROBE_BPS, 8);
       const std::int64_t raised = target + (increment.ok ? increment.value : 0);
-      target = raised > state.target_ceiling_bytes_per_sec ? state.target_ceiling_bytes_per_sec : raised;
+      // 上限は望む品質の申告ビットレートである（規範 4.2）。観測した goodput を
+      // 上限にすると輪が閉じて目標が上がらない。申告がまだ無い間は上限を作らない。
+      const std::int64_t declared = desired_cost_bytes_per_sec(state);
+      // 上限が最低成立点を下回ってはならない（ADR-0040）。最下段の申告は
+      // MIN_VIABLE_BPS より小さい。申告だけで切ると目標が最低成立点の下へ
+      // 押し戻され、AUDIO_ONLY の出入りを往復する（実測で振動した）。
+      const Result<std::int64_t> floor_for_cap = trunc_div(constants::MIN_VIABLE_BPS, 8);
+      const std::int64_t minimum = floor_for_cap.ok ? floor_for_cap.value : 0;
+      const std::int64_t cap = (declared > 0 && declared < minimum) ? minimum : declared;
+      target = (cap > 0 && raised > cap) ? cap : raised;
       streak = 0;
     }
   } else {
@@ -722,7 +768,26 @@ inline StepResult handle_report(const State& state, const std::vector<std::int64
     commands.push_back(make_keyframe_request(stream.sender_id, stream.channel, next_spatial));
   }
   after_rate.streams = streams;
-  return StepResult{after_rate, commands};
+  // 音声だけの状態の出入りだけをやり直す（規範 4.3、ADR-0029）。
+  //
+  // なぜ配分の全部をやり直さないか: reallocate は「買える最良の段」を選ぶため、
+  // 予算が潤沢な回線では遅延勾配による降格を直後に打ち消す（実測で降格の試験が
+  // 落ちた）。勾配は予算に現れない詰まりの予兆であり無かったことにしてはならない。
+  //
+  // なぜ音声だけの出入りはやり直すか: その判断は reallocate にしか無い。報告の
+  // 経路で呼ばなければ、回復の勾配がいくら続いても映像が戻らない。
+  if (target == state.target_bytes_per_sec) {
+    return StepResult{after_rate, commands};
+  }
+  if (!crosses_audio_only(after_rate)) {
+    return StepResult{after_rate, commands};
+  }
+  StepResult realloc_result = reallocate(after_rate);
+  std::vector<Command> merged = commands;
+  for (const Command& cmd : realloc_result.commands) {
+    merged.push_back(cmd);
+  }
+  return StepResult{realloc_result.state, merged};
 }
 
 /// 受信した位置を更新する。後戻りする値では更新しない。

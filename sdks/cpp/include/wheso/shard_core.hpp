@@ -86,6 +86,9 @@ struct Subscription {
   Congestion congestion = Congestion::Normal;
   std::int64_t congestion_entered_at = 0;
   std::int64_t tier_penalty = 0;
+  // 破棄不可のユニット（優先順位 4・5）を落とした段。落としていなければ −1。
+  // 規範 1.4: 順位 4・5 を破棄する場合は次の KEY まで連続して破棄する。
+  std::int64_t awaiting_key_sid = -1;
 };
 
 /// 受信者ごとの遅延勾配。分子と分母の整数対で持つ（ADR-0017）。
@@ -685,50 +688,25 @@ struct SubscriptionDecision {
   bool forward = false;
   /// 破棄として報告する優先順位。-1 は報告しないことを意味する。
   std::int64_t drop_priority = -1;
+  /// 送信者へキーフレームを要求するか（規範 1.4）。
+  /// 順位 4・5 を落としたときだけ真になる。1〜3 では立てない。
+  bool request_keyframe = false;
 };
 
-inline SubscriptionDecision decide_for_subscription(const State& state, const Subscription& sub,
-                                                    const Event& event,
-                                                    std::optional<std::int64_t> priority,
-                                                    std::int64_t t) {
-  // 1. ack が途絶えている → 渡さない
-  if (sub.stalled) {
-    return SubscriptionDecision{sub, false, -1};
+/// 破棄する。順位 4・5 なら次の KEY までの連続破棄を始め、キーフレームを要求する（規範 1.4）。
+/// 順位 1〜3（破棄可能なユニット）では連鎖を始めず、要求も作らない。
+inline SubscriptionDecision drop_with_chain(const Subscription& sub, const Event& event, std::int64_t priority) {
+  bool breaks_chain = (priority == 4 || priority == 5);
+  if (!breaks_chain) {
+    return SubscriptionDecision{sub, false, priority, false};
   }
+  Subscription updated = sub;
+  updated.awaiting_key_sid = event.sid;
+  return SubscriptionDecision{updated, false, priority, true};
+}
 
-  // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
-  // 本数は購読者ごとに決める。帯域が細い購読者へ多くの音声を送らないためである。
-  if (is_audio_channel(event.ch) && !is_audio_forwarded(state, sub, event.from, t)) {
-    // 輻輳による破棄ではないため priority は 0 とする（ADR-0024 の 5）。
-    return SubscriptionDecision{sub, false, 0};
-  }
-
-  // 音声は段を持たない。段の選択は映像のみ。
-  if (!is_audio_channel(event.ch)) {
-    // 2. 段の選択に合わない → 渡さない
-    std::int64_t chosen = choose_rung(state, sub);
-    if (event.sid != chosen) {
-      return SubscriptionDecision{sub, false, -1};
-    }
-    // 3. temporalId の超過 → 渡さない
-    if (event.tid > sub.max_temporal_id) {
-      return SubscriptionDecision{sub, false, -1};
-    }
-  }
-
-  bool must_forward = !priority.has_value();
-
-  // 4. 輻輳状態による破棄
-  if (!must_forward && should_drop_in_congestion(sub, event.tid, priority.value())) {
-    return SubscriptionDecision{sub, false, priority.value()};
-  }
-
-  // 5. 送信窓が閉じている
-  if (!must_forward && is_window_closed(state, sub, event.seq, event.ch)) {
-    return SubscriptionDecision{sub, false, priority.value()};
-  }
-
-  // 6. 渡す
+/// 転送する。段が変わっていれば窓を作り直す。
+inline SubscriptionDecision forward_decision(const State& state, const Subscription& sub, const Event& event) {
   std::int64_t chosen = is_audio_channel(event.ch) ? 0 : choose_rung(state, sub);
   if (chosen != sub.window_sid) {
     // 渡す段が変わった。seq の空間が変わるため窓を作り直す。
@@ -736,11 +714,71 @@ inline SubscriptionDecision decide_for_subscription(const State& state, const Su
     updated.window_sid = chosen;
     updated.highest_sent = event.seq;
     updated.highest_acked = event.seq - 1;
-    return SubscriptionDecision{updated, true, -1};
+    return SubscriptionDecision{updated, true, -1, false};
   }
   Subscription updated = sub;
   if (event.seq > sub.highest_sent) updated.highest_sent = event.seq;
-  return SubscriptionDecision{updated, true, -1};
+  return SubscriptionDecision{updated, true, -1, false};
+}
+
+inline SubscriptionDecision decide_for_subscription(const State& state, const Subscription& sub,
+                                                    const Event& event,
+                                                    std::optional<std::int64_t> priority,
+                                                    std::int64_t t) {
+  // 1. ack が途絶えている → 渡さない
+  if (sub.stalled) {
+    return SubscriptionDecision{sub, false, -1, false};
+  }
+
+  // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
+  // 本数は購読者ごとに決める。帯域が細い購読者へ多くの音声を送らないためである。
+  if (is_audio_channel(event.ch) && !is_audio_forwarded(state, sub, event.from, t)) {
+    // 輻輳による破棄ではないため priority は 0 とする（ADR-0024 の 5）。
+    return SubscriptionDecision{sub, false, 0, false};
+  }
+
+  // 音声は段を持たない。段の選択は映像のみ。
+  if (!is_audio_channel(event.ch)) {
+    // 2. 段の選択に合わない → 渡さない
+    std::int64_t chosen = choose_rung(state, sub);
+    if (event.sid != chosen) {
+      return SubscriptionDecision{sub, false, -1, false};
+    }
+    // 3. temporalId の超過 → 渡さない
+    if (event.tid > sub.max_temporal_id) {
+      return SubscriptionDecision{sub, false, -1, false};
+    }
+  }
+
+  bool must_forward = !priority.has_value();
+  bool is_key = (event.flags & static_cast<std::int64_t>(wire_layout::FLAG_KEY)) != 0;
+
+  // 参照連鎖が切れている間は、次の KEY まで落とし続ける（規範 1.4）。
+  // 順位 4・5 を 1 件落とした後に後続を渡すと、復号器は参照の無いフレームを受け取り
+  // 出力を止める。落とし続ければ復号器は「キーフレーム待ち」に入り、要求で復帰する。
+  if (!is_audio_channel(event.ch) && sub.awaiting_key_sid == event.sid) {
+    if (!is_key) {
+      // 落とす。要求は最初の 1 回で送っているため繰り返さない。
+      return SubscriptionDecision{sub, false, priority.has_value() ? priority.value() : -1, false};
+    }
+    // KEY が来た。参照連鎖が回復するため、待ちを解いて渡す。
+    Subscription cleared = sub;
+    cleared.awaiting_key_sid = -1;
+    return forward_decision(state, cleared, event);
+  }
+
+  // 4. 輻輳状態による破棄
+  if (!must_forward && should_drop_in_congestion(sub, event.tid, priority.value())) {
+    return drop_with_chain(sub, event, priority.value());
+  }
+
+  // 5. 送信窓が閉じている
+  if (!must_forward && is_window_closed(state, sub, event.seq, event.ch)) {
+    return drop_with_chain(sub, event, priority.value());
+  }
+
+  // 6. 渡す
+  return forward_decision(state, sub, event);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -800,6 +838,9 @@ inline StepResult handle_media(const State& state, const Event& event, std::int6
   std::vector<std::int64_t> targets;
   std::map<std::int64_t, std::int64_t> dropped;
   std::vector<Subscription> next_subscriptions;
+  // 参照連鎖が切れた購読が 1 つでもあれば、送信者へキーフレームを 1 度だけ要求する
+  // （規範 1.4）。購読ごとに出すと同じ要求が並ぶ。要求は段ごとに 1 件で足りる。
+  bool wants_keyframe = false;
 
   for (const Subscription& sub : windowed.subscriptions) {
     if (sub.target_id != event.from || sub.channel != event.ch) {
@@ -808,6 +849,9 @@ inline StepResult handle_media(const State& state, const Event& event, std::int6
     }
     SubscriptionDecision decision = decide_for_subscription(windowed, sub, event, priority, t);
     next_subscriptions.push_back(decision.subscription);
+    if (decision.request_keyframe) {
+      wants_keyframe = true;
+    }
     if (decision.forward) {
       targets.push_back(sub.subscriber_id);
     } else if (decision.drop_priority >= 0) {
@@ -827,6 +871,15 @@ inline StepResult handle_media(const State& state, const Event& event, std::int6
       drop.count = cnt;
       commands.push_back(drop);
     }
+  }
+  // 破棄の報告の後に置く（順序を固定しないとトレースの完全一致が壊れる）。
+  if (wants_keyframe) {
+    Command kf_req;
+    kf_req.kind = CommandKind::KeyframeRequest;
+    kf_req.target_id = event.from;
+    kf_req.channel = event.ch;
+    kf_req.spatial_id = event.sid;
+    commands.push_back(kf_req);
   }
 
   if (targets.empty()) {
@@ -885,6 +938,7 @@ inline StepResult handle_subscribe(const State& state, const Event& event, std::
   created.congestion = existing ? existing->congestion : Congestion::Normal;
   created.congestion_entered_at = existing ? existing->congestion_entered_at : t;
   created.tier_penalty = existing ? existing->tier_penalty : 0;
+  created.awaiting_key_sid = existing ? existing->awaiting_key_sid : -1;
   rest.push_back(created);
   std::sort(rest.begin(), rest.end(), subscription_less);
   State next = state;

@@ -107,11 +107,13 @@ export interface ReceiverState {
    */
   readonly recoverStreak: number;
   /**
-   * 目標ビットレートの上限（bytes/sec）。
+   * 観測した goodput の最大値（bytes/sec）。**観測であり、上限ではない。**
    *
-   * **観測した goodput の最大値である。** 固定値にしてはならない。
-   * 参加直後は最低（MIN_VIABLE_BPS 相当）から始め、実際に届いた量に応じて上げる
-   * （congestion.md 4.1: goodput は下限としてのみ使う）。
+   * 規範 4.1 は「goodput は下限としてのみ使う。上限の推定には使わない」と定める。
+   * この値で目標を切ってはならない。中継ノードは目標の分しか転送しないため、
+   * goodput は目標を超えず、切ると目標が最低成立点に張り付く（実測。`desiredCostBytesPerSec`
+   * の注記）。観測として持つのは、届いた量を観測項目として報告するためである
+   * （`observability.md`）。
    */
   readonly targetCeilingBytesPerSec: number;
   /** 表に無いイベントの記録。 */
@@ -326,8 +328,11 @@ function handleGoodput(state: ReceiverState, bytesPerSec: number): ReceiverStepR
   }
   const ceiling =
     bytesPerSec > state.targetCeilingBytesPerSec ? bytesPerSec : state.targetCeilingBytesPerSec;
-  const raised = bytesPerSec > state.targetBytesPerSec ? bytesPerSec : state.targetBytesPerSec;
-  const target = raised > ceiling ? ceiling : raised;
+  // 規範 4.1 は `available = max(goodput, 現在の目標レート)` と定める。**天井で切らない。**
+  // 天井は「これまでに見た最大の goodput」であり、中継ノードは目標の分しか転送しないため
+  // 常に目標以下に留まる。ここで切ると目標は最低成立点から一生上がらない（実測の記録は
+  // `desiredCostBytesPerSec` の注記にある）。
+  const target = bytesPerSec > state.targetBytesPerSec ? bytesPerSec : state.targetBytesPerSec;
   if (target === state.targetBytesPerSec && ceiling === state.targetCeilingBytesPerSec) {
     return { state, commands: [] };
   }
@@ -388,6 +393,36 @@ function rungCapFor(state: ReceiverState, stream: StreamState): number {
     }
   }
   return best === undefined ? top.sid : best.sid;
+}
+
+/**
+ * いま望んでいる品質を全部受け取るのに要する量（bytes/sec）。
+ *
+ * 規範 4.2 は加算的増加の上限を「**現在のプロファイルの目標ビットレート**」と定める。
+ * 購読が複数あるため、望む段（`rungCapFor`）の申告ビットレートの合計を上限とする。
+ * 音声は段を持たないため、申告があるものをそのまま数える。
+ *
+ * **観測した goodput を上限にしてはならない**（規範 4.1）。中継ノードは目標の分しか
+ * 転送しないため、goodput は目標を超えない。goodput で上限を作ると
+ * 「目標 ≤ goodput ≤ 目標」の輪が閉じ、**目標は最低成立点から一生上がらない**。
+ * 実測（2026-07-30、実環境・劣化なし）: 目標が 30,620 bytes/s（`MIN_VIABLE_BPS/8`）に
+ * 張り付き、中継ノードが基底層 417 件を含む 842 件を捨てた。送信は 1,342 件、
+ * 到着は 577 件だった。
+ */
+function desiredCostBytesPerSec(state: ReceiverState): number {
+  let bits = 0;
+  for (const stream of state.streams) {
+    if (stream.phase !== "SUBSCRIBED") {
+      continue;
+    }
+    if (isAudio(stream.channel)) {
+      bits += costOf(state, stream, stream.spatialId);
+      continue;
+    }
+    bits += costOf(state, stream, rungCapFor(state, stream));
+  }
+  const bytes = truncDiv(bits, 8);
+  return bytes.ok ? bytes.value : 0;
 }
 
 /** 段の費用（bits/sec）。申告が無ければ 0（費用不明なら予算を減らさない）。 */
@@ -635,8 +670,17 @@ function handleReport(
     if (streak >= RATE_RECOVER_STREAK) {
       const probeBytes = truncDiv(RATE_PROBE_BPS, 8);
       const raised = target + (probeBytes.ok ? probeBytes.value : 0);
-      // 観測した goodput の最大を超えて要求しない（congestion.md 4.1）。
-      target = raised > state.targetCeilingBytesPerSec ? state.targetCeilingBytesPerSec : raised;
+      // 上限は**望む品質の申告ビットレート**である（規範 4.2）。観測した goodput を
+      // 上限にすると輪が閉じて目標が上がらない（`desiredCostBytesPerSec` の注記）。
+      // 申告がまだ無い（カタログ未着）間は上限を作らない。知らないことは制約ではない。
+      const declared = desiredCostBytesPerSec(state);
+      // **上限が最低成立点を下回ってはならない**（ADR-0040）。最下段の申告（200 kbps）は
+      // `MIN_VIABLE_BPS`（音声を含む 244,960）より小さい。申告だけで切ると目標が
+      // 最低成立点の下へ押し戻され、`AUDIO_ONLY` の出入りを往復する（実測で振動した）。
+      const floorForCap = truncDiv(MIN_VIABLE_BPS, 8);
+      const minimum = floorForCap.ok ? floorForCap.value : 0;
+      const cap = declared > 0 && declared < minimum ? minimum : declared;
+      target = cap > 0 && raised > cap ? cap : raised;
       streak = 0;
     }
   } else {
@@ -687,7 +731,39 @@ function handleReport(
       spatialId: nextSpatial,
     });
   }
-  return { state: { ...afterRate, streams }, commands };
+  const stepped: ReceiverState = { ...afterRate, streams };
+  if (target === state.targetBytesPerSec) {
+    return { state: stepped, commands };
+  }
+  // **音声だけの状態の出入りだけをやり直す**（規範 4.3、ADR-0029）。
+  //
+  // なぜ配分の全部をやり直さないか: 段は輻輳の状態機械が 1 段ずつ動かす
+  // （`state-machines.md` 3 節）。`reallocate` は「買える最良の段」を選ぶため、予算が
+  // 潤沢な回線では**遅延勾配による降格を直後に打ち消してしまう**（実測: 降格の試験で
+  // 段が 2 から 1 へ下がらなくなった）。勾配は予算に現れない詰まりの予兆であり、
+  // 予算の都合で無かったことにしてはならない。
+  //
+  // なぜ音声だけの出入りはやり直すか: その判断は `reallocate` にしか無い。報告の経路で
+  // 呼ばなければ、回復の勾配がいくら続いても映像が戻らない（実測: 目標が 29,620 →
+  // 154,620 bytes/s まで回復しても `audioOnly` が true のままで、購読の命令が 1 件も
+  // 出なかった）。**音声だけの会議から二度と戻れない。**
+  if (!crossesAudioOnly(stepped)) {
+    return { state: stepped, commands };
+  }
+  const reallocated = reallocate(stepped);
+  return { state: reallocated.state, commands: [...commands, ...reallocated.commands] };
+}
+
+/**
+ * いまの目標が音声だけの状態の境界を跨いでいるか（ADR-0029 のヒステリシス）。
+ *
+ * 跨いでいる場合だけ配分をやり直す。判定は `reallocate` と同じ式でなければならないため、
+ * 回線の速度（目標 × 8）で見る。予算（9/10）で見ると余裕を二重に引くことになる。
+ */
+function crossesAudioOnly(state: ReceiverState): boolean {
+  const linkBps = state.targetBytesPerSec * 8;
+  const wanted = state.audioOnly ? linkBps < AUDIO_ONLY_EXIT_BPS : linkBps < AUDIO_ONLY_ENTER_BPS;
+  return wanted !== state.audioOnly;
 }
 
 /** メディアの転送。要求 tier を超えるユニットは転送しない。 */

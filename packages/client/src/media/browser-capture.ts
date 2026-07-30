@@ -124,6 +124,11 @@ export function browserCaptureDeps(): CaptureDeps {
   let audioEnabled = true;
   /** 次のフレームでキーフレームを要求する段。 */
   const keyframeWanted = new Set<number>();
+  /**
+   * 段ごとの「次に符号化器へ渡してよい時刻」（ミリ秒）。
+   * 申告 fps を超えて渡さないために持つ（`encodeFrame` の注記）。
+   */
+  const nextDueMs = new Map<number, number>();
   /** 取得したトラックの読み出しを止めるための取り消し。 */
   const stops: (() => void)[] = [];
 
@@ -349,17 +354,60 @@ export function browserCaptureDeps(): CaptureDeps {
    *
    * 段ごとに独立した符号化器へ同じフレームを渡す（simulcast。ADR-0004）。
    * 縮小は符号化器が行う（`configure` の width / height）。
+   *
+   * **申告した fps を超えて渡してはならない。**
+   *
+   * `VideoEncoder` の `framerate` は助言であり、投入した数がそのまま出る。取得の
+   * トラックは 30 fps で回るため、15 fps と申告した段へ全フレームを渡すと**申告の 2 倍**が
+   * ワイヤへ出る。中継ノードの送信窓は申告 fps から幅を決める
+   * （`inFlight × 1000 > SEND_WINDOW_MS × framerate`。congestion.md 2 節）ため、
+   * 2 倍の速さで届くと窓が閉じ、**基底層まで捨てられる**。
+   * 実測（2026-07-30、実環境・劣化なし）: 符号化 1,472 件のうちワイヤへ 1,342 件、
+   * 中継ノードが 842 件（うち優先度 4 が 417 件）を捨て、購読者へは 413 件しか届かなかった。
+   * 受信側は 1 枚おきに欠けた（判定 B-2 が 363 件）。
+   *
+   * 間隔は整数で数える。段ごとに「次に渡してよい時刻」を持ち、それより前のフレームは
+   * その段に渡さない（他の段には渡す。段ごとに fps が違う）。
    */
   function encodeFrame(frame: unknown): void {
     if (!videoEnabled) {
       closeFrame(frame);
       return;
     }
+    const nowMs = Date.now();
     for (const entry of videoEncoders.values()) {
+      if (!dueForRung(entry.spatialId, entry.framerate, nowMs)) {
+        continue;
+      }
       const wantKey = keyframeWanted.delete(entry.spatialId);
       callMethod(entry.encoder, "encode", [frame, { keyFrame: wantKey }]);
     }
     closeFrame(frame);
+  }
+
+  /**
+   * その段へこのフレームを渡してよいか。
+   *
+   * 申告 fps の間隔を空ける。**間隔は「前に渡した時刻」からではなく「予定の時刻」から
+   * 進める**（前者だと 1 回の遅れが累積し、実効 fps が申告より下がり続ける）。
+   * 予定が現在から 1 間隔以上遅れていれば現在に合わせ直す（停止からの復帰）。
+   */
+  function dueForRung(spatialId: number, framerate: number, nowMs: number): boolean {
+    if (framerate <= 0) {
+      return true;
+    }
+    const intervalMs = Math.trunc(1000 / framerate);
+    const planned = nextDueMs.get(spatialId);
+    if (planned === undefined) {
+      nextDueMs.set(spatialId, nowMs + intervalMs);
+      return true;
+    }
+    if (nowMs < planned) {
+      return false;
+    }
+    const advanced = planned + intervalMs;
+    nextDueMs.set(spatialId, advanced <= nowMs ? nowMs + intervalMs : advanced);
+    return true;
   }
 
   /** 音声のかたまりを符号化する。 */

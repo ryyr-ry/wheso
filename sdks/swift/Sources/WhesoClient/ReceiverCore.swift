@@ -300,6 +300,29 @@ private func highestRung(_ state: WhesoReceiverState, _ stream: WhesoStreamState
 
 // MARK: - budget と catalog
 
+/// 望む段の申告ビットレートの合計（bytes/sec）。
+///
+/// AIMD の回復上限に使う。中継ノードは目標の分しか転送しないため、観測した goodput を
+/// 上限にすると「目標 ≤ goodput ≤ 目標」の輪が閉じ目標が上がらない。
+/// カタログが未着（合計 0）のときは上限を作らない。知らないことは制約ではない。
+private func desiredCostBytesPerSec(_ state: WhesoReceiverState) -> Int64 {
+    var bits: Int64 = 0
+    for stream in state.streams {
+        if stream.phase != .subscribed {
+            continue
+        }
+        if isReceiverAudio(stream.channel) {
+            bits += costOf(state, stream, stream.spatialId)
+            continue
+        }
+        bits += costOf(state, stream, rungCapFor(state, stream))
+    }
+    if case .success(let value) = whesoTruncDiv(bits, 8) {
+        return value
+    }
+    return 0
+}
+
 /// 下り帯域の観測。天井を押し上げるだけに使う（congestion.md 4.1）。
 /// 観測した goodput。天井を押し上げ、目標を上げる方向にだけ使う（congestion.md 4.1）。
 private func handleGoodput(_ state: WhesoReceiverState, _ bytesPerSec: Int64) -> WhesoReceiverStepResult {
@@ -307,8 +330,11 @@ private func handleGoodput(_ state: WhesoReceiverState, _ bytesPerSec: Int64) ->
         return WhesoReceiverStepResult(state: state, commands: [])
     }
     let ceiling = bytesPerSec > state.targetCeilingBytesPerSec ? bytesPerSec : state.targetCeilingBytesPerSec
-    let raised = bytesPerSec > state.targetBytesPerSec ? bytesPerSec : state.targetBytesPerSec
-    let target = raised > ceiling ? ceiling : raised
+    // 規範 4.1: goodput は下限としてのみ使う。天井で切らない。
+    // 中継ノードは目標の分しか転送しないため、goodput は目標を超えない。
+    // ここで天井を適用すると「目標 ≤ goodput ≤ 目標」の輪が閉じ、
+    // 目標は最低成立点から一生上がらない（実測）。
+    let target = bytesPerSec > state.targetBytesPerSec ? bytesPerSec : state.targetBytesPerSec
     if target == state.targetBytesPerSec && ceiling == state.targetCeilingBytesPerSec {
         return WhesoReceiverStepResult(state: state, commands: [])
     }
@@ -490,11 +516,20 @@ private func handleDisplaySize(
 // MARK: - 報告と AIMD
 
 /// 遅延の報告。tier を 1 段動かし、target を AIMD で更新する。
+///
+/// 2 つの層がある（X-037）:
+/// 1. 状態機械: 遅延勾配が閾値を超えたら tier を 1 段下げ、回復したら 1 段上げる。
+/// 2. AIMD: target を劣化時に 0.85 倍し、回復 3 回連続で RATE_PROBE_BPS を加える。
 private func handleReport(
     _ state: WhesoReceiverState,
     _ delayUs: [Int64],
     _ t: Int64
 ) -> WhesoReceiverStepResult {
+    // 標本が 2 個未満では勾配が定まらない。定まらない値で AIMD を動かすと、
+    // 媒体が止まっている間も「劣化している」と読み続けて目標が潰れる（実測）。
+    if delayUs.count < 2 {
+        return WhesoReceiverStepResult(state: state, commands: [])
+    }
     let trend = whesoDelaySlope(delayUs)
     let degrading = trend.numerator * WhesoConstants.SHARD_TREND_ENTER_T2_DEN
         > WhesoConstants.SHARD_TREND_ENTER_T2_NUM * trend.denominator
@@ -532,7 +567,21 @@ private func handleReport(
                 increment = value
             }
             let raised = target + increment
-            target = raised > state.targetCeilingBytesPerSec ? state.targetCeilingBytesPerSec : raised
+            // 上限は望む品質の申告ビットレートである（規範 4.2）。
+            // 観測した goodput を上限にすると輪が閉じて目標が上がらない。
+            // 申告がまだ無い（カタログ未着）間は上限を作らない。
+            let declared = desiredCostBytesPerSec(state)
+            // 上限が最低成立点を下回ってはならない（ADR-0040）。最下段の申告は
+            // MIN_VIABLE_BPS より小さいため、申告だけで切ると目標が最低成立点の下へ
+            // 押し戻され AUDIO_ONLY の出入りを往復する（実測で振動した）。
+            let minimum: Int64
+            if case .success(let value) = whesoTruncDiv(WhesoConstants.MIN_VIABLE_BPS, 8) {
+                minimum = value
+            } else {
+                minimum = 0
+            }
+            let cap = (declared > 0 && declared < minimum) ? minimum : declared
+            target = cap > 0 && raised > cap ? cap : raised
             streak = 0
         }
     } else {
@@ -581,7 +630,45 @@ private func handleReport(
         ))
     }
     afterRate.streams = streams
-    return WhesoReceiverStepResult(state: afterRate, commands: commands)
+
+    // 目標が変わっていなければそのまま返す（従来どおり）。
+    if target == state.targetBytesPerSec {
+        return WhesoReceiverStepResult(state: afterRate, commands: commands)
+    }
+    // 音声だけの状態の境界を跨いでいる場合に限り reallocate を呼ぶ（ADR-0029）。
+    //
+    // なぜ配分の全部をやり直さないか: reallocate は「買える最良の段」を選ぶため、
+    // 予算が潤沢な回線では遅延勾配による降格を直後に打ち消してしまう（実測）。
+    // 勾配は予算に現れない詰まりの予兆であり、予算の都合で無かったことにしてはならない。
+    //
+    // なぜ音声だけの出入りはやり直すか: その判断は reallocate にしか無い。報告の経路で
+    // 呼ばなければ回復の勾配がいくら続いても映像が戻らない（実測: 目標が 29,620 →
+    // 154,620 bytes/s まで回復しても audioOnly が true のままだった）。
+    if !crossesAudioOnly(afterRate) {
+        return WhesoReceiverStepResult(state: afterRate, commands: commands)
+    }
+    let reallocated = reallocate(afterRate)
+    return WhesoReceiverStepResult(
+        state: reallocated.state,
+        commands: commands + reallocated.commands
+    )
+}
+
+// MARK: - 音声だけの状態の境界判定
+
+/// いまの目標が音声だけの状態の境界を跨いでいるか（ADR-0029 のヒステリシス）。
+///
+/// 跨いでいる場合だけ配分をやり直す。判定は reallocate と同じ式でなければならないため、
+/// 回線の速度（目標 × 8）で見る。予算（9/10）で見ると余裕を二重に引くことになる。
+private func crossesAudioOnly(_ state: WhesoReceiverState) -> Bool {
+    let linkBps = state.targetBytesPerSec * 8
+    let wanted: Bool
+    if state.audioOnly {
+        wanted = linkBps < WhesoConstants.AUDIO_ONLY_EXIT_BPS
+    } else {
+        wanted = linkBps < WhesoConstants.AUDIO_ONLY_ENTER_BPS
+    }
+    return wanted != state.audioOnly
 }
 
 // MARK: - メディア

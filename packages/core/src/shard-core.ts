@@ -19,7 +19,7 @@
  *    reset を繰り返して 1 枚も復号できない（ADR-0027）。
  */
 
-import { CHANNEL_AUDIO, CHANNEL_SCREEN_AUDIO, FLAG_ACTIVE_SPEAKER } from "./generated/wire-layout.ts";
+import { CHANNEL_AUDIO, CHANNEL_SCREEN_AUDIO, FLAG_ACTIVE_SPEAKER, FLAG_KEY } from "./generated/wire-layout.ts";
 import {
   ACK_TIMEOUT_MS,
   AUDIO_SELECTIVE_FORWARD_COUNT,
@@ -392,6 +392,18 @@ export interface Subscription {
    * （ADR-0027 の 4）。
    */
   readonly tierPenalty: number;
+  /**
+   * 破棄不可のユニット（優先順位 4・5）を落とした段。落としていなければ −1。
+   *
+   * **規範 1.4**: 順位 4 と 5 を破棄する場合は、デコーダの参照連鎖が壊れるため、
+   * **必ず同一 (senderId, channel, spatialId) の次の KEY ユニットまで連続して破棄し**、
+   * 受信者へ `keyframeRequest` を送る。
+   *
+   * これを持たないと、参照が欠けたフレーム列をそのまま渡すことになる。実測（実環境・
+   * 劣化なし）では復号器へ 613 件渡して出力が 148 枚しか得られず、`Decoding error` が
+   * 記録された。**送った側から見れば「届いている」のに、見る側では映像が出ない。**
+   */
+  readonly awaitingKeySid: number;
 }
 
 /**
@@ -593,6 +605,9 @@ function handleMedia(state: ShardState, event: MediaEvent, t: number): StepResul
   const targets: number[] = [];
   const dropped = new Map<number, number>();
   const nextSubscriptions: Subscription[] = [];
+  // 参照連鎖が切れた購読が 1 つでもあれば、送信者へキーフレームを 1 度だけ要求する
+  // （規範 1.4）。購読ごとに出すと同じ要求が並ぶ。要求は段ごとに 1 件で足りる。
+  let wantsKeyframe = false;
 
   for (const sub of marked.subscriptions) {
     if (sub.targetId !== event.from || sub.channel !== event.ch) {
@@ -601,6 +616,9 @@ function handleMedia(state: ShardState, event: MediaEvent, t: number): StepResul
     }
     const decision = decideForSubscription(marked, sub, event, priority, t);
     nextSubscriptions.push(decision.subscription);
+    if (decision.requestKeyframe) {
+      wantsKeyframe = true;
+    }
     if (decision.forward) {
       targets.push(sub.subscriberId);
       continue;
@@ -622,6 +640,10 @@ function handleMedia(state: ShardState, event: MediaEvent, t: number): StepResul
     if (count !== undefined && count > 0) {
       commands.push({ kind: "drop", priority: key, count });
     }
+  }
+  // 破棄の報告の後に置く（順序を固定しないとトレースの完全一致が壊れる）。
+  if (wantsKeyframe) {
+    commands.push({ kind: "keyframeRequest", for: event.from, channel: event.ch, spatialId: event.sid });
   }
 
   if (targets.length === 0) {
@@ -647,6 +669,13 @@ interface SubscriptionDecision {
   readonly forward: boolean;
   /** 破棄として報告する優先順位。報告しない場合は null。 */
   readonly dropPriority: number | null;
+  /**
+   * 送信者へキーフレームを要求するか（規範 1.4）。
+   *
+   * 順位 4・5 を落としたときだけ真になる。順位 1 から 3 のみで対処できる場合は
+   * **要求を発生させてはならない**（規範 1.4 の最後の段）。
+   */
+  readonly requestKeyframe: boolean;
 }
 
 /**
@@ -670,7 +699,7 @@ function decideForSubscription(
   t: number,
 ): SubscriptionDecision {
   if (sub.stalled) {
-    return { subscription: sub, forward: false, dropPriority: null };
+    return { subscription: sub, forward: false, dropPriority: null, requestKeyframe: false };
   }
 
   // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
@@ -680,30 +709,68 @@ function decideForSubscription(
   // 輻輳の段が深いほど本数を減らす。減らす順序は ADR-0024 の順位に従う。
   if (isAudioChannel(event.ch) && !isAudioForwarded(state, sub, event.from, t)) {
     // 輻輳による破棄ではないため priority は 0 とする（ADR-0024 の 5）。
-    return { subscription: sub, forward: false, dropPriority: 0 };
+    return { subscription: sub, forward: false, dropPriority: 0, requestKeyframe: false };
   }
 
   // 音声は段を持たない（spatialId は常に 0。wire-format.md 1.2）。段の選択は映像のみ。
   if (!isAudioChannel(event.ch)) {
     const chosen = chooseRung(state, sub);
     if (event.sid !== chosen) {
-      return { subscription: sub, forward: false, dropPriority: null };
+      return { subscription: sub, forward: false, dropPriority: null, requestKeyframe: false };
     }
     if (event.tid > sub.maxTemporalId) {
-      return { subscription: sub, forward: false, dropPriority: null };
+      return { subscription: sub, forward: false, dropPriority: null, requestKeyframe: false };
     }
   }
 
   const mustForward = priority === null;
+  const isKey = (event.flags & FLAG_KEY) !== 0;
+
+  // **参照連鎖が切れている間は、次の KEY まで落とし続ける**（規範 1.4）。
+  //
+  // 順位 4・5 を 1 件落とした後に後続を渡すと、復号器は参照の無いフレームを受け取り、
+  // 出力を止める。実測では復号器へ 613 件渡して出力は 148 枚、`Decoding error` が
+  // 記録された。落とし続ければ復号器は「キーフレーム待ち」に入り、要求で復帰する。
+  if (!isAudioChannel(event.ch) && sub.awaitingKeySid === event.sid) {
+    if (!isKey) {
+      // 落とす。要求は最初の 1 回で送っているため、ここでは繰り返さない
+      // （受信ノードの間隔制限が抑制するが、そもそも作らない方が良い）。
+      return { subscription: sub, forward: false, dropPriority: priority, requestKeyframe: false };
+    }
+    // KEY が来た。参照連鎖が回復するため、待ちを解いて渡す。
+    return forwardDecision(state, { ...sub, awaitingKeySid: -1 }, event);
+  }
 
   if (!mustForward && shouldDropInCongestion(sub, event, priority)) {
-    return { subscription: sub, forward: false, dropPriority: priority };
+    return dropWithChain(sub, event, priority);
   }
 
   if (!mustForward && isWindowClosed(state, sub, event)) {
-    return { subscription: sub, forward: false, dropPriority: priority };
+    return dropWithChain(sub, event, priority);
   }
 
+  return forwardDecision(state, sub, event);
+}
+
+/**
+ * 破棄する。順位 4・5 なら次の KEY までの連続破棄を始め、キーフレームを要求する（規範 1.4）。
+ * 順位 1 から 3（破棄可能なユニット）では連鎖を始めず、要求も作らない。
+ */
+function dropWithChain(sub: Subscription, event: MediaEvent, priority: number | null): SubscriptionDecision {
+  const breaksChain = priority === 4 || priority === 5;
+  if (!breaksChain) {
+    return { subscription: sub, forward: false, dropPriority: priority, requestKeyframe: false };
+  }
+  return {
+    subscription: { ...sub, awaitingKeySid: event.sid },
+    forward: false,
+    dropPriority: priority,
+    requestKeyframe: true,
+  };
+}
+
+/** 転送する。段が変わっていれば窓を作り直す。 */
+function forwardDecision(state: ShardState, sub: Subscription, event: MediaEvent): SubscriptionDecision {
   const chosen = isAudioChannel(event.ch) ? 0 : chooseRung(state, sub);
   if (chosen !== sub.windowSid) {
     // 渡す段が変わった。seq の空間が変わるため窓を作り直す。
@@ -712,6 +779,7 @@ function decideForSubscription(
       subscription: { ...sub, windowSid: chosen, highestSent: event.seq, highestAcked: event.seq - 1 },
       forward: true,
       dropPriority: null,
+      requestKeyframe: false,
     };
   }
   const highestSent = event.seq > sub.highestSent ? event.seq : sub.highestSent;
@@ -719,6 +787,7 @@ function decideForSubscription(
     subscription: { ...sub, highestSent },
     forward: true,
     dropPriority: null,
+    requestKeyframe: false,
   };
 }
 
@@ -969,6 +1038,7 @@ function handleSubscribe(state: ShardState, event: SubscribeEvent, t: number): S
     congestion: existing?.congestion ?? "NORMAL",
     congestionEnteredAt: existing?.congestionEnteredAt ?? t,
     tierPenalty: existing?.tierPenalty ?? 0,
+    awaitingKeySid: existing?.awaitingKeySid ?? -1,
   };
   return withEncoderTiers({
     ...state,

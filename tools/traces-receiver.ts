@@ -22,6 +22,7 @@ import {
 import {
   AUDIO_ONLY_ENTER_BPS,
   AUDIO_ONLY_EXIT_BPS,
+  RATE_RECOVER_STREAK,
   TRACE_FORMAT_VERSION,
   V_1080P30,
   V_360P15,
@@ -161,6 +162,31 @@ function generateReceiverEvents(seed: bigint, steps: number): readonly ReceiverE
   for (let i = 0; i < 20; i += 1) {
     rising.push(10_000 + i * 60_000);
     falling.push(1_200_000 - i * 60_000);
+  }
+
+  /**
+   * **回復で音声だけの状態から戻ることを覆う決まった列**（規範 4.1・4.2・4.3、ADR-0029）。
+   *
+   * なぜ決まった列を先に置くか: 無作為の列では `budget` が大きな値を運び、観測の天井が
+   * 早々に大きくなるため、「天井で切るか、申告ビットレートで切るか」の違いが 1 度も
+   * 現れない。実際にこの穴があり、**goodput を上限にする誤り（目標が最低成立点に
+   * 張り付く）と、AIMD の結果を配分へ反映しない誤り（音声だけから戻れない）を
+   * 6 言語のトレース照合が 1 件も検出できなかった**。
+   *
+   * なぜこの順序か: トレースは**命令の列**を突き合わせる。目標が変わっても買える段が
+   * 変わらなければ命令は同じであり、違いが現れない。音声だけの状態は境界がはっきりして
+   * いる（`AUDIO_ONLY_ENTER_BPS` / `AUDIO_ONLY_EXIT_BPS`）ため、戻るときに必ず
+   * `subscribeChange` が出る。
+   *
+   *   1. 予算を `AUDIO_ONLY_ENTER_BPS` の下へ落とす → 映像の購読を落とす
+   *   2. 小さな goodput を観測させる（天井を小さくする）
+   *   3. 回復を連続させる → 規範どおりなら目標が増え、`AUDIO_ONLY_EXIT_BPS` を超えて
+   *      映像が戻る。goodput を上限とする実装では戻らない
+   */
+  events.push({ kind: "budget", bytesPerSec: enterBytes(-1000) });
+  events.push({ kind: "goodput", bytesPerSec: enterBytes(-1000) });
+  for (let i = 0; i < RATE_RECOVER_STREAK * 4; i += 1) {
+    events.push({ kind: "report", delayUs: falling });
   }
 
   for (let i = 0; i < steps; i += 1) {

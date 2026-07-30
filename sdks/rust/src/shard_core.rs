@@ -83,6 +83,12 @@ pub struct Subscription {
     pub congestion_entered_at: i64,
     /// 輻輳による段の引き下げ量。SHEDDING_SPATIAL 以降で 1 になる。
     pub tier_penalty: i64,
+    /// 破棄不可のユニット（優先順位 4・5）を落とした段。落としていなければ −1。
+    ///
+    /// 規範 1.4: 順位 4・5 を破棄する場合はデコーダの参照連鎖が壊れるため、
+    /// 同一 (senderId, channel, spatialId) の次の KEY まで連続して破棄し、
+    /// keyframeRequest を送る。
+    pub awaiting_key_sid: i64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -357,6 +363,9 @@ fn handle_media(state: &ShardState, m: &MediaFields, t: i64) -> StepResult {
     let mut targets: Vec<i64> = Vec::new();
     let mut dropped: Vec<(i64, i64)> = Vec::new(); // (priority, count) を後で集約する
     let mut next_subscriptions: Vec<Subscription> = Vec::new();
+    // 参照連鎖が切れた購読が 1 つでもあれば、送信者へキーフレームを 1 度だけ要求する
+    // （規範 1.4）。購読ごとに出すと同じ要求が並ぶ。要求は段ごとに 1 件で足りる。
+    let mut wants_keyframe = false;
 
     for sub in &with_speech.subscriptions {
         if sub.target_id != from || sub.channel != ch {
@@ -365,6 +374,9 @@ fn handle_media(state: &ShardState, m: &MediaFields, t: i64) -> StepResult {
         }
         let decision = decide_for_subscription(&with_speech, sub, sid, tid, seq, ch, priority, t);
         next_subscriptions.push(decision.subscription);
+        if decision.request_keyframe {
+            wants_keyframe = true;
+        }
         if decision.forward {
             targets.push(sub.subscriber_id);
         } else if let Some(dp) = decision.drop_priority {
@@ -391,6 +403,10 @@ fn handle_media(state: &ShardState, m: &MediaFields, t: i64) -> StepResult {
     let mut commands: Vec<ShardCommand> = Vec::new();
     for (p, c) in &drop_map {
         commands.push(ShardCommand::Drop { priority: *p, count: *c });
+    }
+    // 破棄の報告の後に置く（順序を固定しないとトレースの完全一致が壊れる）。
+    if wants_keyframe {
+        commands.push(ShardCommand::KeyframeRequest { target_id: from, channel: ch, spatial_id: sid });
     }
 
     if targets.is_empty() {
@@ -422,6 +438,9 @@ struct SubscriptionDecision {
     subscription: Subscription,
     forward: bool,
     drop_priority: Option<i64>,
+    /// 送信者へキーフレームを要求するか（規範 1.4）。
+    /// 順位 4・5 を落としたときだけ真になる。
+    request_keyframe: bool,
 }
 
 /// 購読 1 本に対する転送の可否を決める。判定の順序は TS と同一でなければならない。
@@ -437,14 +456,14 @@ fn decide_for_subscription(
 ) -> SubscriptionDecision {
     // 1. ack が途絶えている → 渡さない
     if sub.stalled {
-        return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: None };
+        return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: None, request_keyframe: false };
     }
 
     // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
     // 本数は購読者ごとに決める。帯域が細い購読者へ多数の音声を送ると映像の余地が無くなる。
     if is_audio_channel(ch) && !is_audio_forwarded(state, sub, sub.target_id, t) {
         // 輻輳による破棄ではないため priority は 0 とする（ADR-0024 の 5）。
-        return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: Some(0) };
+        return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: Some(0), request_keyframe: false };
     }
 
     // 音声は段を持たない。段の選択は映像のみ。
@@ -452,27 +471,59 @@ fn decide_for_subscription(
         let chosen = choose_rung(state, sub);
         // 2. 段が合わない → 渡さない
         if sid != chosen {
-            return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: None };
+            return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: None, request_keyframe: false };
         }
         // 3. temporalId の超過 → 渡さない
         if tid > sub.max_temporal_id {
-            return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: None };
+            return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: None, request_keyframe: false };
         }
     }
 
     let must_forward = priority.is_none();
 
+    // **参照連鎖が切れている間は、次の KEY まで落とし続ける**（規範 1.4）。
+    // 音声を除外した後、priority が None ⟺ KEY（drop_priority の定義より）。
+    if !is_audio_channel(ch) && sub.awaiting_key_sid == sid {
+        if !must_forward {
+            // 落とす。要求は最初の 1 回で送っているため繰り返さない。
+            return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: priority, request_keyframe: false };
+        }
+        // KEY が来た。参照連鎖が回復するため、待ちを解いて渡す。
+        let cleared = Subscription { awaiting_key_sid: -1, ..sub.clone() };
+        return forward_decision(state, &cleared, sid, tid, seq, ch);
+    }
+
     // 4. 輻輳状態による破棄
     if !must_forward && should_drop_in_congestion(sub, tid, priority) {
-        return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: priority };
+        return drop_with_chain(sub, sid, priority);
     }
 
     // 5. 送信窓が閉じている
     if !must_forward && is_window_closed(state, sub, seq, ch) {
-        return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: priority };
+        return drop_with_chain(sub, sid, priority);
     }
 
     // 6. 渡す
+    forward_decision(state, sub, sid, tid, seq, ch)
+}
+
+/// 破棄する。順位 4・5 なら次の KEY までの連続破棄を始め、キーフレームを要求する（規範 1.4）。
+/// 順位 1〜3（破棄可能なユニット）では連鎖を始めず、要求も作らない。
+fn drop_with_chain(sub: &Subscription, sid: i64, priority: Option<i64>) -> SubscriptionDecision {
+    let breaks_chain = priority == Some(4) || priority == Some(5);
+    if !breaks_chain {
+        return SubscriptionDecision { subscription: sub.clone(), forward: false, drop_priority: priority, request_keyframe: false };
+    }
+    SubscriptionDecision {
+        subscription: Subscription { awaiting_key_sid: sid, ..sub.clone() },
+        forward: false,
+        drop_priority: priority,
+        request_keyframe: true,
+    }
+}
+
+/// 転送する。段が変わっていれば窓を作り直す。
+fn forward_decision(state: &ShardState, sub: &Subscription, _sid: i64, _tid: i64, seq: i64, ch: i64) -> SubscriptionDecision {
     let chosen = if is_audio_channel(ch) { 0 } else { choose_rung(state, sub) };
     if chosen != sub.window_sid {
         // 渡す段が変わった。seq の空間が変わるため窓を作り直す。
@@ -482,11 +533,11 @@ fn decide_for_subscription(
             highest_acked: seq - 1,
             ..sub.clone()
         };
-        return SubscriptionDecision { subscription: updated, forward: true, drop_priority: None };
+        return SubscriptionDecision { subscription: updated, forward: true, drop_priority: None, request_keyframe: false };
     }
     let highest_sent = if seq > sub.highest_sent { seq } else { sub.highest_sent };
     let updated = Subscription { highest_sent, ..sub.clone() };
-    SubscriptionDecision { subscription: updated, forward: true, drop_priority: None }
+    SubscriptionDecision { subscription: updated, forward: true, drop_priority: None, request_keyframe: false }
 }
 
 /// この購読へ渡す段を 1 つ選ぶ（ADR-0027 の 3）。
@@ -688,6 +739,7 @@ fn handle_subscribe(
         congestion: existing.map(|e| e.congestion).unwrap_or(Congestion::Normal),
         congestion_entered_at: existing.map(|e| e.congestion_entered_at).unwrap_or(t),
         tier_penalty: existing.map(|e| e.tier_penalty).unwrap_or(0),
+        awaiting_key_sid: existing.map(|e| e.awaiting_key_sid).unwrap_or(-1),
     };
 
     let mut next = state.clone();

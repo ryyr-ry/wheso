@@ -257,6 +257,7 @@ class Subscription {
     required this.congestion,
     required this.congestionEnteredAt,
     required this.tierPenalty,
+    required this.awaitingKeySid,
   });
   final int subscriberId;
   final int targetId;
@@ -273,6 +274,12 @@ class Subscription {
   final int congestionEnteredAt;
   /// 輻輳による段の引き下げ量。
   final int tierPenalty;
+  /// 破棄不可のユニット（優先順位 4・5）を落とした段。落としていなければ −1。
+  ///
+  /// 規範 1.4: 順位 4 と 5 を破棄する場合は、デコーダの参照連鎖が壊れるため、
+  /// 必ず同一 (senderId, channel, spatialId) の次の KEY ユニットまで連続して破棄し、
+  /// 受信者へ keyframeRequest を送る。
+  final int awaitingKeySid;
 
   Subscription copyWith({
     int? maxSpatialId,
@@ -285,6 +292,7 @@ class Subscription {
     Congestion? congestion,
     int? congestionEnteredAt,
     int? tierPenalty,
+    int? awaitingKeySid,
   }) {
     return Subscription(
       subscriberId: subscriberId,
@@ -300,6 +308,7 @@ class Subscription {
       congestion: congestion ?? this.congestion,
       congestionEnteredAt: congestionEnteredAt ?? this.congestionEnteredAt,
       tierPenalty: tierPenalty ?? this.tierPenalty,
+      awaitingKeySid: awaitingKeySid ?? this.awaitingKeySid,
     );
   }
 }
@@ -533,6 +542,9 @@ StepResult _handleMedia(ShardState state, MediaEvent event, int t) {
   final List<int> targets = [];
   final Map<int, int> dropped = {};
   final List<Subscription> nextSubscriptions = [];
+  // 参照連鎖が切れた購読が 1 つでもあれば、送信者へキーフレームを 1 度だけ要求する
+  // （規範 1.4）。購読ごとに出すと同じ要求が並ぶ。要求は段ごとに 1 件で足りる。
+  bool wantsKeyframe = false;
 
   for (final sub in marked.subscriptions) {
     if (sub.targetId != event.from || sub.channel != event.ch) {
@@ -541,6 +553,9 @@ StepResult _handleMedia(ShardState state, MediaEvent event, int t) {
     }
     final decision = _decideForSubscription(marked, sub, event, priority, t);
     nextSubscriptions.add(decision.subscription);
+    if (decision.requestKeyframe) {
+      wantsKeyframe = true;
+    }
     if (decision.forward) {
       targets.add(sub.subscriberId);
       continue;
@@ -563,6 +578,14 @@ StepResult _handleMedia(ShardState state, MediaEvent event, int t) {
     if (count > 0) {
       commands.add(DropCommand(priority: key, count: count));
     }
+  }
+  // 破棄の報告の後に置く（順序を固定しないとトレースの完全一致が壊れる）。
+  if (wantsKeyframe) {
+    commands.add(KeyframeRequestCommand(
+      targetId: event.from,
+      channel: event.ch,
+      spatialId: event.sid,
+    ));
   }
 
   if (targets.isEmpty) {
@@ -596,10 +619,14 @@ class _SubscriptionDecision {
     required this.subscription,
     required this.forward,
     required this.dropPriority,
+    required this.requestKeyframe,
   });
   final Subscription subscription;
   final bool forward;
   final int? dropPriority;
+  /// 送信者へキーフレームを要求するか（規範 1.4）。
+  /// 順位 4・5 を落としたときだけ真になる。
+  final bool requestKeyframe;
 }
 
 /// 購読 1 本に対する転送判定。順序を固定する。
@@ -612,14 +639,14 @@ _SubscriptionDecision _decideForSubscription(
 ) {
   // 1. ack が途絶えている → 渡さない
   if (sub.stalled) {
-    return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: null);
+    return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: null, requestKeyframe: false);
   }
 
   // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
   // 本数は購読者ごとに決める。帯域が細い購読者へ全員分の音声を送ると映像の余地が無くなる。
   if (_isAudioChannel(event.ch) && !_isAudioForwarded(state, sub, event.from, t)) {
     // 輻輳による破棄ではないため priority は 0 とする（ADR-0024 の 5）。
-    return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: 0);
+    return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: 0, requestKeyframe: false);
   }
 
   // 音声は段を持たない。段の選択は映像のみ。
@@ -627,30 +654,62 @@ _SubscriptionDecision _decideForSubscription(
     final chosen = _chooseRung(state, sub);
     if (event.sid != chosen) {
       // 2. 段が合わない → 渡さない
-      return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: null);
+      return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: null, requestKeyframe: false);
     }
     if (event.tid > sub.maxTemporalId) {
       // 3. temporalId の超過 → 渡さない
-      return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: null);
+      return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: null, requestKeyframe: false);
     }
   }
 
   final bool mustForward = priority == null;
+  final bool isKey = (event.flags & wire_layout.FLAG_KEY) != 0;
 
-  // 4. 輻輳状態による破棄
-  // mustForward が false なら priority は null ではない。ローカル変数で型を絞る。
+  // 参照連鎖が切れている間は、次の KEY まで落とし続ける（規範 1.4）。
+  // 順位 4・5 を 1 件落とした後に後続を渡すと、復号器は参照の無いフレームを受け取り、
+  // 出力を止める。落とし続ければ復号器は「キーフレーム待ち」に入り、要求で復帰する。
+  if (!_isAudioChannel(event.ch) && sub.awaitingKeySid == event.sid) {
+    if (!isKey) {
+      // 落とす。要求は最初の 1 回で送っているため、ここでは繰り返さない。
+      return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: priority, requestKeyframe: false);
+    }
+    // KEY が来た。参照連鎖が回復するため、待ちを解いて渡す。
+    return _forwardDecision(state, sub.copyWith(awaitingKeySid: -1), event);
+  }
+
   if (!mustForward) {
     final int p = priority;
+    // 4. 輻輳状態による破棄
     if (_shouldDropInCongestion(sub, event, p)) {
-      return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: p);
+      return _dropWithChain(sub, event, p);
     }
     // 5. 送信窓が閉じている
     if (_isWindowClosed(state, sub, event)) {
-      return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: p);
+      return _dropWithChain(sub, event, p);
     }
   }
 
   // 6. 渡す
+  return _forwardDecision(state, sub, event);
+}
+
+/// 破棄する。順位 4・5 なら次の KEY までの連続破棄を始め、キーフレームを要求する（規範 1.4）。
+/// 順位 1 から 3（破棄可能なユニット）では連鎖を始めず、要求も作らない。
+_SubscriptionDecision _dropWithChain(Subscription sub, MediaEvent event, int priority) {
+  final bool breaksChain = priority == 4 || priority == 5;
+  if (!breaksChain) {
+    return _SubscriptionDecision(subscription: sub, forward: false, dropPriority: priority, requestKeyframe: false);
+  }
+  return _SubscriptionDecision(
+    subscription: sub.copyWith(awaitingKeySid: event.sid),
+    forward: false,
+    dropPriority: priority,
+    requestKeyframe: true,
+  );
+}
+
+/// 転送する。段が変わっていれば窓を作り直す。
+_SubscriptionDecision _forwardDecision(ShardState state, Subscription sub, MediaEvent event) {
   final int chosen = _isAudioChannel(event.ch) ? 0 : _chooseRung(state, sub);
   if (chosen != sub.windowSid) {
     // 渡す段が変わった。seq の空間が変わるため窓を作り直す。
@@ -662,6 +721,7 @@ _SubscriptionDecision _decideForSubscription(
       ),
       forward: true,
       dropPriority: null,
+      requestKeyframe: false,
     );
   }
   final int highestSent = event.seq > sub.highestSent ? event.seq : sub.highestSent;
@@ -669,6 +729,7 @@ _SubscriptionDecision _decideForSubscription(
     subscription: sub.copyWith(highestSent: highestSent),
     forward: true,
     dropPriority: null,
+    requestKeyframe: false,
   );
 }
 
@@ -854,6 +915,7 @@ StepResult _handleSubscribe(ShardState state, SubscribeEvent event, int t) {
     congestion: existing?.congestion ?? Congestion.normal,
     congestionEnteredAt: existing?.congestionEnteredAt ?? t,
     tierPenalty: existing?.tierPenalty ?? 0,
+    awaitingKeySid: existing?.awaitingKeySid ?? -1,
   );
   final subs = [...rest, created]..sort(_subscriptionOrder);
   return _withEncoderTiers(state.copyWith(subscriptions: subs));

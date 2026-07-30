@@ -30,7 +30,13 @@ import {
   SHARD_UTIL_ENTER_T2_NUM,
   V_360P15,
 } from "../packages/core/src/generated/constants.ts";
-import { CHANNEL_VIDEO, FLAG_END_OF_FRAME, MAX_TEMPORAL_ID } from "../packages/core/src/generated/wire-layout.ts";
+import {
+  CHANNEL_VIDEO,
+  FLAG_DISCARDABLE,
+  FLAG_END_OF_FRAME,
+  FLAG_KEY,
+  MAX_TEMPORAL_ID,
+} from "../packages/core/src/generated/wire-layout.ts";
 
 const SENDER = 1;
 const SUBSCRIBER = 2;
@@ -103,6 +109,105 @@ function withOneSubscription(subscribers: readonly number[]): ShardState {
 function settleAt(step_: number): number {
   return (SHEDDING_HYSTERESIS_MS + 1) * step_;
 }
+
+/* ------------------------------------------------------------------------- */
+/* 規範 1.4: 順位 4・5 を落としたら次の KEY まで落とし続ける                  */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * 映像 1 件の事象を作る。
+ *
+ * `discardable` が偽なら破棄不可（優先順位 4）であり、規範 1.4 の連鎖の対象になる。
+ * 旗は生成物から引く（数値を書かない）。
+ */
+function videoEvent(seq: number, options: { readonly key?: boolean; readonly discardable?: boolean }): ShardEvent {
+  const key = options.key === true;
+  const discardable = options.discardable === true;
+  return {
+    kind: "media",
+    from: SENDER,
+    ch: CHANNEL_VIDEO,
+    sid: 0,
+    tid: discardable ? 2 : 0,
+    key,
+    seq,
+    bytes: 1200,
+    flags:
+      FLAG_END_OF_FRAME |
+      (key ? FLAG_KEY : 0) |
+      (discardable ? FLAG_DISCARDABLE : 0),
+  };
+}
+
+/** 送信窓を閉じるまで破棄不可のフレームを送り込み、最初に落ちた時点を返す。 */
+function pushUntilDrop(state: ShardState, startSeq: number): { readonly state: ShardState; readonly seq: number } {
+  let current = state;
+  for (let seq = startSeq; seq < startSeq + 40; seq += 1) {
+    const result = step(current, videoEvent(seq, {}), 1);
+    current = result.state;
+    if (result.commands.some((command) => command.kind === "drop")) {
+      return { state: current, seq };
+    }
+  }
+  return { state: current, seq: -1 };
+}
+
+test("**破棄不可のユニットを落としたら、次の KEY まで落とし続ける**（規範 1.4）", () => {
+  // 参照が欠けたフレーム列を渡すと復号器は出力を止める。実測では復号器へ 613 件渡して
+  // 出力が 148 枚しか得られず `Decoding error` が記録された。
+  const started = withOneSubscription([SUBSCRIBER]);
+  const dropped = pushUntilDrop(started, 1);
+  assert.notEqual(dropped.seq, -1, "送信窓が閉じて破棄が起きる");
+
+  // 以後、KEY でないフレームは 1 件も転送されない。
+  let state = dropped.state;
+  for (let seq = dropped.seq + 1; seq <= dropped.seq + 5; seq += 1) {
+    const result = step(state, videoEvent(seq, {}), 1);
+    state = result.state;
+    assert.equal(
+      result.commands.some((command) => command.kind === "forward"),
+      false,
+      `KEY が来るまで転送しない（seq=${String(seq)}）`,
+    );
+  }
+
+  // KEY が来たら転送を再開する。
+  const recovered = step(state, videoEvent(dropped.seq + 6, { key: true }), 1);
+  assert.equal(
+    recovered.commands.some((command) => command.kind === "forward"),
+    true,
+    "KEY で参照連鎖が回復するため転送する",
+  );
+});
+
+test("**破棄不可を落としたらキーフレームを要求する**（規範 1.4）", () => {
+  const started = withOneSubscription([SUBSCRIBER]);
+  let state = started;
+  let requested = 0;
+  for (let seq = 1; seq <= 12; seq += 1) {
+    const result = step(state, videoEvent(seq, {}), 1);
+    state = result.state;
+    requested += result.commands.filter((command) => command.kind === "keyframeRequest").length;
+  }
+  assert.ok(requested > 0, "要求を送る（送らないと復号器は永久にキーフレームを待つ）");
+});
+
+test("破棄可能なユニットだけを落とした場合はキーフレームを要求しない（規範 1.4）", () => {
+  // 順位 1 から 3 のみで対処できる場合、要求を発生させてはならない。
+  const started = withOneSubscription([SUBSCRIBER]);
+  let state = started;
+  let requested = 0;
+  let dropped = 0;
+  for (let seq = 1; seq <= 30; seq += 1) {
+    // 破棄可能（最上位の時間層）だけを送り続ける。
+    const result = step(state, videoEvent(seq, { discardable: true }), 1);
+    state = result.state;
+    requested += result.commands.filter((command) => command.kind === "keyframeRequest").length;
+    dropped += result.commands.filter((command) => command.kind === "drop").length;
+  }
+  assert.ok(dropped > 0, "破棄可能なユニットは落ちる（窓が閉じるため）");
+  assert.equal(requested, 0, "**要求は 1 件も出さない**");
+});
 
 test("購読の輻輳状態は勾配の閾値をまたいだときだけ 1 段ずつ進む（表の劣化方向）", () => {
   let state = withOneSubscription([SUBSCRIBER]);

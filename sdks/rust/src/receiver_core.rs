@@ -525,11 +525,18 @@ fn handle_report(state: &ReceiverState, delay_us: &[i64], t: i64) -> ReceiverSte
                 Err(_) => 0,
             };
             let raised = target + increment;
-            target = if raised > state.target_ceiling_bytes_per_sec {
-                state.target_ceiling_bytes_per_sec
-            } else {
-                raised
+            // 上限は望む品質の申告ビットレート（規範 4.2）。観測した goodput を
+            // 上限にすると輪が閉じて目標が上がらない。申告が無い間は上限を作らない。
+            let declared = desired_cost_bytes_per_sec(state);
+            // 上限が最低成立点を下回ってはならない（ADR-0040）。最下段の申告は
+            // MIN_VIABLE_BPS より小さいため、申告だけで切ると目標が最低成立点の
+            // 下へ押し戻され AUDIO_ONLY の出入りを往復する（実測で振動した）。
+            let minimum = match trunc_div(MIN_VIABLE_BPS, 8) {
+                Ok(value) => value,
+                Err(_) => 0,
             };
+            let cap = if declared > 0 && declared < minimum { minimum } else { declared };
+            target = if cap > 0 && raised > cap { cap } else { raised };
             streak = 0;
         }
     } else {
@@ -579,7 +586,39 @@ fn handle_report(state: &ReceiverState, delay_us: &[i64], t: i64) -> ReceiverSte
             spatial_id: next_spatial,
         });
     }
-    ReceiverStepResult { state: ReceiverState { streams, ..after_rate }, commands }
+    let stepped = ReceiverState { streams, ..after_rate };
+    if target == state.target_bytes_per_sec {
+        return ReceiverStepResult { state: stepped, commands };
+    }
+    // 音声だけの状態の出入りだけをやり直す（規範 4.3、ADR-0029）。
+    //
+    // 配分の全部をやり直してはならない。reallocate は「買える最良の段」を選ぶため、
+    // 予算が潤沢な回線では遅延勾配による降格を直後に打ち消してしまう（実測で発生）。
+    // 勾配は予算に現れない詰まりの予兆であり、予算で無かったことにしてはならない。
+    //
+    // 音声だけの出入りは reallocate にしか無いため、境界を跨いだときだけ呼ぶ。
+    // 呼ばなければ回復の勾配がいくら続いても映像が戻らない（実測で確認）。
+    if !crosses_audio_only(&stepped) {
+        return ReceiverStepResult { state: stepped, commands };
+    }
+    let reallocated = reallocate(stepped);
+    let mut merged = commands;
+    merged.extend(reallocated.commands);
+    ReceiverStepResult { state: reallocated.state, commands: merged }
+}
+
+/// いまの目標が音声だけの状態の境界を跨いでいるか（ADR-0029 のヒステリシス）。
+///
+/// 跨いでいる場合だけ配分をやり直す。判定は reallocate と同じ式でなければならないため、
+/// 回線の速度（目標 × 8）で見る。予算（9/10）で見ると余裕を二重に引くことになる。
+fn crosses_audio_only(state: &ReceiverState) -> bool {
+    let link_bps = state.target_bytes_per_sec * 8;
+    let wanted = if state.audio_only {
+        link_bps < AUDIO_ONLY_EXIT_BPS
+    } else {
+        link_bps < AUDIO_ONLY_ENTER_BPS
+    };
+    wanted != state.audio_only
 }
 
 /// メディアの転送。要求 tier を超えるユニットは転送しない。
@@ -804,7 +843,27 @@ fn reallocate(state: ReceiverState) -> ReceiverStepResult {
 // 帯域とカタログ
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// goodput の観測。天井を押し上げて再配分する。
+/// 望む段の申告ビットレートの合計（bytes/sec）。
+/// AIMD の回復時に上限として使う（規範 4.2）。カタログ未着（合計 0）のときは
+/// 呼び出し側が上限を作らない。知らないことは制約ではない。
+fn desired_cost_bytes_per_sec(state: &ReceiverState) -> i64 {
+    let mut bits: i64 = 0;
+    for stream in &state.streams {
+        if stream.phase != StreamPhase::Subscribed {
+            continue;
+        }
+        if is_audio(stream.channel) {
+            bits += cost_of(state, stream.sender_id, stream.channel, stream.spatial_id);
+        } else {
+            bits += cost_of(state, stream.sender_id, stream.channel, rung_cap_for(state, stream));
+        }
+    }
+    match trunc_div(bits, 8) {
+        Ok(value) => value,
+        Err(_) => 0,
+    }
+}
+
 /// 観測した goodput。天井を押し上げ、目標を上げる方向にだけ使う（congestion.md 4.1）。
 fn handle_goodput(state: &ReceiverState, bytes_per_sec: i64) -> ReceiverStepResult {
     if bytes_per_sec <= 0 {
@@ -815,12 +874,14 @@ fn handle_goodput(state: &ReceiverState, bytes_per_sec: i64) -> ReceiverStepResu
     } else {
         state.target_ceiling_bytes_per_sec
     };
-    let raised = if bytes_per_sec > state.target_bytes_per_sec {
+    // 規範 4.1: available = max(goodput, 現在の目標レート)。**天井で切らない。**
+    // 中継ノードは目標の分しか転送しないため goodput は常に目標以下に留まる。
+    // 天井で切ると目標が最低成立点から一生上がらない（desiredCostBytesPerSec の注記）。
+    let target = if bytes_per_sec > state.target_bytes_per_sec {
         bytes_per_sec
     } else {
         state.target_bytes_per_sec
     };
-    let target = if raised > ceiling { ceiling } else { raised };
     if target == state.target_bytes_per_sec && ceiling == state.target_ceiling_bytes_per_sec {
         return ReceiverStepResult { state: state.clone(), commands: Vec::new() };
     }

@@ -47,13 +47,20 @@ public struct WhesoSubscription: Equatable {
     public var congestionEnteredAt: Int64
     /// 輻輳による段の引き下げ量。SHEDDING_SPATIAL 以降で 1 になる。
     public var tierPenalty: Int64
+    /// 破棄不可のユニット（優先順位 4・5）を落とした段。落としていなければ −1。
+    ///
+    /// **規範 1.4**: 順位 4 と 5 を破棄する場合は、デコーダの参照連鎖が壊れるため、
+    /// **必ず同一 (senderId, channel, spatialId) の次の KEY ユニットまで連続して破棄し**、
+    /// 受信者へ `keyframeRequest` を送る。
+    public var awaitingKeySid: Int64
 
     public init(
         subscriberId: Int64, targetId: Int64, channel: Int64,
         maxSpatialId: Int64, maxTemporalId: Int64,
         windowSid: Int64, highestSent: Int64, highestAcked: Int64,
         lastAckAtMs: Int64, stalled: Bool,
-        congestion: WhesoCongestion, congestionEnteredAt: Int64, tierPenalty: Int64
+        congestion: WhesoCongestion, congestionEnteredAt: Int64, tierPenalty: Int64,
+        awaitingKeySid: Int64
     ) {
         self.subscriberId = subscriberId
         self.targetId = targetId
@@ -68,6 +75,7 @@ public struct WhesoSubscription: Equatable {
         self.congestion = congestion
         self.congestionEnteredAt = congestionEnteredAt
         self.tierPenalty = tierPenalty
+        self.awaitingKeySid = awaitingKeySid
     }
 }
 
@@ -313,6 +321,9 @@ private func handleMedia(
     var targets: [Int64] = []
     var droppedMap: [Int64: Int64] = [:]
     var nextSubscriptions: [WhesoSubscription] = []
+    // 参照連鎖が切れた購読が 1 つでもあれば、送信者へキーフレームを 1 度だけ要求する
+    // （規範 1.4）。購読ごとに出すと同じ要求が並ぶ。要求は段ごとに 1 件で足りる。
+    var wantsKeyframe = false
 
     for sub in withSpeech.subscriptions {
         if sub.targetId != from || sub.channel != ch {
@@ -321,6 +332,9 @@ private func handleMedia(
         }
         let decision = decideForSubscription(withSpeech, sub: sub, from: from, ch: ch, sid: sid, tid: tid, flags: flags, seq: seq, priority: priorityValue, t: t)
         nextSubscriptions.append(decision.subscription)
+        if decision.requestKeyframe {
+            wantsKeyframe = true
+        }
         if decision.forward {
             targets.append(sub.subscriberId)
         } else if let dp = decision.dropPriority {
@@ -337,6 +351,10 @@ private func handleMedia(
         if let count = droppedMap[key], count > 0 {
             commands.append(.drop(priority: key, count: count))
         }
+    }
+    // 破棄の報告の後に置く（順序を固定しないとトレースの完全一致が壊れる）。
+    if wantsKeyframe {
+        commands.append(.keyframeRequest(targetId: from, channel: ch, spatialId: sid))
     }
 
     if targets.isEmpty {
@@ -360,6 +378,9 @@ private struct SubscriptionDecision {
     let subscription: WhesoSubscription
     let forward: Bool
     let dropPriority: Int64?
+    /// 送信者へキーフレームを要求するか（規範 1.4）。
+    /// 順位 4・5 を落としたときだけ真になる。
+    let requestKeyframe: Bool
 }
 
 /// 購読 1 本に対する転送の可否を決める。
@@ -373,14 +394,14 @@ private func decideForSubscription(
 ) -> SubscriptionDecision {
     // 1. ack が途絶えている
     if sub.stalled {
-        return SubscriptionDecision(subscription: sub, forward: false, dropPriority: nil)
+        return SubscriptionDecision(subscription: sub, forward: false, dropPriority: nil, requestKeyframe: false)
     }
 
     // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
     // 本数は購読者ごとに決める。輻輳の段が深いほど本数を減らす。
     if isAudioChannel(ch) && !isAudioForwardedForSub(state, sub: sub, senderId: from, t: t) {
         // 輻輳による破棄ではないため priority は 0 とする（ADR-0024 の 5）。
-        return SubscriptionDecision(subscription: sub, forward: false, dropPriority: 0)
+        return SubscriptionDecision(subscription: sub, forward: false, dropPriority: 0, requestKeyframe: false)
     }
 
     // 音声は段を持たない（spatialId は常に 0）。段の選択は映像のみ。
@@ -388,27 +409,60 @@ private func decideForSubscription(
         let chosen = chooseRung(state, sub: sub)
         // 2. 段の選択に合わない
         if sid != chosen {
-            return SubscriptionDecision(subscription: sub, forward: false, dropPriority: nil)
+            return SubscriptionDecision(subscription: sub, forward: false, dropPriority: nil, requestKeyframe: false)
         }
         // 3. temporalId の超過
         if tid > sub.maxTemporalId {
-            return SubscriptionDecision(subscription: sub, forward: false, dropPriority: nil)
+            return SubscriptionDecision(subscription: sub, forward: false, dropPriority: nil, requestKeyframe: false)
         }
     }
 
     let mustForward = priority == nil
+    let isKey = (flags & Int64(WhesoWireLayout.FLAG_KEY)) != 0
+
+    // **参照連鎖が切れている間は、次の KEY まで落とし続ける**（規範 1.4）。
+    //
+    // 順位 4・5 を 1 件落とした後に後続を渡すと、復号器は参照の無いフレームを受け取り、
+    // 出力を止める。落とし続ければ復号器は「キーフレーム待ち」に入り、要求で復帰する。
+    if !isAudioChannel(ch) && sub.awaitingKeySid == sid {
+        if !isKey {
+            // 落とす。要求は最初の 1 回で送っているため、ここでは繰り返さない。
+            return SubscriptionDecision(subscription: sub, forward: false, dropPriority: priority, requestKeyframe: false)
+        }
+        // KEY が来た。参照連鎖が回復するため、待ちを解いて渡す。
+        var cleared = sub
+        cleared.awaitingKeySid = -1
+        return forwardDecision(state, sub: cleared, ch: ch, seq: seq)
+    }
 
     // 4. 輻輳状態による破棄
     if !mustForward && shouldDropInCongestion(sub, tid: tid, priority: priority) {
-        return SubscriptionDecision(subscription: sub, forward: false, dropPriority: priority)
+        return dropWithChain(sub, sid: sid, priority: priority)
     }
 
     // 5. 送信窓が閉じている
     if !mustForward && isWindowClosed(state, sub: sub, seq: seq, ch: ch) {
-        return SubscriptionDecision(subscription: sub, forward: false, dropPriority: priority)
+        return dropWithChain(sub, sid: sid, priority: priority)
     }
 
     // 6. 転送する
+    return forwardDecision(state, sub: sub, ch: ch, seq: seq)
+}
+
+/// 破棄する。順位 4・5 なら次の KEY までの連続破棄を始め、キーフレームを要求する（規範 1.4）。
+/// 順位 1 から 3（破棄可能なユニット）では連鎖を始めず、要求も作らない。
+private func dropWithChain(_ sub: WhesoSubscription, sid: Int64, priority: Int64?) -> SubscriptionDecision {
+    let breaksChain = priority == 4 || priority == 5
+    if !breaksChain {
+        return SubscriptionDecision(subscription: sub, forward: false, dropPriority: priority, requestKeyframe: false)
+    }
+    var updated = sub
+    updated.awaitingKeySid = sid
+    return SubscriptionDecision(subscription: updated, forward: false, dropPriority: priority, requestKeyframe: true)
+}
+
+/// 転送する。段が変わっていれば窓を作り直す。
+private func forwardDecision(_ state: WhesoShardState, sub: WhesoSubscription, ch: Int64, seq: Int64) -> SubscriptionDecision {
     let chosen: Int64 = isAudioChannel(ch) ? 0 : chooseRung(state, sub: sub)
     if chosen != sub.windowSid {
         // 渡す段が変わった。seq の空間が変わるため窓を作り直す。
@@ -416,13 +470,13 @@ private func decideForSubscription(
         updated.windowSid = chosen
         updated.highestSent = seq
         updated.highestAcked = seq - 1
-        return SubscriptionDecision(subscription: updated, forward: true, dropPriority: nil)
+        return SubscriptionDecision(subscription: updated, forward: true, dropPriority: nil, requestKeyframe: false)
     }
     var updated = sub
     if seq > sub.highestSent {
         updated.highestSent = seq
     }
-    return SubscriptionDecision(subscription: updated, forward: true, dropPriority: nil)
+    return SubscriptionDecision(subscription: updated, forward: true, dropPriority: nil, requestKeyframe: false)
 }
 
 // MARK: - chooseRung（ADR-0027 の 3）
@@ -632,7 +686,8 @@ private func handleSubscribe(
         stalled: false,
         congestion: existing?.congestion ?? .normal,
         congestionEnteredAt: existing?.congestionEnteredAt ?? t,
-        tierPenalty: existing?.tierPenalty ?? 0
+        tierPenalty: existing?.tierPenalty ?? 0,
+        awaitingKeySid: existing?.awaitingKeySid ?? -1
     )
     var next = state
     next.subscriptions = (rest + [created]).sorted(by: subscriptionOrder)

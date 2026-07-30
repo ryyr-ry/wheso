@@ -437,8 +437,10 @@ ReceiverStepResult _handleGoodput(ReceiverState state, int bytesPerSec) {
   }
   final int ceiling =
       bytesPerSec > state.targetCeilingBytesPerSec ? bytesPerSec : state.targetCeilingBytesPerSec;
-  final int raised = bytesPerSec > state.targetBytesPerSec ? bytesPerSec : state.targetBytesPerSec;
-  final int target = raised > ceiling ? ceiling : raised;
+  // 規範 4.1: available = max(goodput, 現在の目標レート)。**天井で切らない。**
+  // 中継ノードは目標の分しか転送しないため、天井で切ると目標は最低成立点から
+  // 一生上がらない（実測の記録は `_desiredCostBytesPerSec` の注記にある）。
+  final int target = bytesPerSec > state.targetBytesPerSec ? bytesPerSec : state.targetBytesPerSec;
   if (target == state.targetBytesPerSec && ceiling == state.targetCeilingBytesPerSec) {
     return ReceiverStepResult(state: state, commands: const []);
   }
@@ -511,6 +513,29 @@ int _rungCapFor(ReceiverState state, StreamState stream) {
     }
   }
   return best == null ? top.sid : best.sid;
+}
+
+/// 望む品質の申告ビットレートの合計（bytes/sec）。
+///
+/// AIMD の加算的増加の上限として使う。goodput の観測最大値を上限にすると
+/// 「目標 ≤ goodput ≤ 目標」の輪が閉じ、目標は最低成立点から一生上がらない。
+/// 実測（2026-07-30、実環境・劣化なし）: 目標が 30,620 bytes/s（MIN_VIABLE_BPS/8）に
+/// 張り付き、中継ノードが基底層 417 件を含む 842 件を捨てた。送信は 1,342 件、
+/// 到着は 577 件だった。
+int _desiredCostBytesPerSec(ReceiverState state) {
+  int bits = 0;
+  for (final stream in state.streams) {
+    if (stream.phase != StreamPhase.subscribed) {
+      continue;
+    }
+    if (_isAudio(stream.channel)) {
+      bits += _costOf(state, stream, stream.spatialId);
+      continue;
+    }
+    bits += _costOf(state, stream, _rungCapFor(state, stream));
+  }
+  final bytes = truncDiv(bits, 8);
+  return bytes.isOk ? (bytes.value ?? 0) : 0;
 }
 
 /// 段の費用（bits/sec）。申告が無ければ 0。
@@ -742,7 +767,18 @@ ReceiverStepResult _handleReport(ReceiverState state, List<int> delayUs, int t) 
       final increment = truncDiv(constants.RATE_PROBE_BPS, 8);
       final incrementValue = increment.value;
       final raised = target + (increment.isOk && incrementValue != null ? incrementValue : 0);
-      target = raised > state.targetCeilingBytesPerSec ? state.targetCeilingBytesPerSec : raised;
+      // 上限は望む品質の申告ビットレートである（規範 4.2）。観測した goodput を
+      // 上限にすると輪が閉じて目標が上がらない（`_desiredCostBytesPerSec` の注記）。
+      // 申告がまだ無い（カタログ未着）間は上限を作らない。知らないことは制約ではない。
+      final declared = _desiredCostBytesPerSec(state);
+      // 上限が最低成立点を下回ってはならない（ADR-0040）。最下段の申告（200 kbps）は
+      // MIN_VIABLE_BPS（音声を含む 244,960）より小さい。申告だけで切ると目標が
+      // 最低成立点の下へ押し戻され、AUDIO_ONLY の出入りを往復する（実測で振動した）。
+      final floorForCap = truncDiv(constants.MIN_VIABLE_BPS, 8);
+      final floorForCapValue = floorForCap.value;
+      final int minimum = (floorForCap.isOk && floorForCapValue != null) ? floorForCapValue : 0;
+      final int cap = (declared > 0 && declared < minimum) ? minimum : declared;
+      target = cap > 0 && raised > cap ? cap : raised;
       streak = 0;
     }
   } else {
@@ -787,10 +823,37 @@ ReceiverStepResult _handleReport(ReceiverState state, List<int> delayUs, int t) 
       spatialId: nextSpatial,
     ));
   }
+  final stepped = afterRate.copyWith(streams: streams);
+  if (target == state.targetBytesPerSec) {
+    return ReceiverStepResult(state: stepped, commands: commands);
+  }
+  // 音声だけの状態の出入りだけをやり直す（規範 4.3、ADR-0029）。
+  //
+  // 配分の全部をやり直してはならない。reallocate は「買える最良の段」を選ぶため、
+  // 予算が潤沢な回線では遅延勾配による降格を直後に打ち消す（実測: 降格の試験で
+  // 段が 2 から 1 へ下がらなくなった）。音声だけの出入りは reallocate にしか無い。
+  // 報告の経路で呼ばなければ、回復の勾配がいくら続いても映像が戻らない（実測:
+  // 目標が 29,620 → 154,620 bytes/s まで回復しても audioOnly が true のまま）。
+  if (!_crossesAudioOnly(stepped)) {
+    return ReceiverStepResult(state: stepped, commands: commands);
+  }
+  final reallocated = _reallocate(stepped);
   return ReceiverStepResult(
-    state: afterRate.copyWith(streams: streams),
-    commands: commands,
+    state: reallocated.state,
+    commands: <ReceiverCommand>[...commands, ...reallocated.commands],
   );
+}
+
+/// いまの目標が音声だけの状態の境界を跨いでいるか（ADR-0029 のヒステリシス）。
+///
+/// 跨いでいる場合だけ配分をやり直す。判定は reallocate と同じ式でなければならないため、
+/// 回線の速度（目標 × 8）で見る。予算（9/10）で見ると余裕を二重に引くことになる。
+bool _crossesAudioOnly(ReceiverState state) {
+  final linkBps = state.targetBytesPerSec * 8;
+  final bool wanted = state.audioOnly
+      ? linkBps < constants.AUDIO_ONLY_EXIT_BPS
+      : linkBps < constants.AUDIO_ONLY_ENTER_BPS;
+  return wanted != state.audioOnly;
 }
 
 /// メディアの転送。要求 tier を超えるユニットは転送しない。

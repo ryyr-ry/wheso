@@ -259,8 +259,10 @@ private fun streamKey(stream: StreamState): String = "${stream.senderId}:${strea
 private fun handleGoodput(state: ReceiverState, bytesPerSec: Long): ReceiverStepResult {
     if (bytesPerSec <= 0L) return ReceiverStepResult(state, emptyList())
     val ceiling = if (bytesPerSec > state.targetCeilingBytesPerSec) bytesPerSec else state.targetCeilingBytesPerSec
-    val raised = if (bytesPerSec > state.targetBytesPerSec) bytesPerSec else state.targetBytesPerSec
-    val target = if (raised > ceiling) ceiling else raised
+    // 規範 4.1: available = max(goodput, 現在の目標レート)。**天井で切らない。**
+    // 中継ノードは目標の分しか転送しないため goodput は常に目標以下に留まる。
+    // 天井で切ると目標は最低成立点から一生上がらない。
+    val target = if (bytesPerSec > state.targetBytesPerSec) bytesPerSec else state.targetBytesPerSec
     if (target == state.targetBytesPerSec && ceiling == state.targetCeilingBytesPerSec) {
         return ReceiverStepResult(state, emptyList())
     }
@@ -368,7 +370,42 @@ private fun handleDisplaySize(state: ReceiverState, senderId: Long, channel: Lon
     return reallocate(state.copy(streams = streams))
 }
 
+/**
+ * SUBSCRIBED なストリームが**望む段**の申告ビットレートの合計を bytes/sec で返す。
+ *
+ * AIMD の回復上限に使う。goodput の観測最大値（targetCeilingBytesPerSec）を上限に
+ * すると、中継ノードが目標の分しか転送しないため goodput は目標を超えず、
+ * target ≤ goodput ≤ target の輪が閉じて目標が最低成立点から一生上がらない。
+ * 実測（実環境・劣化なし）で中継ノードが基底層 417 件を含む 842 件を捨て、
+ * 送信 1,342 件に対し到着 577 件だった。
+ */
+private fun desiredCostBytesPerSec(state: ReceiverState): Long {
+    var bits = 0L
+    for (stream in state.streams) {
+        if (stream.phase != StreamPhase.SUBSCRIBED) continue
+        if (isAudio(stream.channel)) {
+            bits += costOf(state, stream, stream.spatialId)
+            continue
+        }
+        bits += costOf(state, stream, rungCapFor(state, stream))
+    }
+    val bytes = truncDiv(bits, 8L)
+    return if (bytes is Outcome.Ok) bytes.value else 0L
+}
+
 // --- handleReport ---
+
+/**
+ * いまの目標が音声だけの状態の境界を跨いでいるか（ADR-0029 のヒステリシス）。
+ *
+ * 跨いでいる場合だけ配分をやり直す。判定は reallocate と同じ式でなければならないため、
+ * 回線の速度（目標 × 8）で見る。予算（9/10）で見ると余裕を二重に引くことになる。
+ */
+private fun crossesAudioOnly(state: ReceiverState): Boolean {
+    val linkBps = state.targetBytesPerSec * 8L
+    val wanted = if (state.audioOnly) linkBps < AUDIO_ONLY_EXIT_BPS else linkBps < AUDIO_ONLY_ENTER_BPS
+    return wanted != state.audioOnly
+}
 
 private fun handleReport(state: ReceiverState, delayUs: List<Long>, t: Long): ReceiverStepResult {
     // 標本が 2 個未満では勾配が定まらない。定まらない値で AIMD を動かしてはならない。
@@ -395,8 +432,17 @@ private fun handleReport(state: ReceiverState, delayUs: List<Long>, t: Long): Re
         streak = state.recoverStreak + 1L
         if (streak >= RATE_RECOVER_STREAK) {
             val increment = truncDiv(RATE_PROBE_BPS, 8L)
-            val raised = target + if (increment is Outcome.Ok) increment.value else 0L
-            target = if (raised > state.targetCeilingBytesPerSec) state.targetCeilingBytesPerSec else raised
+            val raised = target + (if (increment is Outcome.Ok) increment.value else 0L)
+            // 上限は望む品質の申告ビットレート（規範 4.2）。観測した goodput を
+            // 上限にすると輪が閉じて目標が上がらない。申告が無い間は上限を作らない。
+            val declared = desiredCostBytesPerSec(state)
+            // 上限が最低成立点を下回ってはならない（ADR-0040）。最下段の申告は
+            // MIN_VIABLE_BPS より小さいため、申告だけで切ると目標が最低成立点の下へ
+            // 押し戻され、AUDIO_ONLY の出入りを往復する（実測で振動した）。
+            val floorForCap = truncDiv(MIN_VIABLE_BPS, 8L)
+            val minimum = if (floorForCap is Outcome.Ok) floorForCap.value else 0L
+            val cap = if (declared > 0L && declared < minimum) minimum else declared
+            target = if (cap > 0L && raised > cap) cap else raised
             streak = 0L
         }
     } else {
@@ -414,6 +460,7 @@ private fun handleReport(state: ReceiverState, delayUs: List<Long>, t: Long): Re
         return ReceiverStepResult(afterRate, emptyList())
     }
 
+    // --- 状態機械（state-machines.md 3 節）。tier を 1 段動かす ---
     val delta = if (degrading) -1L else 1L
     val commands = mutableListOf<ReceiverCommand>()
     val streams = mutableListOf<StreamState>()
@@ -439,7 +486,26 @@ private fun handleReport(state: ReceiverState, delayUs: List<Long>, t: Long): Re
         // 段が変わるとエンコーダの別ストリームへ切り替わるためキーフレームが必要である（ADR-0027 の 4）。
         commands.add(ReceiverCommand.KeyframeRequest(stream.senderId, stream.channel, nextSpatial))
     }
-    return ReceiverStepResult(afterRate.copy(streams = streams), commands)
+    val stepped = afterRate.copy(streams = streams)
+
+    // 目標が変わっていなければ、そのまま返す。
+    if (target == state.targetBytesPerSec) {
+        return ReceiverStepResult(stepped, commands)
+    }
+    // 音声だけの状態の出入りだけをやり直す（規範 4.3、ADR-0029）。
+    //
+    // なぜ配分の全部をやり直さないか: reallocate は「買える最良の段」を選ぶため、
+    // 予算が潤沢な回線では遅延勾配による降格を直後に打ち消してしまう（実測:
+    // 降格の試験で段が 2 から 1 へ下がらなくなった）。
+    //
+    // なぜ音声だけの出入りはやり直すか: その判断は reallocate にしか無い。報告の経路で
+    // 呼ばなければ、回復の勾配がいくら続いても映像が戻らない（実測: 目標が 29,620 →
+    // 154,620 bytes/s まで回復しても audioOnly が true のまま）。
+    if (!crossesAudioOnly(stepped)) {
+        return ReceiverStepResult(stepped, commands)
+    }
+    val reallocated = reallocate(stepped)
+    return ReceiverStepResult(reallocated.state, commands + reallocated.commands)
 }
 
 // --- handleMedia ---

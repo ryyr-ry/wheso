@@ -45,7 +45,12 @@ export interface Bridge {
 export function startTlsBridge(port: number, host: string): Bridge {
   const open = new Set<Socket>();
   const server = createNetServer((client) => {
+    // **小さな書き込みを遅らせない。** 制御メッセージ（`hello` など）は数十バイトであり、
+    // Nagle と遅延 ACK が噛み合うと数百ミリ秒遅れる。認証には猶予（`HELLO_TIMEOUT_MS`）が
+    // あるため、遅れは接続の切断として現れる。
+    client.setNoDelay(true);
     const upstream = tlsConnect({ host, port: 443, servername: host }, () => {
+      upstream.setNoDelay(true);
       upstream.pipe(client);
     });
     let rewritten = false;
@@ -61,9 +66,14 @@ export function startTlsBridge(port: number, host: string): Bridge {
     });
     open.add(client);
     client.on("close", () => open.delete(client));
-    upstream.on("error", () => client.destroy());
-    client.on("error", () => upstream.destroy());
-    upstream.on("close", () => client.destroy());
+    // **穏やかに閉じる。** `destroy` は書き込み待ちを捨てるため、閉鎖コードを載せた
+    // WebSocket の終了フレームが失われ、ブラウザには 1006（コードなしの異常終了）として
+    // 見える。実測: 終端を挟むと 60 秒で 17 件の切断が現れ、挟まないと 0 件だった。
+    // 切断は接続の張り直しを呼び、張り直しの最中に `hello` が猶予を越えると
+    // `E_AUTH`（4020）で閉じられる。**器が作った異常を製品の欠陥と読み違える。**
+    upstream.on("error", () => client.end());
+    client.on("error", () => upstream.end());
+    upstream.on("close", () => client.end());
     client.on("end", () => upstream.end());
   });
   server.listen(port, "127.0.0.1");

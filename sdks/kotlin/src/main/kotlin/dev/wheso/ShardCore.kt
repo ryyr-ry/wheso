@@ -17,6 +17,7 @@ import dev.wheso.generated.CHANNEL_AUDIO
 import dev.wheso.generated.CHANNEL_SCREEN_AUDIO
 import dev.wheso.generated.Errors
 import dev.wheso.generated.FLAG_ACTIVE_SPEAKER
+import dev.wheso.generated.FLAG_KEY
 import dev.wheso.generated.NODE_MAX_OUT_BYTES_PER_SEC
 import dev.wheso.generated.NODE_MAX_OUT_MESSAGES_PER_SEC
 import dev.wheso.generated.SEND_WINDOW_MS
@@ -88,6 +89,14 @@ public data class Subscription(
     val congestion: Congestion,
     val congestionEnteredAt: Long,
     val tierPenalty: Long,
+    /**
+     * 破棄不可のユニット（優先順位 4・5）を落とした段。落としていなければ −1。
+     *
+     * 規範 1.4: 順位 4 と 5 を破棄する場合は、デコーダの参照連鎖が壊れるため、
+     * 必ず同一 (senderId, channel, spatialId) の次の KEY ユニットまで連続して破棄し、
+     * 受信者へ keyframeRequest を送る。
+     */
+    val awaitingKeySid: Long,
 )
 
 public data class Ladder(
@@ -234,6 +243,9 @@ private fun handleMedia(state: ShardState, event: ShardEvent.Media, t: Long): Sh
     val targets = mutableListOf<Long>()
     val dropped = mutableMapOf<Long, Long>()
     val nextSubs = mutableListOf<Subscription>()
+    // 参照連鎖が切れた購読が 1 つでもあれば、送信者へキーフレームを 1 度だけ要求する
+    // （規範 1.4）。購読ごとに出すと同じ要求が並ぶ。要求は段ごとに 1 件で足りる。
+    var wantsKeyframe = false
 
     for (sub in marked.subscriptions) {
         if (sub.targetId != event.from || sub.channel != event.ch) {
@@ -241,15 +253,21 @@ private fun handleMedia(state: ShardState, event: ShardEvent.Media, t: Long): Sh
         }
         val d = decideForSubscription(marked, sub, event, priority, t)
         nextSubs.add(d.subscription)
+        if (d.requestKeyframe) wantsKeyframe = true
         if (d.forward) { targets.add(sub.subscriberId) }
         else if (d.dropPriority != null) { dropped[d.dropPriority] = (dropped[d.dropPriority] ?: 0L) + 1L }
     }
 
     targets.sort()
     val commands = mutableListOf<ShardCommand>()
+    // 破棄は優先順位の昇順でまとめて 1 件ずつ報告する。
     for (key in dropped.keys.sorted()) {
         val count = dropped[key]
         if (count != null && count > 0L) commands.add(ShardCommand.Drop(key, count))
+    }
+    // 破棄の報告の後に置く（順序を固定しないとトレースの完全一致が壊れる）。
+    if (wantsKeyframe) {
+        commands.add(ShardCommand.KeyframeRequest(event.from, event.ch, event.sid))
     }
 
     if (targets.isEmpty()) {
@@ -266,42 +284,87 @@ private fun handleMedia(state: ShardState, event: ShardEvent.Media, t: Long): Sh
     return ShardStepResult(overload.state, commands + overload.commands)
 }
 
-private data class SubscriptionDecision(val subscription: Subscription, val forward: Boolean, val dropPriority: Long?)
+private data class SubscriptionDecision(
+    val subscription: Subscription,
+    val forward: Boolean,
+    val dropPriority: Long?,
+    /**
+     * 送信者へキーフレームを要求するか（規範 1.4）。
+     * 順位 4・5 を落としたときだけ真になる。順位 1〜3 のみで対処できる場合は要求しない。
+     */
+    val requestKeyframe: Boolean,
+)
 
 private fun decideForSubscription(
     state: ShardState, sub: Subscription, event: ShardEvent.Media, priority: Long?, t: Long,
 ): SubscriptionDecision {
-    if (sub.stalled) return SubscriptionDecision(sub, false, null)
+    if (sub.stalled) return SubscriptionDecision(sub, false, null, false)
 
     // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
     // 本数は購読者ごとに決める。帯域が細い購読者へ多数の音声を送ると映像の余地が無くなる。
     if (isAudioChannel(event.ch) && !isAudioForwarded(state, sub, event.from, t)) {
         // 輻輳による破棄ではないため priority は 0 とする（ADR-0024 の 5）。
-        return SubscriptionDecision(sub, false, 0L)
+        return SubscriptionDecision(sub, false, 0L, false)
     }
 
     if (!isAudioChannel(event.ch)) {
         val chosen = chooseRung(state, sub)
-        if (event.sid != chosen) return SubscriptionDecision(sub, false, null)
-        if (event.tid > sub.maxTemporalId) return SubscriptionDecision(sub, false, null)
+        if (event.sid != chosen) return SubscriptionDecision(sub, false, null, false)
+        if (event.tid > sub.maxTemporalId) return SubscriptionDecision(sub, false, null, false)
     }
 
     val mustForward = priority == null
-    if (!mustForward && shouldDropInCongestion(sub, event, priority)) {
-        return SubscriptionDecision(sub, false, priority)
-    }
-    if (!mustForward && isWindowClosed(state, sub, event)) {
-        return SubscriptionDecision(sub, false, priority)
+    val isKey = (event.flags and FLAG_KEY.toLong()) != 0L
+
+    // 参照連鎖が切れている間は、次の KEY まで落とし続ける（規範 1.4）。
+    // 順位 4・5 を 1 件落とした後に後続を渡すと、復号器は参照の無いフレームを受け取り
+    // 出力を止める。落とし続ければ復号器は「キーフレーム待ち」に入り、要求で復帰する。
+    if (!isAudioChannel(event.ch) && sub.awaitingKeySid == event.sid) {
+        if (!isKey) {
+            // 落とす。要求は最初の 1 回で送っているため繰り返さない。
+            return SubscriptionDecision(sub, false, priority, false)
+        }
+        // KEY が来た。参照連鎖が回復するため、待ちを解いて渡す。
+        return forwardDecision(state, sub.copy(awaitingKeySid = -1L), event)
     }
 
+    if (!mustForward && shouldDropInCongestion(sub, event, priority)) {
+        return dropWithChain(sub, event, priority)
+    }
+    if (!mustForward && isWindowClosed(state, sub, event)) {
+        return dropWithChain(sub, event, priority)
+    }
+
+    return forwardDecision(state, sub, event)
+}
+
+/**
+ * 破棄する。順位 4・5 なら次の KEY までの連続破棄を始め、キーフレームを要求する（規範 1.4）。
+ * 順位 1〜3（破棄可能なユニット）では連鎖を始めず、要求も作らない。
+ */
+private fun dropWithChain(sub: Subscription, event: ShardEvent.Media, priority: Long?): SubscriptionDecision {
+    val breaksChain = priority == 4L || priority == 5L
+    if (!breaksChain) {
+        return SubscriptionDecision(sub, false, priority, false)
+    }
+    return SubscriptionDecision(
+        sub.copy(awaitingKeySid = event.sid),
+        false,
+        priority,
+        true,
+    )
+}
+
+/** 転送する。段が変わっていれば窓を作り直す。 */
+private fun forwardDecision(state: ShardState, sub: Subscription, event: ShardEvent.Media): SubscriptionDecision {
     val chosen = if (isAudioChannel(event.ch)) 0L else chooseRung(state, sub)
     if (chosen != sub.windowSid) {
         // 渡す段が変わった。seq 空間が変わるため窓を作り直す。
         val updated = sub.copy(windowSid = chosen, highestSent = event.seq, highestAcked = event.seq - 1L)
-        return SubscriptionDecision(updated, true, null)
+        return SubscriptionDecision(updated, true, null, false)
     }
     val highestSent = if (event.seq > sub.highestSent) event.seq else sub.highestSent
-    return SubscriptionDecision(sub.copy(highestSent = highestSent), true, null)
+    return SubscriptionDecision(sub.copy(highestSent = highestSent), true, null, false)
 }
 
 private fun chooseRung(state: ShardState, sub: Subscription): Long {
@@ -406,6 +469,7 @@ private fun handleSubscribe(state: ShardState, event: ShardEvent.Subscribe, t: L
         congestion = existing?.congestion ?: Congestion.NORMAL,
         congestionEnteredAt = existing?.congestionEnteredAt ?: t,
         tierPenalty = existing?.tierPenalty ?: 0L,
+        awaitingKeySid = existing?.awaitingKeySid ?: -1L,
     )
     return withEncoderTiers(state.copy(subscriptions = (rest + created).sortedWith(subscriptionOrder)))
 }

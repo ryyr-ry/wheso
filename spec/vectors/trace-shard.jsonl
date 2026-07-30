@@ -490,7 +490,7 @@
 {"t":2986,"in":{"kind":"media","from":2,"ch":1,"sid":0,"tid":2,"key":false,"bytes":40000,"flags":10,"seq":15}}
 {"t":2986,"out":[{"kind":"drop","priority":1,"count":2},{"kind":"forward","to":[3]}]}
 {"t":2996,"in":{"kind":"media","from":2,"ch":1,"sid":0,"tid":0,"key":false,"bytes":4000,"flags":8,"seq":16}}
-{"t":2996,"out":[{"kind":"drop","priority":4,"count":3}]}
+{"t":2996,"out":[{"kind":"drop","priority":4,"count":3},{"kind":"keyframeRequest","for":2,"channel":1,"spatialId":0}]}
 {"t":3006,"in":{"kind":"media","from":2,"ch":1,"sid":0,"tid":2,"key":false,"bytes":30000,"flags":42,"seq":17}}
 {"t":3006,"out":[{"kind":"drop","priority":2,"count":3}]}
 {"t":3016,"in":{"kind":"media","from":2,"ch":3,"sid":0,"tid":2,"key":false,"bytes":20000,"flags":26,"seq":1}}

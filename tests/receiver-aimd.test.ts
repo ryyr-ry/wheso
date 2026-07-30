@@ -15,16 +15,48 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { initialReceiverState, receiverStep, type ReceiverState } from "../packages/core/src/receiver-core.ts";
 import {
+  initialReceiverState,
+  receiverStep,
+  type CatalogLadder,
+  type ReceiverState,
+} from "../packages/core/src/receiver-core.ts";
+import {
+  AUDIO_ONLY_ENTER_BPS,
   MIN_VIABLE_BPS,
   RATE_HOLD_MS,
   RATE_PROBE_BPS,
   RATE_RECOVER_STREAK,
+  V_1080P30,
 } from "../packages/core/src/generated/constants.ts";
+import { CHANNEL_VIDEO, MAX_TEMPORAL_ID } from "../packages/core/src/generated/wire-layout.ts";
 
 /** 目標の初期値（bytes/sec）。値そのものに意味は無いが、17/20 の切り捨てが見える大きさにする。 */
 const INITIAL_TARGET = 1_000_000;
+
+/**
+ * 1 段だけのはしご。上限（申告ビットレートの合計）の試験に使う。
+ *
+ * 段が 1 つなら「望む段」は必ずその段であり、上限が一意に定まる。
+ */
+const SMALL_RUNG_BITRATE = V_1080P30.targetBitrate;
+
+function smallLadder(senderId: number): CatalogLadder {
+  return {
+    senderId,
+    channel: CHANNEL_VIDEO,
+    rungs: [
+      {
+        sid: 0,
+        width: V_1080P30.width,
+        height: V_1080P30.height,
+        framerate: V_1080P30.framerate,
+        temporalLayers: V_1080P30.temporalLayers,
+        targetBitrate: V_1080P30.targetBitrate,
+      },
+    ],
+  };
+}
 
 /** 遅延が増え続ける標本列。勾配が閾値を超える。 */
 function risingDelays(): number[] {
@@ -143,14 +175,91 @@ test("回復の連続が途切れたら数え直す", () => {
   assert.equal(state.targetBytesPerSec, lowered, "2 回では増えない");
 });
 
-test("加算的増加は上限（初めに与えられた目標）を超えない", () => {
-  let state = stateWithBudget(INITIAL_TARGET);
-  // 下げた分より大きい増加が来ても、上限で止まる。
-  state = reportAt(state, risingDelays(), 0);
-  for (let attempt = 1; attempt <= RATE_RECOVER_STREAK * 20; attempt += 1) {
+test("**回復が続けば目標は観測した goodput を超えて上がる**（規範 4.1: goodput は下限）", () => {
+  // 中継ノードは目標の分しか転送しないため、goodput は目標を超えない。goodput を
+  // 上限にすると「目標 ≤ goodput ≤ 目標」の輪が閉じ、目標は最低成立点から一生上がらない。
+  // 実測（実環境・劣化なし）: 目標が 30,620 bytes/s に張り付き、中継ノードが基底層 417 件を
+  // 含む 842 件を捨てた。到着は送信 1,342 件に対し 577 件だった。
+  const floor = Math.trunc(MIN_VIABLE_BPS / 8);
+  let state = initialReceiverState();
+  assert.equal(state.targetBytesPerSec, floor, "初期状態は最低成立点である");
+  // 観測できた goodput は最低成立点ぶんしかない（中継が目標で切っているため）。
+  state = receiverStep(state, { kind: "goodput", bytesPerSec: floor }, 0).state;
+  assert.equal(state.targetCeilingBytesPerSec, floor, "天井は観測値である");
+
+  // 勾配は健全（回復）。3 回連続で加算的増加が起きる。
+  for (let attempt = 1; attempt <= RATE_RECOVER_STREAK; attempt += 1) {
     state = reportAt(state, fallingDelays(), RATE_HOLD_MS * attempt);
   }
-  assert.equal(state.targetBytesPerSec, INITIAL_TARGET, "上限で止まる");
+  assert.equal(
+    state.targetBytesPerSec,
+    floor + Math.trunc(RATE_PROBE_BPS / 8),
+    "**天井で切られずに増える**",
+  );
+  assert.ok(
+    state.targetBytesPerSec > state.targetCeilingBytesPerSec,
+    "観測した goodput を超えて探る（AIMD の探りはそういうものである）",
+  );
+});
+
+test("加算的増加は申告ビットレートの合計で止まる（規範 4.2）", () => {
+  // 上限は「現在のプロファイルの目標ビットレート」である。はしごを与え、購読を張り、
+  // 表示寸法を与えて段を決めた上で、いくら回復が続いても合計を超えないことを見る。
+  let state = initialReceiverState();
+  state = receiverStep(state, { kind: "catalog", entries: [smallLadder(7)] }, 0).state;
+  state = receiverStep(
+    state,
+    {
+      kind: "subscribe",
+      entries: [{ senderId: 7, channel: CHANNEL_VIDEO, maxSpatialId: 0, maxTemporalId: MAX_TEMPORAL_ID }],
+    },
+    0,
+  ).state;
+  state = receiverStep(
+    state,
+    { kind: "displaySize", senderId: 7, channel: CHANNEL_VIDEO, width: 4096 },
+    0,
+  ).state;
+  for (let attempt = 1; attempt <= RATE_RECOVER_STREAK * 30; attempt += 1) {
+    state = reportAt(state, fallingDelays(), RATE_HOLD_MS * attempt);
+  }
+  const cap = Math.trunc(SMALL_RUNG_BITRATE / 8);
+  assert.equal(state.targetBytesPerSec, cap, "申告ビットレートで止まる");
+});
+
+test("**回復が続けば音声だけの状態から映像へ戻る**（規範 4.3、ADR-0029）", () => {
+  // AIMD が目標を上げても配分をやり直さないと、`AUDIO_ONLY` の解除が判断されない。
+  // 実測: 目標が 29,620 → 154,620 bytes/s まで回復しても `audioOnly` が true のままで、
+  // 購読の命令が 1 件も出なかった。**音声だけの会議から二度と戻れない。**
+  let state = initialReceiverState();
+  state = receiverStep(state, { kind: "catalog", entries: [smallLadder(7)] }, 0).state;
+  state = receiverStep(
+    state,
+    {
+      kind: "subscribe",
+      entries: [{ senderId: 7, channel: CHANNEL_VIDEO, maxSpatialId: 0, maxTemporalId: MAX_TEMPORAL_ID }],
+    },
+    0,
+  ).state;
+  // 予算を音声だけの境界より下へ落とす。
+  const low = Math.trunc(AUDIO_ONLY_ENTER_BPS / 8) - 1000;
+  state = receiverStep(state, { kind: "budget", bytesPerSec: low }, 0).state;
+  assert.equal(state.audioOnly, true, "映像を落として音声を守る");
+  // 観測できた goodput も小さい（中継が目標で切っているため）。
+  state = receiverStep(state, { kind: "goodput", bytesPerSec: low }, 0).state;
+  assert.equal(state.audioOnly, true);
+
+  // 回復が続く。
+  let restored = false;
+  for (let attempt = 1; attempt <= RATE_RECOVER_STREAK * 6 && !restored; attempt += 1) {
+    const result = receiverStep(state, { kind: "report", delayUs: fallingDelays() }, RATE_HOLD_MS * attempt);
+    state = result.state;
+    if (result.commands.some((command) => command.kind === "subscribeChange")) {
+      restored = true;
+    }
+  }
+  assert.equal(restored, true, "**購読をやり直す命令が出る**");
+  assert.equal(state.audioOnly, false, "映像へ戻る");
 });
 
 test("増減どちらでもない報告では target が動かない", () => {
