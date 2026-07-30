@@ -114,16 +114,37 @@ export function judgeMonotonic(record: DegradeRecord): readonly Violation[] {
   return violations;
 }
 
-/** 判定 A-1 の前提: すべての受信フレームでハッシュが得られている。 */
+/**
+ * 判定 A-1 の前提: **照合の対象になった枠**でハッシュが得られている。
+ *
+ * 器は画素の読み戻しが高価であるため一部の枠だけを照合する（毎枚行うと頁の主筋が詰まり、
+ * 音声が途切れる。実測 875 ms）。空文字は「照合の対象外」を表す。半端な長さは器の失敗で
+ * あり、**それは見逃してはならない**。
+ *
+ * **1 枚も得られていなければ不合格である。** そうでないと、器が壊れて全部空になったときに
+ * 判定 A-1 が空洞のまま緑になる。
+ */
 export function judgeHashes(record: DegradeRecord): readonly Violation[] {
   const violations: Violation[] = [];
+  let hashed = 0;
   for (const entry of record.received) {
+    if (entry.sha256.length === 0) {
+      continue;
+    }
     if (entry.sha256.length !== 64) {
       violations.push({
         judgement: "A-1",
         detail: `${String(entry.frameIndex)} 番目のハッシュが 64 文字でない（${String(entry.sha256.length)}）`,
       });
+      continue;
     }
+    hashed += 1;
+  }
+  if (record.received.length > 0 && hashed === 0) {
+    violations.push({
+      judgement: "A-1",
+      detail: `${String(record.received.length)} 枚 描いたのにハッシュが 1 枚も得られていない（器が壊れている）`,
+    });
   }
   return violations;
 }

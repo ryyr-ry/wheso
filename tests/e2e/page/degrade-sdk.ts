@@ -345,14 +345,38 @@ async function tokenFor(tokenKey: string, meetingId: string, userId: string): Pr
  */
 const HASH_SIDE = 64;
 
+/**
+ * 画素を読むための画布。**1 個を使い回す。**
+ *
+ * 毎フレーム作ると割り当てと GPU からの読み戻しが積み上がり、頁の主筋が詰まる。実測:
+ * N-0（劣化なし）で音声の再生が 875 ms 途切れ、連鎖切れが 55 件出た。器が主筋を止めると
+ * 復号も送出も遅れ、**製品の欠陥と見分けが付かない**。
+ */
+let hashCanvas: OffscreenCanvas | null = null;
+let hashContext: OffscreenCanvasRenderingContext2D | null = null;
+
+/**
+ * この取得時刻の枠を照合の対象にするか。
+ *
+ * **購読者どうしで同じ枠を選ばなければならない**（判定 A-1 は購読者間の一致を見る）。
+ * 取得時刻は源のものであり全員に共通であるから、取得時刻から決める。4 枚に 1 枚で足りる
+ * （1 枚でも違えば転送か復号が壊れている）。
+ */
+function shouldHash(captureUs: number): boolean {
+  return Math.trunc(captureUs / 1000) % 4 === 0;
+}
+
 async function hashFrame(frame: unknown): Promise<string> {
   const width = Reflect.get(Object(frame), "displayWidth");
   const height = Reflect.get(Object(frame), "displayHeight");
   if (typeof width !== "number" || typeof height !== "number" || width === 0 || height === 0) {
     return "";
   }
-  const canvas = new OffscreenCanvas(HASH_SIDE, HASH_SIDE);
-  const context = canvas.getContext("2d");
+  if (hashCanvas === null) {
+    hashCanvas = new OffscreenCanvas(HASH_SIDE, HASH_SIDE);
+    hashContext = hashCanvas.getContext("2d");
+  }
+  const context = hashContext;
   if (context === null) {
     return "";
   }
@@ -437,12 +461,17 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
           // 「描画の間隔」に混ざる（旧い器で実際に 2049 ms の偽の間隔が出た）。
           const slot = recorder.received.length;
           recorder.received.push({ captureUs, sha256: "", atMs });
-          void hashFrame(frame).then((sha256) => {
-            const entry = recorder.received[slot];
-            if (entry !== undefined) {
-              recorder.received[slot] = { ...entry, sha256 };
-            }
-          });
+          // **4 枚に 1 枚だけ照合する。** 画素の読み戻しは高価であり、毎枚行うと頁の主筋が
+          // 詰まる（実測: 音声の再生が 875 ms 途切れた）。選ぶ基準は取得時刻であるから、
+          // 購読者どうしで同じ枠が選ばれる（判定 A-1 は購読者間の一致を見る）。
+          if (shouldHash(captureUs)) {
+            void hashFrame(frame).then((sha256) => {
+              const entry = recorder.received[slot];
+              if (entry !== undefined) {
+                recorder.received[slot] = { ...entry, sha256 };
+              }
+            });
+          }
           output.onFrame(senderId, frame);
         },
         onDecodeError: (senderId, channel): void => {

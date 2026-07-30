@@ -64,9 +64,6 @@ export interface ShaperPort {
   readonly detach: () => void;
 }
 
-/** 解放を試みる間隔（ミリ秒）。細かくすると精度が上がるが CPU を食う。 */
-const TICK_MS = 5;
-
 /** 溜めてよい上限（バイト）。超えたら読み元を止める。 */
 const HIGH_WATER_BYTES = 256 * 1024;
 
@@ -75,6 +72,15 @@ const LOW_WATER_BYTES = 64 * 1024;
 
 /** バケツに溜めておける最大（ミリ秒ぶん）。突発の許容量である。 */
 const BURST_MS = 50;
+
+/**
+ * 1 度に解放する上限（バイト）。これより大きい塊は割る。
+ *
+ * 大きい書き込み（64 KB など）をそのまま出すと、借りが大きくなりすぎて制限を突き抜ける。
+ * 実際の回線もパケットに割って送る。4 KB は TCP の 1 セグメント（約 1.4 KB）の数個ぶんで
+ * あり、予約の回数と精度の折り合いである。
+ */
+const MAX_RELEASE_BYTES = 4096;
 
 interface Pending {
   readonly chunk: Buffer;
@@ -168,41 +174,58 @@ export function createShaper(now: () => number, seed = 1): Shaper {
       throttles += 1;
       return false;
     }
-    const allowed = Math.trunc(credit);
-    if (allowed >= head.chunk.length) {
-      lane.queue.shift();
-      lane.queuedBytes -= head.chunk.length;
-      credit -= head.chunk.length;
-      releasedBytes += head.chunk.length;
-      lane.sink(head.chunk);
+    // **借りを作る。上限より大きい塊は割る。**
+    //
+    // 足りない分だけ割って出すと、残りのために毎回 1 ミリ秒の予約を挟むことになる。
+    // 実行系が忙しいと `setTimeout(…, 1)` は 10〜50 ms 遅れるため、**制限に達していないのに
+    // 通信が固まる**（実測: 8 Mbps の制限で待たせた回数 43 に対し、破棄不可のフレームが
+    // 44 枚落ちた）。credit を負にすれば平均の速度は同じで、待ちは「借りを返す時間」に
+    // まとまる。`tc` の tbf も塊単位で送る。
+    if (head.chunk.length > MAX_RELEASE_BYTES) {
+      const part = head.chunk.subarray(0, MAX_RELEASE_BYTES);
+      const rest = head.chunk.subarray(MAX_RELEASE_BYTES);
+      lane.queue[0] = { chunk: rest, readyAtMs: head.readyAtMs };
+      lane.queuedBytes -= part.length;
+      credit -= part.length;
+      releasedBytes += part.length;
+      lane.sink(part);
       return true;
     }
-    // 途中まで解放する。**バイト列であるから分割してよい**（順序は保たれる）。
-    const part = head.chunk.subarray(0, allowed);
-    const rest = head.chunk.subarray(allowed);
-    lane.queue[0] = { chunk: rest, readyAtMs: head.readyAtMs };
-    lane.queuedBytes -= part.length;
-    credit -= part.length;
-    releasedBytes += part.length;
-    throttles += 1;
-    lane.sink(part);
+    lane.queue.shift();
+    lane.queuedBytes -= head.chunk.length;
+    credit -= head.chunk.length;
+    releasedBytes += head.chunk.length;
+    lane.sink(head.chunk);
     return true;
   }
 
-  const timer = setInterval(() => {
+  /** 予約中の解放（`setTimeout` の取り消し用）。 */
+  let pending: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * 出せるものを出す。**刻みで回さない。**
+   *
+   * 一定周期の刻みで解放すると、(1) その間に届いた分がまとめて出て突発になり、(2) 実行
+   * 系が忙しいと刻み自体が遅れる（ブラウザ 2 個と CDP の通信で埋まる）。実測: 5 ms の
+   * 刻みで回していたとき、帯域 8 Mbps（実際の通信量は約 350 kbps）でも提示が 375/594 に
+   * 落ちた。**制限に達していないのに器が壊していた。** 出来事駆動にすれば、制限に達しない
+   * 限り遅れは入らない。
+   */
+  function drain(): void {
     const atMs = now();
     refill(atMs);
     if (state.blackout) {
       for (const lane of lanes) {
         applyBackpressure(lane);
       }
+      schedule(atMs);
       return;
     }
     const unlimited = bytesPerMs() <= 0;
-    // **接続をまたいで公平に回す。** 1 本に全部与えると装置単位の制限にならない。
     let progressed = true;
     while (progressed) {
       progressed = false;
+      // **接続をまたいで公平に回す。** 1 本に全部与えると装置単位の制限にならない。
       for (const lane of lanes) {
         if (releaseFrom(lane, atMs, unlimited)) {
           progressed = true;
@@ -213,8 +236,41 @@ export function createShaper(now: () => number, seed = 1): Shaper {
         break;
       }
     }
-  }, TICK_MS);
-  timer.unref();
+    schedule(atMs);
+  }
+
+  /** 次に解放できる時刻へ予約する。待つものが無ければ何も予約しない。 */
+  function schedule(atMs: number): void {
+    if (pending !== null) {
+      clearTimeout(pending);
+      pending = null;
+    }
+    let earliest = Number.POSITIVE_INFINITY;
+    let waiting = 0;
+    for (const lane of lanes) {
+      const head = lane.queue[0];
+      if (head === undefined) {
+        continue;
+      }
+      waiting += 1;
+      if (head.readyAtMs < earliest) {
+        earliest = head.readyAtMs;
+      }
+    }
+    if (waiting === 0) {
+      return;
+    }
+    const perMs = bytesPerMs();
+    // 帯域待ちなら、1 バイトぶんの credit が溜まる時刻まで待つ。
+    // 借り（負の credit）を返し切るまで待つ。1 バイトぶんではなく借り全部である。
+    const creditWaitMs = perMs <= 0 || credit >= 1 ? 0 : Math.ceil((1 - credit) / perMs);
+    const readyWaitMs = earliest === Number.POSITIVE_INFINITY ? 0 : earliest - atMs;
+    const waitMs = Math.max(1, readyWaitMs > creditWaitMs ? readyWaitMs : creditWaitMs);
+    pending = setTimeout(drain, waitMs);
+    if (typeof pending === "object" && pending !== null && "unref" in pending) {
+      pending.unref();
+    }
+  }
 
   return {
     attach: (sink, source): ShaperPort => {
@@ -258,6 +314,8 @@ export function createShaper(now: () => number, seed = 1): Shaper {
           lane.queue.push({ chunk, readyAtMs });
           lane.queuedBytes += chunk.length;
           applyBackpressure(lane);
+          // **積んだらその場で流す。** 刻みを待たない（待つと突発になる）。
+          drain();
         },
         detach: (): void => {
           lane.detached = true;
@@ -272,6 +330,8 @@ export function createShaper(now: () => number, seed = 1): Shaper {
         lastRefillMs = now();
       }
       state = next;
+      // 遮断が明けた・帯域が広がった場合に溜まりを流す。
+      drain();
     },
     stats: (): ShapeStats => {
       let queued = 0;
@@ -281,7 +341,10 @@ export function createShaper(now: () => number, seed = 1): Shaper {
       return { releasedBytes, queuedBytes: queued, pauses, throttles };
     },
     stop: (): void => {
-      clearInterval(timer);
+      if (pending !== null) {
+        clearTimeout(pending);
+        pending = null;
+      }
       for (const lane of lanes) {
         lane.detached = true;
       }

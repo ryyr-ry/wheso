@@ -207,6 +207,13 @@ interface ParticipantView {
   readonly encodedAudioCount: number;
   /** SDK 自身が観測した A/V のずれ（ミリ秒）。器の対応付けとの食い違いを見るため。 */
   readonly avSkewMs: number;
+  /** 復号器の出入り。「届いたのに出ない」の原因を分けるために要る。 */
+  readonly decoderIo: {
+    readonly created: number;
+    readonly submitted: number;
+    readonly output: number;
+    readonly failed: number;
+  };
   readonly uplinkBps: number;
   readonly downlinkBps: number;
   readonly participantCount: number;
@@ -275,6 +282,12 @@ function readParticipant(value: unknown): ParticipantView {
     encodedVideoCount: num(record["encodedVideoCount"]),
     encodedAudioCount: num(record["encodedAudioCount"]),
     avSkewMs: num(record["avSkewMs"]),
+    decoderIo: {
+      created: num(asRecord(record["decoderIo"])["created"]),
+      submitted: num(asRecord(record["decoderIo"])["submitted"]),
+      output: num(asRecord(record["decoderIo"])["output"]),
+      failed: num(asRecord(record["decoderIo"])["failed"]),
+    },
     uplinkBps: num(record["uplinkBps"]),
     downlinkBps: num(record["downlinkBps"]),
     participantCount: num(record["participantCount"]),
@@ -294,8 +307,17 @@ function merge(sender: ParticipantView, receiver: ParticipantView): ObservedRun 
     sentVideo: sender.run.sentVideo,
     sentAudio: sender.run.sentAudio,
     lastSentAtMs: sender.run.lastSentAtMs,
-    // 窓は**送信側**の時計で閉じる（判定するのは送ったものである）。
-    windowClosedAtMs: sender.run.windowClosedAtMs,
+    // **窓は早く閉じた側で閉じる。**
+    //
+    // 参加者はそれぞれ別のブラウザで、起こす順に少しずれて始まる。したがって窓を閉じる
+    // 時刻も違う。送信側の時刻だけで切ると、**受信側が記録をやめた後に届いたはずの分**が
+    // 「届かなかった」と読まれる（実測: 末尾の連続した数十枚が B-2 の違反になった）。
+    // 送ったものを判定するのは正しいが、受け手が見ていない区間は判定できない。
+    windowClosedAtMs:
+      receiver.run.windowClosedAtMs > 0 &&
+      receiver.run.windowClosedAtMs < sender.run.windowClosedAtMs
+        ? receiver.run.windowClosedAtMs
+        : sender.run.windowClosedAtMs,
   };
 }
 
@@ -448,6 +470,8 @@ for (const profile of IMPAIRMENT_PROFILES) {
     );
     const built = buildDegradeRecord(merge(sender, receiver));
 
+    const shapeStats = bridgeA.shapeStats();
+
     // **音声の間隔を測る。** 音声は破棄禁止であり、1 秒を超える隙間は再生クロックの
     // 作り直し（`AV_RESYNC_GAP_MS`。ADR-0028）を起こす。作り直すと映像の提示時刻の写像が
     // 飛び、映像側に連鎖する。原因を音声に辿れるよう、隙間の最大を必ず出す。
@@ -479,6 +503,17 @@ for (const profile of IMPAIRMENT_PROFILES) {
         ` / 要求 ${String(built.record.keyframeRequests)}` +
         ` / 上り ${String(sender.uplinkBps)} bps` +
         ` / SDK が思うずれ ${String(receiver.avSkewMs)} ms` +
+        // **「届いたのに出ない」の原因はここで分かれる。** 投入が少なければ経路が捨てており、
+        // 出力が少なければ復号器が追い付いていない。
+        ` / 復号器（投入 ${String(receiver.decoderIo.submitted)}` +
+        ` 出力 ${String(receiver.decoderIo.output)} 失敗 ${String(receiver.decoderIo.failed)}` +
+        ` 生成 ${String(receiver.decoderIo.created)}）` +
+        // **整形器が本当に効いたかを毎回出す。** 待たせた回数が 0 なら制限は効いておらず、
+        // その走行の劣化は「掛けたつもり」である（緑でも赤でも読み違える）。
+        ` / 整形（上り 出 ${String(shapeStats.egress.releasedBytes)}B` +
+        ` 待 ${String(shapeStats.egress.throttles)} 背圧 ${String(shapeStats.egress.pauses)}` +
+        ` / 下り 出 ${String(shapeStats.ingress.releasedBytes)}B` +
+        ` 待 ${String(shapeStats.ingress.throttles)} 背圧 ${String(shapeStats.ingress.pauses)}）` +
         ` / 戻れない切断 ${built.record.closures?.length === 0 ? "なし" : (built.record.closures ?? []).join(", ")}` +
         ` / 戻れた切断 ${built.transientClosures.length === 0 ? "なし" : built.transientClosures.join(", ")}\n`,
     );

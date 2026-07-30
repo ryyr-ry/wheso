@@ -13,41 +13,64 @@ import assert from "node:assert/strict";
 
 import { createShaper, NO_SHAPE } from "./support/link-shaper.ts";
 
-/** 試験用の時計と、`setInterval` を手で回すための仕掛け。 */
+/**
+ * 試験用の時計と、`setTimeout` を手で進めるための仕掛け。
+ *
+ * 整形器は出来事駆動である（刻みで回さない）。したがって試験も予約を時刻で進める。
+ */
 function harness(): {
   readonly clock: { ms: number };
   readonly advance: (ms: number) => void;
   readonly restore: () => void;
 } {
   const clock = { ms: 1_000 };
-  const ticks: (() => void)[] = [];
-  const realInterval = globalThis.setInterval;
-  const realClear = globalThis.clearInterval;
-  // `setInterval` を差し替え、刻みを試験が呼ぶ。**実時間を待つ試験にしない。**
-  const fakeInterval = (handler: unknown): { unref: () => void } => {
-    if (typeof handler === "function") {
-      ticks.push((): void => {
-        handler();
-      });
-    }
-    return { unref: (): void => undefined };
+  interface Job {
+    readonly atMs: number;
+    readonly run: () => void;
+    cancelled: boolean;
+  }
+  const jobs: Job[] = [];
+  const realTimeout = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  const fakeTimeout = (handler: unknown, delay?: unknown): Job => {
+    const wait = typeof delay === "number" ? delay : 0;
+    const job: Job = {
+      atMs: clock.ms + wait,
+      run: (): void => {
+        if (typeof handler === "function") {
+          handler();
+        }
+      },
+      cancelled: false,
+    };
+    jobs.push(job);
+    return job;
   };
-  Reflect.set(globalThis, "setInterval", fakeInterval);
-  Reflect.set(globalThis, "clearInterval", (): void => undefined);
+  Reflect.set(globalThis, "setTimeout", fakeTimeout);
+  Reflect.set(globalThis, "clearTimeout", (job: unknown): void => {
+    if (typeof job === "object" && job !== null && "cancelled" in job) {
+      Reflect.set(job, "cancelled", true);
+    }
+  });
   return {
     clock,
     advance: (ms): void => {
-      // 5 ms 刻みで進める（整形器の刻みと同じ）。
-      for (let step = 0; step < ms; step += 5) {
-        clock.ms += 5;
-        for (const tick of ticks) {
-          tick();
+      const until = clock.ms + ms;
+      // 1 ms ずつ進め、期限の来た予約を発火させる（予約は発火中に増える）。
+      while (clock.ms < until) {
+        clock.ms += 1;
+        for (let index = 0; index < jobs.length; index += 1) {
+          const job = jobs[index];
+          if (job !== undefined && !job.cancelled && job.atMs <= clock.ms) {
+            job.cancelled = true;
+            job.run();
+          }
         }
       }
     },
     restore: (): void => {
-      Reflect.set(globalThis, "setInterval", realInterval);
-      Reflect.set(globalThis, "clearInterval", realClear);
+      Reflect.set(globalThis, "setTimeout", realTimeout);
+      Reflect.set(globalThis, "clearTimeout", realClear);
     },
   };
 }

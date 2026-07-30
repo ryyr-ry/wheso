@@ -459,18 +459,16 @@ function handleVideoUnit(
   // 予定は `now − skew` であるから、待ち時間は `−skew` である。
   const plannedWaitMs = -presentation.skewMs;
   if (plannedWaitMs > AV_RESYNC_GAP_MS) {
-    // 捨てるのだから**参照連鎖は切れる**。キーフレームを待ち、要求も出す（規範 1.4 と
-    // 同じ扱い）。待たせないと、次の差分を参照の無いまま復号器へ渡してしまう
-    // （実測: 判定 A-2 が「963 の参照先 962 が無い」で赤になった）。
-    const rebuilt = noteRouteChange(next, senderId);
-    const gapResult = noteGap(rebuilt.decoders, senderId, channel);
-    deps.sendReceiveControl(
-      JSON.stringify({ t: "keyframeRequest", senderId, channel, spatialId: unit.spatialId }),
-    );
+    // **写像を作り直し、この枠だけを捨てる。連鎖は切らない。**
+    //
+    // 以前はここで `noteGap`（キーフレーム待ち）とキーフレーム要求も行っていた。写像が
+    // **続けて**古いと、届いた枠のほとんどを捨ててキーフレームを待ち続ける状態になる
+    // （実測: 届いた 574 枚のうち復号器へ渡ったのは 124 枚、描画の空白が 11.2 秒、
+    // キーフレーム要求 10 回）。1 枚を捨てただけで参照が欠けるなら、復号の失敗として
+    // 現れ、そこで復号器を作り直して要求する（ADR-0047）。**既に試験のある経路に任せる。**
     return {
-      ...rebuilt,
-      decoders: gapResult.state,
-      reporter: recordVideoDrop(rebuilt.reporter),
+      ...noteRouteChange(next, senderId),
+      reporter: recordVideoDrop(next.reporter),
     };
   }
 

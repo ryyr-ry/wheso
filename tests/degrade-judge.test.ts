@@ -75,15 +75,30 @@ test("A-3: frameIndex の重複を検出する", () => {
   assert.equal(violations.length, 1);
 });
 
-test("A-1: ハッシュが取れていない記録を検出する", () => {
+test("**A-1: 半端なハッシュと「1 枚も無い」を検出する**（一部だけ照合するのは許す）", () => {
   const base = healthyRecord(5);
-  const received = [...base.received];
-  const target = received[2];
+
+  // 空文字は「照合の対象外」である（器は 4 枚に 1 枚だけ読む）。他が取れていれば合格。
+  const sampled = [...base.received];
+  const skipped = sampled[2];
+  assert.ok(skipped !== undefined);
+  sampled[2] = { ...skipped, sha256: "" };
+  assert.deepEqual(judgeHashes({ ...base, received: sampled }), [], "一部が対象外でも合格");
+
+  // 半端な長さは器の失敗である。見逃してはならない。
+  const broken = [...base.received];
+  const target = broken[3];
   assert.ok(target !== undefined);
-  received[2] = { ...target, sha256: "" };
-  const violations = judgeHashes({ ...base, received });
-  assert.equal(violations.length, 1);
+  broken[3] = { ...target, sha256: "abc" };
+  const violations = judgeHashes({ ...base, received: broken });
+  assert.equal(violations.length, 1, JSON.stringify(violations));
   assert.equal(violations[0]?.judgement, "A-1");
+
+  // **1 枚も取れていなければ不合格である**（器が壊れて空洞のまま緑になるのを防ぐ）。
+  const empty = base.received.map((entry) => ({ ...entry, sha256: "" }));
+  const none = judgeHashes({ ...base, received: empty });
+  assert.equal(none.length, 1, JSON.stringify(none));
+  assert.ok(none[0]?.detail.includes("1 枚も"), none[0]?.detail);
 });
 
 test("C-1: 描画が止まった記録を検出する", () => {

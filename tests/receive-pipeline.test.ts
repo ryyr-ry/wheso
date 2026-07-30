@@ -169,14 +169,17 @@ test("**連番の飛びを見たら復号へ渡さず、キーフレームを要
   assert.ok(state.decoders.entries.length > 0);
 });
 
-test("**予定が遠すぎるときは写像を作り直し、その枠は捨てる**（音声より早く出さない）", () => {
+test("**予定が遠すぎる枠は捨てるが、連鎖は切らない**（音声より早く出さない。ADR-0053）", () => {
   // `skewMs` は音声の再生位置から作る（ADR-0028 の写像 M）。映像が音声より大きく先を
-  // 走っていると、予定は数秒先になる。**直ちに出してはならない**: それは音声より数秒
-  // 早い映像を出すことであり、判定 D-1 に反する（実測: 段 E で 8.2 秒ずれた組が出た）。
+  // 走っていると予定は数秒先になる。**直ちに出してはならない**（音声より数秒早い映像を
+  // 出すことであり判定 D-1 に反する。実測 8.2 秒）。
+  //
+  // **キーフレームを要求してはならない。** 写像が続けて古いと、届いた枠のほとんどを捨てて
+  // キーフレームを待ち続ける（実測: 届いた 574 枚のうち復号器へ渡ったのは 124 枚、
+  // 描画の空白 11.2 秒）。参照が欠けるなら復号の失敗として現れ、そこで作り直す（ADR-0047）。
   const clock = { ms: 1000 };
   const { deps, log } = recorder(clock);
   let state = createPipeline(4, clock.ms);
-  // 音声で写像を作る（映像だけでは対応が作れない）。
   state = handleMedia(state, mediaBytes({ channel: CHANNEL_AUDIO, seq: 1, captureUs: 0 }), deps);
   clock.ms += 20;
   state = handleMedia(state, mediaBytes({ key: true, seq: 1, captureUs: 0 }), deps);
@@ -188,22 +191,18 @@ test("**予定が遠すぎるときは写像を作り直し、その枠は捨て
   const controlBefore = log.control.length;
   state = handleMedia(state, mediaBytes({ key: false, seq: 2, captureUs: 10_000_000 }), deps);
   assert.equal(log.decoded.length, decodedBefore, "**予定が遠すぎる枠は渡さない**");
-  assert.ok(
-    log.control.slice(controlBefore).some((text: string) => text.includes("keyframeRequest")),
-    "捨てたら連鎖が切れるためキーフレームを要求する",
+  assert.deepEqual(
+    log.control.slice(controlBefore).filter((text: string) => text.includes("keyframeRequest")),
+    [],
+    "**キーフレームは要求しない**（待ち続けになる）",
   );
 
-  // 差分は渡さない（キーフレーム待ち）。
+  // 写像は作り直されている。対応が取れる枠は続けて渡る（止まらない）。
   clock.ms += 20;
   state = handleMedia(state, mediaBytes({ channel: CHANNEL_AUDIO, seq: 2, captureUs: 20_000 }), deps);
   clock.ms += 20;
   state = handleMedia(state, mediaBytes({ key: false, seq: 3, captureUs: 40_000 }), deps);
-  assert.equal(log.decoded.length, decodedBefore, "キーフレームまで渡さない");
-
-  // キーフレームで再開する。
-  clock.ms += 20;
-  state = handleMedia(state, mediaBytes({ key: true, seq: 4, captureUs: 60_000 }), deps);
-  assert.ok(log.decoded.length > decodedBefore, "キーフレームで再開する");
+  assert.ok(log.decoded.length > decodedBefore, "作り直した後は渡る（キーフレームを待たない）");
 });
 
 test("**遅れて届いた古いユニットを復号へ渡さない**（受入条件 A-3）", () => {
