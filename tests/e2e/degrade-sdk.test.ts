@@ -386,8 +386,11 @@ for (const profile of IMPAIRMENT_PROFILES) {
       requireComplete: profile.id === "N-0",
       // 段を上げた回数だけキーフレーム要求を許す（受入条件 4.5 の例外）。
       // 遮断のある段は復帰のたびにも許される。
+      // 段を上げた回数、遮断からの復帰、**参照連鎖が切れた回数**だけ許す
+      // （受入条件 4.5 の例外と規範 1.4。ADR-0046）。連鎖が切れたら要求するのが規範である。
       allowedKeyframeRequests:
         built.switches.filter((entry) => entry.up).length +
+        built.chainBreaks +
         (profile.outage === undefined ? 0 : Math.trunc(seconds / profile.outage.everySec) + 1),
     });
     assert.deepEqual(
@@ -480,7 +483,8 @@ test("SDK 経由 N-8: 劣化した購読者が健全な購読者を壊さない"
   const violations = judgeAll(healthyBuilt.record, {
     maxGapMs: IMPAIRMENT_MAX_GAP_MS,
     requireComplete: false,
-    allowedKeyframeRequests: healthyBuilt.switches.filter((entry) => entry.up).length,
+    allowedKeyframeRequests:
+      healthyBuilt.switches.filter((entry) => entry.up).length + healthyBuilt.chainBreaks,
   });
   assert.deepEqual(
     violations.map((entry) => `${entry.judgement}: ${entry.detail}`),

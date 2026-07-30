@@ -117,6 +117,14 @@ export interface BuiltRecord {
   readonly judgedSent: number;
   /** 対応する音声が送られなかったため判定から外した映像の数。 */
   readonly droppedForNoAudio: number;
+  /**
+   * 参照連鎖が切れた回数（破棄不可のフレームが届かなかった回数）。
+   *
+   * 規範 1.4 は、順位 4・5 を破棄したら**キーフレームを要求せよ**と定める（ADR-0046）。
+   * したがって判定 E-1（キーフレーム要求は 0 回）の許容は、この回数だけ増える。
+   * 数えないと、規範どおりに要求した実装を違反として落とす。
+   */
+  readonly chainBreaks: number;
   /** 戻れる閉鎖（設計どおりの再接続）。報告のみ。 */
   readonly transientClosures: readonly string[];
 }
@@ -291,6 +299,20 @@ export function buildDegradeRecord(run: ObservedRun, audioPairWindowUs = 100_000
     previous = entry.spatialId;
   }
 
+  // 参照連鎖が切れた回数。破棄不可（最上位の時間層でない）のフレームが届かなかった数である。
+  const arrivedSet = new Set(arrivedIndexes);
+  const temporalIds = sent.map((entry) => entry.temporalId);
+  const highestTemporal = temporalIds.length === 0 ? 0 : Math.max(...temporalIds);
+  let chainBreaks = 0;
+  for (const entry of sent) {
+    if (arrivedSet.has(entry.frameIndex)) {
+      continue;
+    }
+    if (entry.isKey || entry.temporalId < highestTemporal) {
+      chainBreaks += 1;
+    }
+  }
+
   const fatal: string[] = [];
   const transient: string[] = [];
   for (const closure of run.closures) {
@@ -316,6 +338,7 @@ export function buildDegradeRecord(run: ObservedRun, audioPairWindowUs = 100_000
     switches,
     judgedSent: sent.length,
     droppedForNoAudio,
+    chainBreaks,
     transientClosures: transient,
   };
 }

@@ -158,6 +158,24 @@ test("1 枚も届かない観測では判定の対象が空になり、器の失
   assert.equal(built.record.received.length, 0);
 });
 
+test("**参照連鎖が切れた回数を数える**（判定 E-1 の許容の根拠。ADR-0046）", () => {
+  const clean = buildDegradeRecord(baseRun(10));
+  assert.equal(clean.chainBreaks, 0, "何も落ちていなければ 0");
+
+  // 破棄できない層（時間層 0）を 1 枚落とす。
+  const run = baseRun(10);
+  const missing = run.sentVideo.find((entry) => entry.spatialId === 0 && entry.temporalId === 0 && entry.frameIndex > 2);
+  assert.ok(missing !== undefined);
+  const arrived = run.arrived.filter((entry) => entry.captureUs !== missing.captureUs);
+  assert.equal(buildDegradeRecord({ ...run, arrived }).chainBreaks, 1, "連鎖が切れた回数を数える");
+
+  // 破棄できる層（最上位の時間層）は連鎖を切らない。
+  const discardable = run.sentVideo.find((entry) => entry.spatialId === 0 && entry.temporalId === 2);
+  assert.ok(discardable !== undefined);
+  const arrived2 = run.arrived.filter((entry) => entry.captureUs !== discardable.captureUs);
+  assert.equal(buildDegradeRecord({ ...run, arrived: arrived2 }).chainBreaks, 0, "破棄可能は数えない");
+});
+
 test("**戻れない閉鎖だけが失敗になる**（設計どおりの再接続を失敗と読まない）", () => {
   const run = baseRun(6);
   // E_AUTH（4020）は `autoReconnect: false` である。1 度でも起きれば経路は戻らない。
