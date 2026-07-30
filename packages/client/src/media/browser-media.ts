@@ -60,43 +60,26 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
 
   return {
     configureDecoder: (senderId, channel, spatialId): void => {
-      if (typeof videoDecoderCtor !== "function") {
-        return;
-      }
-      const key = keyOf(senderId, channel);
-      closeVideo(videos, key);
-      const decoder = construct(videoDecoderCtor, [
-        {
-          output: (frame: DecodedFrame): void => {
-            options.onFrame(senderId, frame);
-            // **`VideoFrame` は明示的に閉じる。** 閉じないと復号器の資源が尽き、
-            // 数百枚で復号が止まる（WebCodecs の要件）。利用側は同期に使い終える。
-            closeFrame(frame);
-          },
-          error: (): void => {
-            options.onDecodeError(senderId, channel);
-          },
-        },
-      ]);
-      if (decoder === null) {
-        return;
-      }
-      // コーデックは AV1 を既定とする。H.264 の場合は申告から決めるべきであり、
-      // その配線は送信側のはしごの申告（ADR-0026 の 7）を受け取ってから行う。
-      const configured = callMethod(decoder, "configure", [
-        { codec: "av01.0.08M.08", optimizeForLatency: true },
-      ]);
-      if (!configured) {
-        return;
-      }
+      createDecoder(senderId, channel);
       void spatialId;
-      videos.set(key, { key, senderId, decoder });
     },
 
     resetDecoder: (senderId, channel, spatialId): void => {
       const key = keyOf(senderId, channel);
       const entry = videos.get(key);
       if (entry === undefined) {
+        createDecoder(senderId, channel);
+        void spatialId;
+        return;
+      }
+      // **閉じた復号器は作り直す。** WebCodecs では復号の失敗が復号器を `closed` にし、
+      // 以後の `reset` / `configure` / `decode` はすべて失敗する（例外になる）。同じ実体を
+      // 使い回すと、**1 度の失敗で以後 1 枚も出なくなる**。実測（実環境・劣化なし）: 復号器へ
+      // 546 件渡して出力は 69 枚、`Decoding error` が 1 件。生成された復号器は最初の 1 個
+      // だけであり、キーフレームが 9 枚届いても回復しなかった。
+      if (stateOf(entry.decoder) === "closed") {
+        createDecoder(senderId, channel);
+        void spatialId;
         return;
       }
       // 段が変わった。復号器を初期化してキーフレームを待つ（規則 4）。
@@ -131,7 +114,28 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
       // **提示予定時刻まで待つ**（ADR-0042）。直ちに復号して描くと、束ねで遅れる音声に
       // 対して映像が先行する（実測 p99 88 ms。F-063）。門が順序も保証する。
       gate.submit(input.senderId, input.presentAtMs, () => {
-        callMethod(entry.decoder, "decode", [chunk]);
+        // 待っている間に復号器が閉じることがある（失敗は非同期に届く）。閉じていたら
+        // 作り直す。**閉じた実体へ渡し続けてはならない**（例外になり、以後何も出ない）。
+        const current = videos.get(keyOf(input.senderId, input.channel));
+        if (current === undefined) {
+          return;
+        }
+        if (stateOf(current.decoder) === "closed") {
+          // **差分では作り直さない。** 作り直した復号器はキーフレームからしか始められない
+          // ため、差分ごとに作ると実体を捨てて作るだけを繰り返す。失敗を伝えて要求させ、
+          // キーフレームが来たときに作り直す。
+          if (!input.key) {
+            options.onDecodeError(input.senderId, input.channel);
+            return;
+          }
+          const rebuilt = createDecoder(input.senderId, input.channel);
+          if (rebuilt === null) {
+            return;
+          }
+          callMethod(rebuilt.decoder, "decode", [chunk]);
+          return;
+        }
+        callMethod(current.decoder, "decode", [chunk]);
       });
     },
 
@@ -140,6 +144,48 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
       audio.enqueue(input);
     },
   };
+
+  /** 復号器の状態を読む（`unconfigured` / `configured` / `closed`）。読めなければ空文字。 */
+  function stateOf(decoder: unknown): string {
+    const value = typeof decoder === "object" && decoder !== null ? Reflect.get(decoder, "state") : undefined;
+    return typeof value === "string" ? value : "";
+  }
+
+  /** 復号器を作り直す。古い実体は閉じる。 */
+  function createDecoder(senderId: number, channel: number): VideoEntry | null {
+    if (typeof videoDecoderCtor !== "function") {
+      return null;
+    }
+    const key = keyOf(senderId, channel);
+    closeVideo(videos, key);
+    const decoder = construct(videoDecoderCtor, [
+      {
+        output: (frame: DecodedFrame): void => {
+          options.onFrame(senderId, frame);
+          // **`VideoFrame` は明示的に閉じる。** 閉じないと復号器の資源が尽き、
+          // 数百枚で復号が止まる（WebCodecs の要件）。利用側は同期に使い終える。
+          closeFrame(frame);
+        },
+        error: (): void => {
+          options.onDecodeError(senderId, channel);
+        },
+      },
+    ]);
+    if (decoder === null) {
+      return null;
+    }
+    // コーデックは AV1 を既定とする。H.264 の場合は申告から決めるべきであり、
+    // その配線は送信側のはしごの申告（ADR-0026 の 7）を受け取ってから行う。
+    const configured = callMethod(decoder, "configure", [
+      { codec: "av01.0.08M.08", optimizeForLatency: true },
+    ]);
+    if (!configured) {
+      return null;
+    }
+    const entry: VideoEntry = { key, senderId, decoder };
+    videos.set(key, entry);
+    return entry;
+  }
 }
 
 /** `VideoFrame` / `AudioData` を明示的に閉じる。閉じないと資源が漏れる。 */

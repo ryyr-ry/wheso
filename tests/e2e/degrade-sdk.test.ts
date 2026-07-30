@@ -24,7 +24,7 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { chromium, type Browser } from "playwright";
+import { chromium, type Browser, type Page } from "playwright";
 
 import { DEV_TOKEN_KEY, newMeetingId, startLive, type LiveEnvironment } from "../support/live-env.ts";
 import {
@@ -52,7 +52,6 @@ const USER_SENDER = "550e8400e29b41d4a716446655440501";
 const USER_HEALTHY = "550e8400e29b41d4a716446655440502";
 const USER_IMPAIRED = "550e8400e29b41d4a716446655440503";
 
-let browser: Browser | null = null;
 let page: PageServer | null = null;
 /** 主の終端。N-0 から N-7 では送信側と受信側の両方がここを通る。 */
 let bridgeA: Bridge | null = null;
@@ -80,12 +79,10 @@ before(async () => {
   const script = await bundlePage("degrade-sdk.ts");
   assert.notEqual(script, "", "SDK の器を束ねられる");
   page = await servePage(await findFreePort(), script);
-  browser = await chromium.launch({ args: [...FAKE_MEDIA_ARGS] });
+  // ブラウザは参加者ごとに `runParticipants` が起こす（主筋を分けるため）。
 });
 
 after(async () => {
-  await browser?.close();
-  browser = null;
   await page?.close();
   page = null;
   bridgeA?.close();
@@ -179,9 +176,14 @@ interface ParticipantView {
   readonly run: ObservedRun;
   /** 符号化器が出したユニットの数。ワイヤへ出た数との差は送信経路の判断である。 */
   readonly encodedVideoCount: number;
+  /** 符号化器が出した音声ユニットの数（無音は送らないためワイヤの数と一致しない）。 */
+  readonly encodedAudioCount: number;
   readonly uplinkBps: number;
   readonly downlinkBps: number;
   readonly participantCount: number;
+  /** そのページで観測した閉鎖の理由。器の欠陥と製品の欠陥を分けるために要る（F-066）。 */
+  readonly closeNotes: readonly string[];
+  readonly logs: readonly string[];
 }
 
 /**
@@ -232,37 +234,27 @@ function readParticipant(value: unknown): ParticipantView {
         const item = asRecord(entry);
         return { captureUs: num(item["captureUs"]), spatialId: num(item["spatialId"]) };
       }),
-      keyframeRequests: num(record["keyframeRequests"]),
+      keyframeRequestAtMs: list(record["keyframeRequestAtMs"]).map((entry) => num(entry)),
       closures: list(record["closures"]).map((entry) => {
         const item = asRecord(entry);
         return { label: str(item["label"]), role: str(item["role"]), code: num(item["code"]) };
       }),
       lastSentAtMs: num(record["lastSentAtMs"]),
+      windowClosedAtMs: num(record["windowClosedAtMs"]),
     },
     encodedVideoCount: num(record["encodedVideoCount"]),
+    encodedAudioCount: num(record["encodedAudioCount"]),
     uplinkBps: num(record["uplinkBps"]),
     downlinkBps: num(record["downlinkBps"]),
     participantCount: num(record["participantCount"]),
-  };
-}
-interface RunView {
-  readonly ok: boolean;
-  readonly detail: string;
-  readonly sender: ParticipantView;
-  readonly receivers: readonly ParticipantView[];
-  readonly logs: readonly string[];
-}
-
-function readRun(value: unknown): RunView {
-  const record = asRecord(value);
-  return {
-    ok: record["ok"] === true,
-    detail: str(record["detail"]),
-    sender: readParticipant(record["sender"]),
-    receivers: list(record["receivers"]).map((entry) => readParticipant(entry)),
+    closeNotes: list(record["closeNotes"]).map((entry) => {
+      const item = asRecord(entry);
+      return `${str(item["kind"])} code=${String(num(item["code"]))} ${str(item["reason"])}`;
+    }),
     logs: list(record["logs"]).map((entry) => str(entry)),
   };
 }
+
 
 /** 送信側の記録と受信側の記録を 1 つの観測へ合わせる。 */
 function merge(sender: ParticipantView, receiver: ParticipantView): ObservedRun {
@@ -271,6 +263,8 @@ function merge(sender: ParticipantView, receiver: ParticipantView): ObservedRun 
     sentVideo: sender.run.sentVideo,
     sentAudio: sender.run.sentAudio,
     lastSentAtMs: sender.run.lastSentAtMs,
+    // 窓は**送信側**の時計で閉じる（判定するのは送ったものである）。
+    windowClosedAtMs: sender.run.windowClosedAtMs,
   };
 }
 
@@ -281,49 +275,93 @@ interface Spec {
   readonly send: boolean;
 }
 
-/** ブラウザで器を回す。 */
-async function runHarness(specs: readonly Spec[], meetingId: string, durationMs: number): Promise<RunView> {
-  const browserRef = browser;
+/**
+ * **参加者ごとに別のブラウザで回す。**
+ *
+ * 1 つのタブで 2 人ぶん（実符号化器 + 実復号器 + 画素のハッシュ）を回すと主筋が競合し、
+ * **到着は安定しているのに提示だけが揺れる**（実測: 到着 643/644 で一定なのに、提示は
+ * 回ごとに 99〜728 枚、描画の間隔は最悪 5.5 秒）。
+ *
+ * ページを分けるだけでは足りない。同じ起点（`127.0.0.1:<port>`）のページは同じ描画処理を
+ * 共有し得るため、**ブラウザそのものを分ける**。実際の会議は端末が別であるから、これが
+ * 現実に近い。
+ *
+ * 各ページは記録を切らずに返す。暖機の切り落としは純関数が内容で行う。
+ */
+async function runParticipants(
+  specs: readonly Spec[],
+  meetingId: string,
+  durationMs: number,
+): Promise<readonly ParticipantView[]> {
   const pageRef = page;
-  if (browserRef === null || pageRef === null) {
-    throw new Error("ブラウザが起動していない");
+  if (pageRef === null) {
+    throw new Error("ページを配れていない");
   }
-  const tab = await browserRef.newPage();
-  const logs: string[] = [];
-  tab.on("console", (message) => logs.push(message.text()));
-  tab.on("pageerror", (error) => logs.push(`pageerror: ${error.message}`));
+  const instances: Browser[] = [];
+  const tabs: Page[] = [];
+  const consoleLogs = specs.map((): string[] => []);
   try {
-    await tab.goto(`http://127.0.0.1:${String(pageRef.port)}/`);
-    await tab.waitForFunction("typeof window.__whesoDegradeSdk === 'function'", undefined, { timeout: 30_000 });
-    const raw: unknown = await tab.evaluate(
-      async ([specsJson, meeting, tokenKey, duration]) => {
-        const runner = window.__whesoDegradeSdk;
-        if (runner === undefined) {
-          return { ok: false, detail: "器が無い" };
+    for (const [index, _spec] of specs.entries()) {
+      const instance = await chromium.launch({ args: [...FAKE_MEDIA_ARGS] });
+      instances.push(instance);
+      const tab = await instance.newPage();
+      tabs.push(tab);
+      const sink = consoleLogs[index] ?? [];
+      tab.on("console", (message) => sink.push(message.text()));
+      tab.on("pageerror", (error) => sink.push(`pageerror: ${error.message}`));
+      await tab.goto(`http://127.0.0.1:${String(pageRef.port)}/`);
+      await tab.waitForFunction("typeof window.__whesoDegradeOne === 'function'", undefined, { timeout: 30_000 });
+    }
+    // **同時に走らせる。** 直列にすると 1 人目が待つ間に相手が居ない状態が続く。
+    const raws = await Promise.all(
+      tabs.map(async (tab, index) => {
+        const spec = specs[index];
+        if (spec === undefined) {
+          return null;
         }
-        const parsed: unknown = JSON.parse(String(specsJson));
-        if (!Array.isArray(parsed)) {
-          return { ok: false, detail: "設定を読めない" };
-        }
-        const list = parsed.map((entry: unknown) => {
-          const item: Record<string, unknown> =
-            typeof entry === "object" && entry !== null ? { ...entry } : {};
-          return {
-            label: String(item["label"]),
-            base: String(item["base"]),
-            userId: String(item["userId"]),
-            send: item["send"] === true,
-          };
-        });
-        return await runner(list, String(meeting), String(tokenKey), Number(duration));
-      },
-      [JSON.stringify(specs), meetingId, DEV_TOKEN_KEY, durationMs],
+        return await tab.evaluate(
+          async ([specJson, meeting, tokenKey, count, duration]) => {
+            const runner = window.__whesoDegradeOne;
+            if (runner === undefined) {
+              return null;
+            }
+            const parsed: unknown = JSON.parse(String(specJson));
+            const item: Record<string, unknown> =
+              typeof parsed === "object" && parsed !== null ? { ...parsed } : {};
+            return await runner(
+              {
+                label: String(item["label"]),
+                base: String(item["base"]),
+                userId: String(item["userId"]),
+                send: item["send"] === true,
+              },
+              String(meeting),
+              String(tokenKey),
+              Number(count),
+              Number(duration),
+            );
+          },
+          [JSON.stringify(spec), meetingId, DEV_TOKEN_KEY, String(specs.length), String(durationMs)],
+        );
+      }),
     );
-    const view = readRun(raw);
-    return { ...view, logs: [...view.logs, ...logs.slice(0, 10)] };
+    return raws.map((raw, index) => {
+      const view = readParticipant(raw);
+      const sink = consoleLogs[index] ?? [];
+      return { ...view, logs: [...view.logs, ...sink.slice(0, 8)] };
+    });
   } finally {
-    await tab.close();
+    await Promise.all(tabs.map(async (tab) => await tab.close()));
+    await Promise.all(instances.map(async (instance) => await instance.close()));
   }
+}
+
+/** 送信する参加者と、指定した名前の受信者を取り出す。 */
+function pick(
+  views: readonly ParticipantView[],
+  label: string,
+): ParticipantView | undefined {
+  return views.find((entry) => entry.label === label);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -332,7 +370,7 @@ async function runHarness(specs: readonly Spec[], meetingId: string, durationMs:
 
 for (const profile of IMPAIRMENT_PROFILES) {
   test(`SDK 経由 ${profile.id}: ${profile.note}`, { timeout: 420_000 }, async (context) => {
-    if (!impairAvailable || live === null || bridgeA === null) {
+    if (!impairAvailable || live === null || bridgeA === null || page === null) {
       context.skip("劣化を適用できない（tc に root が要る）");
       return;
     }
@@ -340,9 +378,9 @@ for (const profile of IMPAIRMENT_PROFILES) {
     const meetingId = newMeetingId();
     const base = `http://127.0.0.1:${String(bridgeA.port)}`;
     const driver = driveProfile(profile.id, seconds, bridgeA.port);
-    let view: RunView;
+    let views: readonly ParticipantView[];
     try {
-      view = await runHarness(
+      views = await runParticipants(
         [
           { label: "送信", base, userId: USER_SENDER, send: true },
           { label: "受信", base, userId: USER_HEALTHY, send: false },
@@ -359,20 +397,38 @@ for (const profile of IMPAIRMENT_PROFILES) {
     assert.equal(driver.failures(), 0, "劣化の適用が失敗していない");
     assert.ok(driver.applied() > 0, "劣化の段が少なくとも 1 度適用された");
 
-    assert.ok(view.ok, `器が記録を取れる（${view.detail} / ${view.logs.join(" | ")}）`);
-    const receiver = view.receivers[0];
+    const sender = pick(views, "送信");
+    const receiver = pick(views, "受信");
+    assert.ok(sender !== undefined, "送信側の記録がある");
     assert.ok(receiver !== undefined, "受信側の記録がある");
-    const built = buildDegradeRecord(merge(view.sender, receiver));
+    if (sender === undefined || receiver === undefined) {
+      return;
+    }
+    const logs = [...sender.logs, ...receiver.logs].join(" | ");
+    // 器が作った切断は製品の欠陥ではない（F-066）。出しておく。
+    const notes = [...sender.closeNotes, ...receiver.closeNotes];
+    assert.ok(
+      sender.run.sentVideo.length > 0,
+      `送信側がワイヤへ出している（記録: ${logs} / 閉鎖: ${notes.join(", ")}）`,
+    );
+    assert.ok(
+      receiver.run.received.length > 0,
+      `受信側が提示できている（記録: ${logs} / 閉鎖: ${notes.join(", ")}）`,
+    );
+    const built = buildDegradeRecord(merge(sender, receiver));
 
     process.stdout.write(
-      `SDK ${profile.id} の実測: 符号化 ${String(view.sender.encodedVideoCount)}` +
-        ` / ワイヤ ${String(view.sender.run.sentVideo.length)}` +
+      `SDK ${profile.id} の実測: 符号化 ${String(sender.encodedVideoCount)}` +
+        ` / ワイヤ ${String(sender.run.sentVideo.length)}` +
         ` / 判定対象 ${String(built.judgedSent)} / 届 ${String(built.record.arrived?.length ?? 0)}` +
         ` / 提示 ${String(built.record.received.length)}` +
-        ` / 音声 ${String(built.record.playedAudio?.length ?? 0)}` +
+        ` / 音声（符号化 ${String(sender.encodedAudioCount)} / ワイヤ ${String(sender.run.sentAudio.length)}` +
+        ` / 再生 ${String(receiver.run.playedAudio.length)}）` +
+        ` / 対 ${String(built.record.playedAudio?.length ?? 0)}` +
+        ` / 連鎖切れ ${String(built.chainBreaks)}` +
         ` / 段の切替 ${String(built.switches.length)}` +
         ` / 要求 ${String(built.record.keyframeRequests)}` +
-        ` / 上り ${String(view.sender.uplinkBps)} bps` +
+        ` / 上り ${String(sender.uplinkBps)} bps` +
         ` / 戻れない切断 ${built.record.closures?.length === 0 ? "なし" : (built.record.closures ?? []).join(", ")}` +
         ` / 戻れた切断 ${built.transientClosures.length === 0 ? "なし" : built.transientClosures.join(", ")}\n`,
     );
@@ -416,7 +472,7 @@ for (const profile of IMPAIRMENT_PROFILES) {
  * 「送信者」を分離できない。
  */
 test("SDK 経由 N-8: 劣化した購読者が健全な購読者を壊さない", { timeout: 420_000 }, async (context) => {
-  if (!impairAvailable || live === null || bridgeA === null || bridgeB === null) {
+  if (!impairAvailable || live === null || bridgeA === null || bridgeB === null || page === null) {
     context.skip("劣化を適用できない（tc に root が要る）");
     return;
   }
@@ -426,9 +482,9 @@ test("SDK 経由 N-8: 劣化した購読者が健全な購読者を壊さない"
   const impairedBase = `http://127.0.0.1:${String(bridgeB.port)}`;
   // 劣化させるのは受信者 B のポートだけである。送信者と受信者 A には何も掛けない。
   const driver = driveProfile("N-6", seconds, bridgeB.port);
-  let view: RunView;
+  let views: readonly ParticipantView[];
   try {
-    view = await runHarness(
+    views = await runParticipants(
       [
         { label: "送信", base: healthyBase, userId: USER_SENDER, send: true },
         { label: "健全", base: healthyBase, userId: USER_HEALTHY, send: false },
@@ -443,17 +499,20 @@ test("SDK 経由 N-8: 劣化した購読者が健全な購読者を壊さない"
 
   assert.equal(driver.failures(), 0, "劣化の適用が失敗していない");
   assert.ok(driver.applied() > 0, "劣化が少なくとも 1 度適用された");
-  assert.ok(view.ok, `器が記録を取れる（${view.detail} / ${view.logs.join(" | ")}）`);
-
-  const healthy = view.receivers.find((entry) => entry.label === "健全");
-  const impaired = view.receivers.find((entry) => entry.label === "劣化");
+  const sender = pick(views, "送信");
+  const healthy = pick(views, "健全");
+  const impaired = pick(views, "劣化");
+  assert.ok(sender !== undefined, "送信側の記録がある");
   assert.ok(healthy !== undefined && impaired !== undefined, "2 人ぶんの受信記録がある");
+  if (sender === undefined || healthy === undefined || impaired === undefined) {
+    return;
+  }
 
-  const healthyBuilt = buildDegradeRecord(merge(view.sender, healthy));
-  const impairedBuilt = buildDegradeRecord(merge(view.sender, impaired));
+  const healthyBuilt = buildDegradeRecord(merge(sender, healthy));
+  const impairedBuilt = buildDegradeRecord(merge(sender, impaired));
 
   process.stdout.write(
-    `SDK N-8 の実測: 送(全段) ${String(view.sender.run.sentVideo.length)}` +
+    `SDK N-8 の実測: ワイヤ ${String(sender.run.sentVideo.length)}` +
       ` / 健全 判定対象 ${String(healthyBuilt.judgedSent)} 届 ${String(
         healthyBuilt.record.arrived?.length ?? 0,
       )} 提示 ${String(healthyBuilt.record.received.length)}` +

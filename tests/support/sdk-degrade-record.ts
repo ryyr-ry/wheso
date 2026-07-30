@@ -76,9 +76,64 @@ export interface ObservedRun {
   readonly decoded: readonly ObservedDecoded[];
   readonly playedAudio: readonly ObservedPlayedAudio[];
   readonly arrived: readonly ObservedArrived[];
-  readonly keyframeRequests: number;
+  /** キーフレームを要求した時刻の一覧（ミリ秒）。暖機より前の要求は数えない。 */
+  readonly keyframeRequestAtMs: readonly number[];
   readonly closures: readonly ObservedClosure[];
   readonly lastSentAtMs: number;
+  /**
+   * 測定の窓を閉じた時刻（ミリ秒）。0 なら窓を閉じていない（全部を判定する）。
+   * これより後に送ったものは、記録を取る時点でまだ経路にあるため判定しない。
+   */
+  readonly windowClosedAtMs: number;
+}
+
+/**
+ * 暖機を切り落とす。
+ *
+ * **切る位置は内容で決める。** 受信側が最初に提示できたフレームの取得時刻より前は、
+ * 経路が整っていない期間である（`NodeLink` が受理前の媒体を捨て、購読が中継ノードへ
+ * 届く前の媒体は転送先が無い）。枚数で切ると、送信側と受信側で切る位置が揃わない。
+ * 参加者ごとに別のページで回すため、片方の枚数から他方の位置を決められない。
+ *
+ * 要求（`keyframeRequestAtMs`）だけは時刻で切る。取得時刻を持たないためである。
+ * 基準にはその最初のフレームを**送った**時刻を使う。
+ */
+export function trimWarmup(run: ObservedRun): ObservedRun {
+  let firstPresentedCaptureUs = -1;
+  for (const entry of run.received) {
+    if (firstPresentedCaptureUs < 0 || entry.captureUs < firstPresentedCaptureUs) {
+      firstPresentedCaptureUs = entry.captureUs;
+    }
+  }
+  if (firstPresentedCaptureUs < 0) {
+    // 1 枚も提示できていない。切らない（そのまま判定して失敗させる）。
+    return run;
+  }
+  let boundaryAtMs = -1;
+  for (const unit of run.sentVideo) {
+    if (unit.captureUs === firstPresentedCaptureUs) {
+      boundaryAtMs = unit.atMs;
+      break;
+    }
+  }
+  const keep = <T extends { readonly captureUs: number }>(list: readonly T[]): readonly T[] =>
+    list.filter((entry) => entry.captureUs >= firstPresentedCaptureUs);
+  // 末尾も切る。窓を閉じた後に送ったものは、記録を取る時点でまだ経路にある。
+  const inWindow = <T extends { readonly captureUs: number; readonly atMs: number }>(
+    list: readonly T[],
+  ): readonly T[] =>
+    keep(list).filter((entry) => run.windowClosedAtMs <= 0 || entry.atMs <= run.windowClosedAtMs);
+  return {
+    ...run,
+    sentVideo: inWindow(run.sentVideo),
+    sentAudio: inWindow(run.sentAudio),
+    received: keep(run.received),
+    decoded: keep(run.decoded),
+    playedAudio: keep(run.playedAudio),
+    arrived: keep(run.arrived),
+    keyframeRequestAtMs:
+      boundaryAtMs < 0 ? run.keyframeRequestAtMs : run.keyframeRequestAtMs.filter((at) => at >= boundaryAtMs),
+  };
 }
 
 /**
@@ -176,7 +231,9 @@ function nearestAudio(sentAudio: readonly ObservedSentAudio[], captureUs: number
  *   音声しか無い映像は「対が無い」として判定から外す。既定は 1 フレーム分に相当する
  *   100 ms とする（15 fps でも 60 fps でも 1 枚は入る）。
  */
-export function buildDegradeRecord(run: ObservedRun, audioPairWindowUs = 100_000): BuiltRecord {
+export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_000): BuiltRecord {
+  // **暖機を先に切る。** 切らずに判定すると、経路が整う前の期間を欠落として数える。
+  const run = trimWarmup(rawRun);
   const timeline = selectionTimeline(run.arrived);
 
   // 1. 判定の対象にする送信ユニットを選ぶ（購読者が選んだ段のみ）。
@@ -240,9 +297,13 @@ export function buildDegradeRecord(run: ObservedRun, audioPairWindowUs = 100_000
     }
   }
   let lastPlayedCaptureUs = -1;
+  let firstPlayedCaptureUs = -1;
   for (const captureUs of playedByCapture.keys()) {
     if (captureUs > lastPlayedCaptureUs) {
       lastPlayedCaptureUs = captureUs;
+    }
+    if (firstPlayedCaptureUs < 0 || captureUs < firstPlayedCaptureUs) {
+      firstPlayedCaptureUs = captureUs;
     }
   }
 
@@ -269,6 +330,17 @@ export function buildDegradeRecord(run: ObservedRun, audioPairWindowUs = 100_000
     }
     if (entry.captureUs > lastPlayedCaptureUs) {
       // まだ経路に音声が残っている。切る。
+      droppedForNoAudio += 1;
+      continue;
+    }
+    if (entry.captureUs < firstPlayedCaptureUs) {
+      // **音声の経路が整う前の映像は D-1 の対象にしない。**
+      //
+      // 音声と映像は別の部屋（`ar` と `vr`）を通り、購読の確立も別である。映像が先に
+      // 流れ始めた期間の映像に「対応する音声が無い」と言っても、それは同期の失敗では
+      // なく確立の順序である。規範は音声の到着が無い間は「映像を止めてはならない」と
+      // 定めており（ADR-0028 の 2、`decidePresent` の `free`）、この期間に同期の責任は
+      // 生じない。実測: 先頭 15 枚がこれで偽の違反になった。
       droppedForNoAudio += 1;
       continue;
     }
@@ -331,7 +403,7 @@ export function buildDegradeRecord(run: ObservedRun, audioPairWindowUs = 100_000
       playedAudio,
       presentedVideo,
       lastSentAtMs: run.lastSentAtMs,
-      keyframeRequests: run.keyframeRequests,
+      keyframeRequests: run.keyframeRequestAtMs.length,
       closures: fatal,
       arrived: arrivedIndexes,
     },

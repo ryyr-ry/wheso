@@ -41,6 +41,73 @@ function sendMedia(state: SenderState, seq: number, flags: number, t = 0): { sta
   return senderStep(state, { kind: "media", ch: CHANNEL_VIDEO, sid: 3, tid: 2, seq, bytes: 40_000, flags }, t);
 }
 
+test("**破棄不可を落としたら次の KEY まで落とし続け、キーフレームを要求する**（規範 1.4）", () => {
+  // 参照が欠けたフレーム列を渡すと復号器は出力を止める。実測（実環境・劣化なし）では
+  // 実際の復号器が 428 件受け取って 204 枚しか出さず `Decoding error` を記録した。
+  const boundary = Math.trunc((SEND_WINDOW_MS * FPS) / 1000);
+  // 破棄不可（DISCARDABLE を立てない）で窓を超える。
+  const dropped = sendMedia(announced(), boundary + 2, FLAG_END_OF_FRAME);
+  assert.deepEqual(
+    dropped.commands.map((c) => c.kind),
+    ["drop", "keyframeRequest"],
+    "落として要求する",
+  );
+
+  // 以後、KEY でないフレームは渡さない（窓の内側の連番でも渡さない）。
+  const next = senderStep(
+    dropped.state,
+    { kind: "media", ch: CHANNEL_VIDEO, sid: 3, tid: 0, seq: 2, bytes: 40_000, flags: FLAG_END_OF_FRAME },
+    0,
+  );
+  assert.equal(
+    next.commands.some((c) => c.kind === "forward"),
+    false,
+    "KEY が来るまで渡さない",
+  );
+  assert.equal(
+    next.commands.some((c) => c.kind === "keyframeRequest"),
+    false,
+    "要求は繰り返さない",
+  );
+
+  // KEY が来たら渡し、連鎖の待ちを解く。
+  const recovered = senderStep(
+    next.state,
+    { kind: "media", ch: CHANNEL_VIDEO, sid: 3, tid: 0, seq: 3, bytes: 40_000, flags: FLAG_END_OF_FRAME | FLAG_KEY },
+    0,
+  );
+  assert.deepEqual(recovered.commands.map((c) => c.kind), ["forward"], "KEY で再開する");
+  const after = senderStep(
+    recovered.state,
+    { kind: "media", ch: CHANNEL_VIDEO, sid: 3, tid: 0, seq: 4, bytes: 40_000, flags: FLAG_END_OF_FRAME },
+    0,
+  );
+  assert.deepEqual(after.commands.map((c) => c.kind), ["forward"], "以後も渡す");
+});
+
+test("破棄可能なユニットを落としてもキーフレームを要求しない（規範 1.4）", () => {
+  // 順位 1 から 3 のみで対処できる場合、要求を発生させてはならない。
+  const boundary = Math.trunc((SEND_WINDOW_MS * FPS) / 1000);
+  const dropped = sendMedia(announced(), boundary + 2, FLAG_END_OF_FRAME | FLAG_DISCARDABLE);
+  assert.deepEqual(dropped.commands.map((c) => c.kind), ["drop"], "落とすだけである");
+  // 連鎖も始まらないため、次のフレームは窓の内側なら渡る。
+  const next = sendMedia(dropped.state, 2, FLAG_END_OF_FRAME | FLAG_DISCARDABLE);
+  assert.deepEqual(next.commands.map((c) => c.kind), ["forward"], "後続は渡す");
+});
+
+test("音声は連鎖の規則の対象外である（段を持たず、破棄もされない）", () => {
+  const boundary = Math.trunc((SEND_WINDOW_MS * FPS) / 1000);
+  const dropped = sendMedia(announced(), boundary + 2, FLAG_END_OF_FRAME);
+  assert.equal(dropped.commands.some((c) => c.kind === "keyframeRequest"), true);
+  // 待ちの間でも音声は渡す。
+  const audio = senderStep(
+    dropped.state,
+    { kind: "media", ch: CHANNEL_AUDIO, sid: 0, tid: 0, seq: 5, bytes: 200, flags: FLAG_END_OF_FRAME },
+    0,
+  );
+  assert.deepEqual(audio.commands.map((c) => c.kind), ["forward"], "音声は必ず渡す");
+});
+
 test("送信窓の内側では転送する", () => {
   // 未確認 1 フレームは 1/60 秒 = 16.7 ms。SEND_WINDOW_MS（200）の内側である。
   const result = sendMedia(announced(), 2, FLAG_END_OF_FRAME | FLAG_DISCARDABLE);

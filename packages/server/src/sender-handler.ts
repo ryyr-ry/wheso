@@ -364,6 +364,14 @@ function applyCommand(command: SenderCommand, transport: SenderTransport): void 
     case "notify":
       transport.notifyControl(command.code);
       return;
+    case "keyframeRequest":
+      // **自分の取得側へ要求する**（規範 1.4）。送信窓で順位 4・5 を落としたら、次の KEY まで
+      // 落とし続ける。要求しなければ、復号器は次の自然なキーフレームまで何も出せない
+      // （実測: 復号器が 428 件受け取って 204 枚しか出さず `Decoding error` を記録した）。
+      transport.sendTextToClient(
+        JSON.stringify({ t: "keyframeRequest", channel: command.channel, spatialId: command.spatialId }),
+      );
+      return;
     case "schedule":
       transport.scheduleAt(command.at);
       return;

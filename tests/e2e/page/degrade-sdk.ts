@@ -35,7 +35,7 @@ import type { CaptureOutput } from "../../../packages/client/src/media/browser-c
 import type { DecodeInput } from "../../../packages/client/src/api/receive-pipeline.ts";
 import { issueToken } from "../../../packages/core/src/auth.ts";
 import { decodeMediaMessage } from "../../../packages/core/src/wire.ts";
-import { CHANNEL_VIDEO, FLAG_KEY } from "../../../packages/core/src/generated/wire-layout.ts";
+import { CHANNEL_AUDIO, CHANNEL_VIDEO, FLAG_KEY } from "../../../packages/core/src/generated/wire-layout.ts";
 import { V_360P15 } from "../../../packages/core/src/generated/constants.ts";
 
 /** 送った映像ユニット 1 件。`frameIndex` は送出の順に振る（器の中でのみ意味を持つ）。 */
@@ -105,28 +105,65 @@ export interface SdkDegradeParticipant {
   readonly sentVideo: readonly SentVideo[];
   /** 符号化器が出したユニットの数（送信経路が落とした量を見るための観測）。 */
   readonly encodedVideoCount: number;
+  /**
+   * 符号化器が出した音声ユニットの数（観測）。
+   *
+   * **判定に使うのはワイヤへ出た音声である**（`sentAudio`）。送信経路は無音（DTX）を
+   * 送らないため、符号化器の数と一致しない。符号化器の数で対を作ると、送っていない音声に
+   * 対して「再生されていない」と読む（実測: 2,300 対 2,130 の差で D-1 が 23 件出た）。
+   */
+  readonly encodedAudioCount: number;
+  /**
+   * 復号器の出入り（観測）。**「届いたのに出ない」の原因はここで分かれる。**
+   *
+   * 初期化のやり直し（`reset`）が多ければキーフレーム待ちで止まっており、失敗（`error`）が
+   * 多ければ参照連鎖が壊れている。この区別が付かないと原因の層を毎回取り違える（X-043）。
+   */
+  readonly decoderEvents: {
+    readonly configure: number;
+    readonly reset: number;
+    readonly close: number;
+    readonly error: number;
+  };
   readonly sentAudio: readonly SentAudio[];
   readonly received: readonly ReceivedVideo[];
   readonly decoded: readonly DecodedVideo[];
   readonly playedAudio: readonly PlayedAudio[];
   readonly arrived: readonly ArrivedVideo[];
-  readonly keyframeRequests: number;
+  /**
+   * キーフレームを要求した時刻の一覧（ミリ秒）。
+   *
+   * **数ではなく時刻で持つ。** 暖機の切り落としは Node 側が内容で行うため、切る位置より
+   * 前の要求を除くには時刻が必要である。購読を張った直後の要求は規範どおりであり
+   * （`wire-format.md` 2.5）、違反に数えてはならない。
+   */
+  readonly keyframeRequestAtMs: readonly number[];
   readonly closures: readonly ClosureRecord[];
   readonly lastSentAtMs: number;
+  /**
+   * 測定の窓を閉じた時刻（ミリ秒）。
+   *
+   * **これより後に送ったものは判定しない。** 窓を閉じた後も送出は続く（止めると
+   * 「止めたこと」自体が経路に影響する）。閉じた後の数枚は、記録を取る時点でまだ経路に
+   * あるため「届かなかった」と読まれる（実測: 末尾 4 件が B-2 の違反になった）。
+   * 排水の待ちは、窓の中で送ったものが届くための時間である。
+   */
+  readonly windowClosedAtMs: number;
   readonly uplinkBps: number;
   readonly downlinkBps: number;
   readonly participantCount: number;
-}
-
-export interface SdkDegradeResult {
-  readonly ok: boolean;
-  readonly detail: string;
-  /** 閉鎖の理由（部屋の種別・コード・理由の文）。原因の切り分けに使う。 */
-  readonly closeNotes: readonly { readonly kind: string; readonly code: number; readonly reason: string }[];
-  /** 送信側の記録（`sentVideo` / `sentAudio` が意味を持つ）。 */
-  readonly sender: SdkDegradeParticipant;
-  /** 受信側の記録（`received` / `playedAudio` / `arrived` が意味を持つ）。 */
-  readonly receivers: readonly SdkDegradeParticipant[];
+  /** 実際の復号器の出入り（生成・設定・投入・出力・失敗）。 */
+  readonly decoderIo: {
+    readonly created: number;
+    readonly configured: number;
+    readonly submitted: number;
+    readonly output: number;
+    readonly failed: number;
+    readonly messages: readonly string[];
+  };
+  /** この参加者のページで観測した閉鎖の理由。 */
+  readonly closeNotes: readonly CloseNote[];
+  /** この参加者のページの記録（誤りの通知など）。 */
   readonly logs: readonly string[];
 }
 
@@ -142,12 +179,14 @@ interface Spec {
 
 declare global {
   interface Window {
-    __whesoDegradeSdk?: (
-      specs: readonly Spec[],
+    /** **1 ページに 1 人**。参加者ごとに別のページで回す（`runOne` の注記）。 */
+    __whesoDegradeOne?: (
+      spec: Spec,
       meetingId: string,
       tokenKey: string,
+      participantCount: number,
       durationMs: number,
-    ) => Promise<SdkDegradeResult>;
+    ) => Promise<SdkDegradeParticipant>;
   }
 }
 
@@ -171,6 +210,52 @@ interface CloseNote {
 }
 
 const closeNotes: CloseNote[] = [];
+
+/**
+ * 実際の復号器の出入り（観測）。
+ *
+ * 注入の口では「投入した数」しか分からない。**復号器が何枚出したか**は本物を包まないと
+ * 分からず、「届いたのに出ない」の原因を投入・出力・失敗のどこにも切り分けられない
+ * （`tests/e2e/page/sdk.ts` と同じ技法）。
+ */
+const decoderIo = { created: 0, configured: 0, submitted: 0, output: 0, failed: 0 };
+const decoderMessages: string[] = [];
+
+function installDecoderWatch(): void {
+  const original = globalThis.VideoDecoder;
+  if (typeof original !== "function") {
+    return;
+  }
+  class WatchedDecoder extends original {
+    constructor(init: VideoDecoderInit) {
+      super({
+        output: (frame: VideoFrame): void => {
+          decoderIo.output += 1;
+          init.output(frame);
+        },
+        error: (error: DOMException): void => {
+          decoderIo.failed += 1;
+          if (decoderMessages.length < 5) {
+            decoderMessages.push(String(error.message));
+          }
+          init.error(error);
+        },
+      });
+      decoderIo.created += 1;
+    }
+
+    override configure(config: VideoDecoderConfig): void {
+      decoderIo.configured += 1;
+      super.configure(config);
+    }
+
+    override decode(chunk: EncodedVideoChunk): void {
+      decoderIo.submitted += 1;
+      super.decode(chunk);
+    }
+  }
+  globalThis.VideoDecoder = WatchedDecoder;
+}
 
 function installSocketWatch(): void {
   const original = globalThis.WebSocket;
@@ -242,6 +327,8 @@ interface Recorder {
   readonly label: string;
   readonly sentVideo: SentVideo[];
   encodedVideoCount: number;
+  encodedAudioCount: number;
+  readonly decoderEvents: { configure: number; reset: number; close: number; error: number };
   readonly sentAudio: SentAudio[];
   readonly received: ReceivedVideo[];
   readonly decoded: DecodedVideo[];
@@ -249,9 +336,10 @@ interface Recorder {
   readonly arrived: ArrivedVideo[];
   /** 二度数えを防ぐ鍵の集合（`段:連番`）。注入の口は複数回 `onBinary` を登録する。 */
   readonly arrivedKeys: Set<string>;
-  keyframeRequests: number;
+  readonly keyframeRequestAtMs: number[];
   readonly closures: ClosureRecord[];
   lastSentAtMs: number;
+  windowClosedAtMs: number;
   frameCounter: number;
 }
 
@@ -260,15 +348,18 @@ function newRecorder(label: string): Recorder {
     label,
     sentVideo: [],
     encodedVideoCount: 0,
+    encodedAudioCount: 0,
+    decoderEvents: { configure: 0, reset: 0, close: 0, error: 0 },
     sentAudio: [],
     received: [],
     decoded: [],
     playedAudio: [],
     arrived: [],
     arrivedKeys: new Set<string>(),
-    keyframeRequests: 0,
+    keyframeRequestAtMs: [],
     closures: [],
     lastSentAtMs: 0,
+    windowClosedAtMs: 0,
     frameCounter: 0,
   };
 }
@@ -300,7 +391,10 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
           });
           output.onFrame(senderId, frame);
         },
-        onDecodeError: (senderId, channel): void => output.onDecodeError(senderId, channel),
+        onDecodeError: (senderId, channel): void => {
+          recorder.decoderEvents.error += 1;
+          output.onDecodeError(senderId, channel);
+        },
         onDisplaySize: (participantId, width, height): void =>
           output.onDisplaySize(participantId, width, height),
       });
@@ -315,11 +409,8 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
             output.onVideo(video);
           },
           onAudio: (audio): void => {
-            recorder.sentAudio.push({
-              captureUs: Number(audio.captureTimestampUs),
-              atMs: Date.now(),
-              silent: audio.silent,
-            });
+            // 符号化器が出した数だけを数える。**ワイヤへ出た音声は送信の口で数える。**
+            recorder.encodedAudioCount += 1;
             output.onAudio(audio);
           },
         });
@@ -327,6 +418,18 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
     },
     media: {
       ...base.media,
+      configureDecoder: (senderId: number, channel: number, spatialId: number): void => {
+        recorder.decoderEvents.configure += 1;
+        base.media.configureDecoder(senderId, channel, spatialId);
+      },
+      resetDecoder: (senderId: number, channel: number, spatialId: number): void => {
+        recorder.decoderEvents.reset += 1;
+        base.media.resetDecoder(senderId, channel, spatialId);
+      },
+      closeDecoder: (senderId: number, channel: number): void => {
+        recorder.decoderEvents.close += 1;
+        base.media.closeDecoder(senderId, channel);
+      },
       decodeVideo: (input: DecodeInput): void => {
         recorder.decoded.push({
           captureUs: input.captureTimestampUs,
@@ -354,12 +457,12 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
         ...socket,
         send: (text: string): void => {
           if (text.includes("keyframeRequest")) {
-            recorder.keyframeRequests += 1;
+            recorder.keyframeRequestAtMs.push(Date.now());
           }
           socket.send(text);
         },
         sendBinary: (bytes: Uint8Array): void => {
-          // **ワイヤへ出た映像を数える**（送信経路の判断の後）。
+          // **ワイヤへ出た媒体を数える**（送信経路の判断の後）。
           const message = decodeMediaMessage(bytes);
           if (message.ok && message.value.channel === CHANNEL_VIDEO) {
             for (const unit of message.value.units) {
@@ -373,6 +476,13 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
                 captureUs: Number(unit.captureTimestampUs),
                 atMs: recorder.lastSentAtMs,
               });
+            }
+          }
+          if (message.ok && message.value.channel === CHANNEL_AUDIO) {
+            // ワイヤへ出た音声は対の相手になれる。無音（DTX）はここまで来ない。
+            const atMs = Date.now();
+            for (const unit of message.value.units) {
+              recorder.sentAudio.push({ captureUs: Number(unit.captureTimestampUs), atMs, silent: false });
             }
           }
           socket.sendBinary(bytes);
@@ -494,17 +604,23 @@ function snapshot(joined: Joined): SdkDegradeParticipant {
     label: recorder.label,
     sentVideo: [...recorder.sentVideo],
     encodedVideoCount: recorder.encodedVideoCount,
+    encodedAudioCount: recorder.encodedAudioCount,
+    decoderEvents: { ...recorder.decoderEvents },
+    decoderIo: { ...decoderIo, messages: [...decoderMessages] },
     sentAudio: [...recorder.sentAudio],
     received: [...recorder.received],
     decoded: [...recorder.decoded],
     playedAudio: [...recorder.playedAudio],
     arrived: [...recorder.arrived],
-    keyframeRequests: recorder.keyframeRequests,
+    keyframeRequestAtMs: [...recorder.keyframeRequestAtMs],
     closures: [...recorder.closures],
     lastSentAtMs: recorder.lastSentAtMs,
+    windowClosedAtMs: recorder.windowClosedAtMs,
     uplinkBps: joined.uplinkBps(),
     downlinkBps: joined.downlinkBps(),
     participantCount: joined.participants(),
+    closeNotes: [],
+    logs: [],
   };
 }
 
@@ -512,160 +628,85 @@ const EMPTY: SdkDegradeParticipant = {
   label: "",
   sentVideo: [],
   encodedVideoCount: 0,
+  encodedAudioCount: 0,
+  decoderEvents: { configure: 0, reset: 0, close: 0, error: 0 },
+  decoderIo: { created: 0, configured: 0, submitted: 0, output: 0, failed: 0, messages: [] },
   sentAudio: [],
   received: [],
   decoded: [],
   playedAudio: [],
   arrived: [],
-  keyframeRequests: 0,
+  keyframeRequestAtMs: [],
   closures: [],
   lastSentAtMs: 0,
+  windowClosedAtMs: 0,
   uplinkBps: 0,
   downlinkBps: 0,
   participantCount: 0,
+  closeNotes: [],
+  logs: [],
 };
 
-async function run(
-  specs: readonly Spec[],
+/**
+ * **1 つのページで 1 人だけを回す。**
+ *
+ * なぜ 1 人ずつにするか: 1 つのタブで 2 人ぶん（実符号化器 + 実復号器 + 画素のハッシュ）を
+ * 回すと主筋が競合し、**到着は安定しているのに提示だけが揺れる**（実測: 到着 643/644 で
+ * 一定なのに、提示は回ごとに 99〜728 枚、描画の間隔は最悪 5.5 秒）。実際の会議は端末が
+ * 別であるから、ページを分ける方が現実に近く、器の重さを測定に混ぜない。
+ *
+ * 記録は**切らずに全部返す**。暖機の切り落としは Node 側の純関数が内容（取得時刻）で行う
+ * （`tests/support/sdk-degrade-record.ts`）。ページごとに切ると、送信側と受信側で切る位置が
+ * 揃わない。
+ */
+async function runOne(
+  spec: Spec,
   meetingId: string,
   tokenKey: string,
+  participantCount: number,
   durationMs: number,
-): Promise<SdkDegradeResult> {
+): Promise<SdkDegradeParticipant> {
   installSocketWatch();
+  installDecoderWatch();
   const logs: string[] = [];
-  const joinedAll: Joined[] = [];
-  let sender: Joined | null = null;
-  for (const spec of specs) {
-    const joined = await joinOne(spec, meetingId, tokenKey, logs);
-    if (joined === null) {
-      for (const open of joinedAll) {
-        open.leave();
-      }
-      return {
-        ok: false,
-        detail: `参加に失敗した: ${logs.join(" | ")}`,
-        closeNotes: [...closeNotes],
-        sender: EMPTY,
-        receivers: [],
-        logs,
-      };
-    }
-    joinedAll.push(joined);
-    if (spec.send) {
-      sender = joined;
-    }
-  }
-  if (sender === null) {
-    for (const open of joinedAll) {
-      open.leave();
-    }
-    return { ok: false, detail: "送信する参加者が居ない", closeNotes: [...closeNotes], sender: EMPTY, receivers: [], logs };
+  const joined = await joinOne(spec, meetingId, tokenKey, logs);
+  if (joined === null) {
+    return { ...EMPTY, label: spec.label, logs, closeNotes: [...closeNotes] };
   }
 
   // 名簿が行き渡るまで待つ。**互いを認識する前に測り始めると、購読が張られる前の
   // 期間を「欠落」と読む。**
   const deadlineForRoster = Date.now() + 30_000;
   while (Date.now() < deadlineForRoster) {
-    if (joinedAll.every((entry) => entry.participants() >= specs.length)) {
+    if (joined.participants() >= participantCount) {
       break;
     }
     await sleep(500);
-  }
-
-  const senderRecorder = sender.recorder;
-  // 暖機のあいだの記録は捨てる。経路が整うまでの数枚は捨てられる（`NodeLink` が
-  // 受理前の媒体を捨て、購読が中継ノードへ届く前の媒体は転送先が無い）。
-  const warmupDeadline = Date.now() + 20_000;
-  while (Date.now() < warmupDeadline) {
-    if (joinedAll.some((entry) => entry !== sender && entry.recorder.received.length > 0)) {
-      break;
-    }
-    await sleep(250);
-  }
-  const warmupSentVideo = senderRecorder.sentVideo.length;
-  const warmupSentAudio = senderRecorder.sentAudio.length;
-  const warmupByReceiver = new Map<
-    string,
-    { received: number; decoded: number; arrived: number; audio: number; keyframeRequests: number }
-  >();
-  for (const entry of joinedAll) {
-    warmupByReceiver.set(entry.recorder.label, {
-      received: entry.recorder.received.length,
-      decoded: entry.recorder.decoded.length,
-      arrived: entry.recorder.arrived.length,
-      audio: entry.recorder.playedAudio.length,
-      // **暖機の要求は数えない。** 購読を張った直後は差分フレームから始まるため、
-      // 復号器がキーフレームを要求するのは規範どおりである（wire-format.md 2.5）。
-      keyframeRequests: entry.recorder.keyframeRequests,
-    });
   }
 
   const deadline = Date.now() + durationMs;
   while (Date.now() < deadline) {
     await sleep(500);
   }
+  // **窓を閉じた時刻を控える。** これより後に送ったものは判定しない（`windowClosedAtMs`）。
+  joined.recorder.windowClosedAtMs = Date.now();
+  // 経路に残っているものを数え切る。窓の中で送ったものが届くのを待つ。
+  await sleep(3000);
 
-  // 経路に残っているものを数え切る。送出を止めた直後に読むと、まだ飛んでいる
-  // 音声が「再生されていない」と読まれる。
-  await sleep(2000);
-
-  const senderSnapshot = snapshot(sender);
-  const receivers: SdkDegradeParticipant[] = [];
-  for (const entry of joinedAll) {
-    if (entry === sender) {
-      continue;
-    }
-    const warm =
-      warmupByReceiver.get(entry.recorder.label) ??
-      { received: 0, decoded: 0, arrived: 0, audio: 0, keyframeRequests: 0 };
-    const full = snapshot(entry);
-    receivers.push({
-      ...full,
-      // 暖機ぶんを切り落とす。**枚数で切る**（時刻で切ると門でずれた分を取り違える）。
-      received: full.received.slice(warm.received),
-      decoded: full.decoded.slice(warm.decoded),
-      arrived: full.arrived.slice(warm.arrived),
-      playedAudio: full.playedAudio.slice(warm.audio),
-      keyframeRequests: full.keyframeRequests - warm.keyframeRequests,
-    });
-  }
-  const trimmedSender: SdkDegradeParticipant = {
-    ...senderSnapshot,
-    sentVideo: senderSnapshot.sentVideo.slice(warmupSentVideo),
-    sentAudio: senderSnapshot.sentAudio.slice(warmupSentAudio),
-  };
-
-  for (const entry of joinedAll) {
-    entry.leave();
-  }
-
-  const anyReceived = receivers.some((entry) => entry.received.length > 0);
-  return {
-    closeNotes: [...closeNotes],
-    ok: trimmedSender.sentVideo.length > 0 && anyReceived,
-    detail:
-      trimmedSender.sentVideo.length === 0
-        ? "送信していない（符号化器が動いていない）"
-        : anyReceived
-          ? "SDK 経由で送受信できた"
-          : "受信側が 1 枚も提示できていない",
-    sender: trimmedSender,
-    receivers,
-    logs,
-  };
+  const result = snapshot(joined);
+  joined.leave();
+  return { ...result, logs, closeNotes: [...closeNotes] };
 }
 
-window.__whesoDegradeSdk = async (specs, meetingId, tokenKey, durationMs) => {
+window.__whesoDegradeOne = async (spec, meetingId, tokenKey, participantCount, durationMs) => {
   try {
-    return await run(specs, meetingId, tokenKey, durationMs);
+    return await runOne(spec, meetingId, tokenKey, participantCount, durationMs);
   } catch (error) {
     return {
-      ok: false,
-      detail: error instanceof Error ? `${error.name}: ${error.message}` : "不明な失敗",
+      ...EMPTY,
+      label: spec.label,
+      logs: [error instanceof Error ? `${error.name}: ${error.message}` : "不明な失敗"],
       closeNotes: [...closeNotes],
-      sender: EMPTY,
-      receivers: [],
-      logs: [],
     };
   }
 };

@@ -63,9 +63,11 @@ function baseRun(frames: number, options: { readonly arriveLayer0?: boolean } = 
     decoded,
     playedAudio,
     arrived,
-    keyframeRequests: 0,
+    keyframeRequestAtMs: [],
     closures: [],
     lastSentAtMs: 1000 + frames * 66,
+    // 0 は「窓を閉じていない」。末尾の切り落としを試験する回だけ上書きする。
+    windowClosedAtMs: 0,
   };
 }
 
@@ -174,6 +176,113 @@ test("**参照連鎖が切れた回数を数える**（判定 E-1 の許容の�
   assert.ok(discardable !== undefined);
   const arrived2 = run.arrived.filter((entry) => entry.captureUs !== discardable.captureUs);
   assert.equal(buildDegradeRecord({ ...run, arrived: arrived2 }).chainBreaks, 0, "破棄可能は数えない");
+});
+
+test("**暖機は内容で切る**（提示できた最初のフレームより前を捨てる）", () => {
+  const run = baseRun(10);
+  // 最初の 3 枚は経路が整う前で、届かず提示もされなかったことにする。
+  const early = new Set(run.sentVideo.filter((entry) => entry.frameIndex <= 6).map((entry) => entry.captureUs));
+  const trimmed = buildDegradeRecord({
+    ...run,
+    arrived: run.arrived.filter((entry) => !early.has(entry.captureUs)),
+    decoded: run.decoded.filter((entry) => !early.has(entry.captureUs)),
+    received: run.received.filter((entry) => !early.has(entry.captureUs)),
+    playedAudio: run.playedAudio.filter((entry) => !early.has(entry.captureUs)),
+  });
+  // 3 枚ぶん（段 0 と段 1 の対で 6 ユニット）を切るため、判定の対象は 7 件になる。
+  assert.equal(trimmed.judgedSent, 7, "切った後の送信だけを判定する");
+  assert.deepEqual(judgeDrops(trimmed.record), [], "経路が整う前の欠落は違反にしない");
+  assert.equal(trimmed.chainBreaks, 0);
+});
+
+test("**暖機より後の欠落は切り落とされない**（切り落としが穴にならない）", () => {
+  const run = baseRun(10);
+  // 後半の 1 枚（破棄できない層）だけを落とす。
+  const late = run.sentVideo.find((entry) => entry.spatialId === 0 && entry.temporalId === 0 && entry.frameIndex > 10);
+  assert.ok(late !== undefined);
+  const built = buildDegradeRecord({
+    ...run,
+    arrived: run.arrived.filter((entry) => entry.captureUs !== late.captureUs),
+  });
+  assert.equal(built.chainBreaks, 1, "落ちたことを数える");
+  assert.equal(judgeDrops(built.record).length, 1, "違反として残る");
+});
+
+test("暖機の切り落としでキーフレーム要求も切られる（時刻で切る）", () => {
+  const run = baseRun(10);
+  const early = new Set(run.sentVideo.filter((entry) => entry.frameIndex <= 6).map((entry) => entry.captureUs));
+  const firstKept = run.sentVideo.find((entry) => !early.has(entry.captureUs));
+  assert.ok(firstKept !== undefined);
+  const built = buildDegradeRecord({
+    ...run,
+    arrived: run.arrived.filter((entry) => !early.has(entry.captureUs)),
+    decoded: run.decoded.filter((entry) => !early.has(entry.captureUs)),
+    received: run.received.filter((entry) => !early.has(entry.captureUs)),
+    // 1 件目は暖機の中、2 件目は後である。
+    keyframeRequestAtMs: [firstKept.atMs - 500, firstKept.atMs + 500],
+  });
+  assert.equal(built.record.keyframeRequests, 1, "暖機の中の要求は数えない");
+});
+
+test("**窓を閉じた後に送ったものは判定しない**（排水の間の送出）", () => {
+  const run = baseRun(10);
+  // 最後の 2 枚（4 ユニット）は窓を閉じた後に送ったことにする。
+  const boundary = run.sentVideo[run.sentVideo.length - 5]?.atMs ?? 0;
+  const late = new Set(run.sentVideo.filter((entry) => entry.atMs > boundary).map((entry) => entry.captureUs));
+  assert.ok(late.size > 0, "窓の外の送出がある");
+  const built = buildDegradeRecord({
+    ...run,
+    windowClosedAtMs: boundary,
+    // 窓の外のものは届いていない（まだ経路にある）。
+    arrived: run.arrived.filter((entry) => !late.has(entry.captureUs)),
+    decoded: run.decoded.filter((entry) => !late.has(entry.captureUs)),
+    received: run.received.filter((entry) => !late.has(entry.captureUs)),
+  });
+  assert.deepEqual(judgeDrops(built.record), [], "排水の間の送出は欠落として数えない");
+  assert.equal(built.chainBreaks, 0);
+});
+
+test("**窓の内側の欠落は切り落とされない**（末尾の切り落としが穴にならない）", () => {
+  const run = baseRun(10);
+  const boundary = run.sentVideo[run.sentVideo.length - 1]?.atMs ?? 0;
+  // 窓の内側（真ん中）の破棄できない層を 1 枚落とす。
+  const middle = run.sentVideo.find((entry) => entry.spatialId === 0 && entry.temporalId === 0 && entry.frameIndex > 8);
+  assert.ok(middle !== undefined);
+  const built = buildDegradeRecord({
+    ...run,
+    windowClosedAtMs: boundary,
+    arrived: run.arrived.filter((entry) => entry.captureUs !== middle.captureUs),
+  });
+  assert.equal(built.chainBreaks, 1);
+  assert.equal(judgeDrops(built.record).length, 1, "違反として残る");
+});
+
+test("**音声の経路が整う前の映像は D-1 の対象にしない**（確立の順序は同期の失敗ではない）", () => {
+  const run = baseRun(10);
+  // 先頭 3 枚に対応する音声はまだ再生されていない（音声の購読が後から整った）。
+  const early = new Set(
+    run.sentAudio.filter((_entry, index) => index < 3).map((entry) => entry.captureUs),
+  );
+  const built = buildDegradeRecord({
+    ...run,
+    playedAudio: run.playedAudio.filter((entry) => !early.has(entry.captureUs)),
+  });
+  assert.deepEqual(judgeAvSkew(built.record, 22, 30), [], "先頭は違反にしない");
+  assert.equal(built.droppedForNoAudio, 3, "外した数を数える");
+});
+
+test("**整った後に音声が欠けたら違反として残る**（頭の切り落としが穴にならない）", () => {
+  const run = baseRun(10);
+  // 真ん中の 1 件だけ再生されていない。
+  const middle = run.sentAudio[5];
+  assert.ok(middle !== undefined);
+  const built = buildDegradeRecord({
+    ...run,
+    playedAudio: run.playedAudio.filter((entry) => entry.captureUs !== middle.captureUs),
+  });
+  const violations = judgeAvSkew(built.record, 22, 30);
+  assert.equal(violations.length, 1, JSON.stringify(violations));
+  assert.match(violations[0]?.detail ?? "", /対応する音声/);
 });
 
 test("**戻れない閉鎖だけが失敗になる**（設計どおりの再接続を失敗と読まない）", () => {

@@ -18,6 +18,12 @@ import {
   EPOCH_DUAL_SUBSCRIBE_TIMEOUT_MS,
 } from "./generated/constants.ts";
 import { dropPriority } from "./wire.ts";
+import { CHANNEL_AUDIO, CHANNEL_SCREEN_AUDIO, FLAG_KEY } from "./generated/wire-layout.ts";
+
+/** 音声のチャネルか。音声には段が無く、連鎖の規則の対象でもない（規範 1.4）。 */
+function isAudioChannel(channel: number): boolean {
+  return channel === CHANNEL_AUDIO || channel === CHANNEL_SCREEN_AUDIO;
+}
 
 /** epoch 移行の状態（state-machines.md 5 節）。 */
 export type MigrationPhase = "STEADY" | "DUAL_SUBSCRIBE" | "MIGRATING";
@@ -26,6 +32,17 @@ export type MigrationPhase = "STEADY" | "DUAL_SUBSCRIBE" | "MIGRATING";
 export interface StreamWindow {
   readonly channel: number;
   readonly spatialId: number;
+  /**
+   * 破棄不可のユニット（優先順位 4・5）を落とし、次の KEY を待っているか。
+   *
+   * **規範 `wire-format.md` 1.4**: 順位 4 と 5 を破棄する場合は、デコーダの参照連鎖が
+   * 壊れるため、必ず同一 (senderId, channel, spatialId) の次の KEY ユニットまで連続して
+   * 破棄し、キーフレームを要求する。中継ノードには入れた（ADR-0046）が、送信ノードも
+   * 送信窓で順位 4 を落とす。実測（実環境・劣化なし）では、送信ノードが 1 枚落とした後に
+   * 後続を渡したため、**実際の復号器が 428 件受け取って 204 枚しか出さず
+   * `Decoding error` を記録した**。
+   */
+  readonly awaitingKey: boolean;
   /** 送信済みの最大 sequenceNumber。 */
   readonly highestSent: number;
   /** ack で確認された最大 sequenceNumber。 */
@@ -87,6 +104,12 @@ export type SenderCommand =
   | { readonly kind: "disconnect"; readonly peer: number }
   | { readonly kind: "unsubscribeStale" }
   | { readonly kind: "notify"; readonly code: string }
+  /**
+   * 自分の取得側へキーフレームを要求する（規範 1.4）。
+   * 送信ノードは送信窓で順位 4・5 を落とすことがあり、落としたら要求しなければ
+   * 復号器は次の自然なキーフレームまで何も出せない。
+   */
+  | { readonly kind: "keyframeRequest"; readonly channel: number; readonly spatialId: number }
   | { readonly kind: "schedule"; readonly at: number };
 
 export interface SenderStepResult {
@@ -149,6 +172,31 @@ function handleMedia(
 
   const priority = dropPriority(event.ch, event.flags);
   const overWindow = framerate > 0 && inFlight * 1000 > SEND_WINDOW_MS * framerate;
+  const isKey = (event.flags & FLAG_KEY) !== 0;
+
+  // **参照連鎖が切れている間は、次の KEY まで落とし続ける**（規範 1.4）。
+  // 1 枚落とした後に後続を渡すと、復号器は参照の無いフレームを受け取り出力を止める。
+  if (window !== undefined && window.awaitingKey && !isAudioChannel(event.ch)) {
+    if (!isKey) {
+      return {
+        state,
+        commands: priority === null ? [] : [{ kind: "drop", priority, count: 1 }],
+      };
+    }
+    // KEY が来た。待ちを解いて渡す。
+    const reopened = upsertWindow(state, {
+      channel: event.ch,
+      spatialId: event.sid,
+      highestSent: event.seq > window.highestSent ? event.seq : window.highestSent,
+      highestAcked: window.highestAcked,
+      framerate: window.framerate,
+      lastAckAtMs: window.lastAckAtMs,
+      awaitingKey: false,
+    });
+    const targetsForKey =
+      state.phase === "DUAL_SUBSCRIBE" ? [SHARD_PEER_CURRENT, SHARD_PEER_NEXT] : [SHARD_PEER_CURRENT];
+    return { state: reopened, commands: [{ kind: "forward", to: targetsForKey }] };
+  }
 
   // **ack が途絶えたら窓を作り直す**（ADR-0038）。渡した媒体が失われると ack は来ない。
   // 窓を閉じたままにすると、その 1 度の欠落で以後 1 枚も送れなくなる。
@@ -163,6 +211,8 @@ function handleMedia(
         highestAcked: event.seq - 1,
         framerate,
         lastAckAtMs: t,
+        // 窓を作り直したので連鎖の待ちも解く（この連番から数え直す）。
+        awaitingKey: false,
       }),
       commands: [
         {
@@ -175,7 +225,28 @@ function handleMedia(
 
   if (overWindow && priority !== null) {
     // 窓が閉じている間は渡さない。破棄禁止のユニット（KEY・音声）は渡す。
-    return { state, commands: [{ kind: "drop", priority, count: 1 }] };
+    //
+    // **順位 4・5 を落としたら次の KEY まで落とし続け、キーフレームを要求する**（規範 1.4）。
+    // 順位 1 から 3（破棄可能）では連鎖を始めず、要求も作らない。
+    const breaksChain = priority === 4 || priority === 5;
+    if (!breaksChain) {
+      return { state, commands: [{ kind: "drop", priority, count: 1 }] };
+    }
+    return {
+      state: upsertWindow(state, {
+        channel: event.ch,
+        spatialId: event.sid,
+        highestSent: window?.highestSent ?? 0,
+        highestAcked,
+        framerate,
+        lastAckAtMs,
+        awaitingKey: true,
+      }),
+      commands: [
+        { kind: "drop", priority, count: 1 },
+        { kind: "keyframeRequest", channel: event.ch, spatialId: event.sid },
+      ],
+    };
   }
 
   const updated = upsertWindow(state, {
@@ -185,6 +256,7 @@ function handleMedia(
     highestAcked,
     framerate,
     lastAckAtMs,
+    awaitingKey: false,
   });
 
   // 二重購読中は新旧の両方へ渡す。切替の瞬間に映像を途切れさせないためである。
@@ -233,6 +305,7 @@ function handleAnnounce(
       framerate: event.framerate,
       // 申告の時点を起点にする。ここから ACK_TIMEOUT_MS 無音なら窓を作り直す。
       lastAckAtMs: window?.lastAckAtMs ?? t,
+      awaitingKey: window?.awaitingKey ?? false,
     }),
     commands: [],
   };
