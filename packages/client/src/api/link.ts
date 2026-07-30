@@ -132,6 +132,11 @@ export interface Link {
   readonly noteStall: (durationMs: number) => void;
   /** 報告の周期を伝える。 */
   readonly noteReportTimer: () => void;
+  /**
+   * 死活の点検（規範 1 節の `HEARTBEAT_TIMEOUT_MS`）。心拍の周期で呼ぶ。
+   * 応答が `HEARTBEAT_TIMEOUT_MS` 途絶えていれば、こちらから閉じて張り直す。
+   */
+  readonly checkLiveness: () => void;
   /** 遅延勾配の劣化と回復を伝える。 */
   readonly noteTrend: (degrading: boolean) => void;
   /** 再接続の回数。観測のために数える。 */
@@ -343,6 +348,11 @@ export function createLink(deps: LinkDeps): Link {
       dispatch({ kind: "socketOpen" });
     });
     created.onClose((code) => {
+      // **今の主でなければ無視する。** 張り直した後に古い実体の閉鎖が届くことがある。
+      // 受け入れると、生きている新しい接続を「切れた」と扱ってしまう。
+      if (socket !== created) {
+        return;
+      }
       open = false;
       socket = null;
       // 経路が切れた。次に繋がったときは対応付けを作り直す。
@@ -350,12 +360,26 @@ export function createLink(deps: LinkDeps): Link {
       dispatch({ kind: "socketClose", code });
     });
     created.onText((text) => {
+      if (socket !== created) {
+        return;
+      }
+      // **受け取ったことを記録する**（死活監視の起点。`connection.ts` の `inbound`）。
+      dispatch({ kind: "inbound" });
       deps.onText(text);
       if (isHelloAck(text)) {
         dispatch({ kind: "helloAck" });
       }
     });
     created.onBinary((bytes) => {
+      // **今の主でなければ渡さない。**
+      //
+      // 張り直した後も古い実体が媒体を運ぶことがある（閉じるまでの間、受信ノードは購読済みの
+      // 接続すべてへ送る）。両方を渡すと**同じフレームが 2 度提示される**。実測（段 E）:
+      // 判定 A-3 が「1083 の次に 1083」のような重複を 10 件以上検出した。
+      if (socket !== created) {
+        return;
+      }
+      dispatch({ kind: "inbound" });
       deps.onMedia(bytes);
     });
   }
@@ -450,6 +474,14 @@ export function createLink(deps: LinkDeps): Link {
     droppedMedia: (): number => droppedMedia,
     noteStall: (durationMs): void => dispatch({ kind: "stall", durationMs }),
     noteReportTimer: (): void => dispatch({ kind: "reportTimer" }),
+    /**
+     * 死活の点検（規範 1 節の `HEARTBEAT_TIMEOUT_MS`）。
+     *
+     * **`close` の事象が来ない切れ方があるため要る。** 実測（段 E）: 経路を落としたとき
+     * `vr` だけが `close` を受け取り、他の 4 部屋は `CLOSING` のまま `close` が来ず、
+     * 音声が二度と戻らなかった。心拍の周期で呼び、応答が途絶えていれば張り直す。
+     */
+    checkLiveness: (): void => dispatch({ kind: "timeout" }),
     noteTrend: (degrading): void =>
       dispatch(degrading ? { kind: "trendDegrade" } : { kind: "trendRecover" }),
     connects: (): number => connects,

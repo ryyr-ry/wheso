@@ -198,6 +198,15 @@ export class ReceiverNode implements Party.Server {
         this.authenticating.delete(sender.id);
         return;
       }
+      // **心拍に応える**（規範 1 節の `HEARTBEAT_TIMEOUT_MS`）。
+      //
+      // 応えないと、静かな部屋（`as` など）では受信が 1 度も起きないため、クライアントは
+      // 「切れた」ことを知る手立てを持たない。実測（段 E）: 経路を落としたとき `close` の
+      // 事象が来ず、`ar` が再接続しないまま**音声が二度と戻らなかった**。
+      if (message.includes('"t":"heartbeat"')) {
+        sender.send(JSON.stringify({ t: "heartbeatAck" }));
+        return;
+      }
       // 購読や報告を受けた時点で割当先への接続を確かめる。
       // **接続はアラームからは張れない**（`onAlarm` は `context.parties` へ触れられない）。
       // **`await` してはならない。** Durable Object は 1 つの入力を処理している間、
@@ -281,7 +290,7 @@ export class ReceiverNode implements Party.Server {
       if (now - openedAt < HELLO_TIMEOUT_MS) {
         continue;
       }
-      connection.close(ERROR_DEFINITIONS.E_AUTH.closeCode, "hello timeout");
+      connection.close(ERROR_DEFINITIONS.E_HELLO_TIMEOUT.closeCode, "hello timeout");
     }
     // ACK_INTERVAL_MS ごとに受信位置を上流へ返す（congestion.md 2 節）。
     this.counters = { ...this.counters, alarms: this.counters.alarms + 1 };

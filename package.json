@@ -27,6 +27,7 @@
     "test:degrade": "node --test --test-force-exit \"tests/e2e/degrade.test.ts\"",
     "test:degrade:sdk": "node --test --test-force-exit \"tests/e2e/degrade-sdk.test.ts\"",
     "test:endurance": "node --test --test-force-exit \"tests/e2e/endurance.test.ts\"",
+    "test:endurance:sdk": "node --test --test-force-exit \"tests/e2e/endurance-sdk.test.ts\"",
     "test:transport": "node tools/transport-suite.ts all",
     "test:rust": "cargo test --manifest-path sdks/rust/Cargo.toml",
     "test:cpp": "bash sdks/cpp/run-tests.sh",

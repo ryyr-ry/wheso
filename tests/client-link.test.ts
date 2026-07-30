@@ -18,7 +18,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { createLink, type LinkDeps, type LinkSocket } from "../packages/client/src/api/link.ts";
-import { RECONNECT_BACKOFF_MS } from "../packages/core/src/generated/constants.ts";
+import {
+  HEARTBEAT_TIMEOUT_MS,
+  RECONNECT_BACKOFF_MS,
+} from "../packages/core/src/generated/constants.ts";
 import { ERROR_DEFINITIONS } from "../packages/core/src/generated/errors.ts";
 
 interface FakeSocket extends LinkSocket {
@@ -209,6 +212,65 @@ test("**回復可能なコードで切れると再接続し、購読を送り直
     "**購読を送り直す。送らないと無音の黒画面になる**",
   );
   assert.equal(link.connects(), 2);
+});
+
+test("**張り直した後は古い実体の媒体を渡さない**（同じフレームを 2 度提示しない）", () => {
+  // 閉じるまでの間、受信ノードは購読済みの接続すべてへ送る。両方を渡すと同じフレームが
+  // 2 度提示される。実測（段 E）: 判定 A-3 が「1083 の次に 1083」の重複を 10 件以上検出した。
+  const h = harness();
+  const link = createLink(h.deps);
+  link.open();
+  const first = h.sockets[0];
+  assert.ok(first !== undefined);
+  first.fireOpen();
+  first.fireText(JSON.stringify({ t: "helloAck" }));
+  first.fireBinary(new Uint8Array([1]));
+  assert.equal(h.media.length, 1, "主からの媒体は渡る");
+
+  // 切れて張り直す。
+  first.fireClose(ERROR_DEFINITIONS.E_WIRE_TOO_LARGE.closeCode);
+  h.advanceTo(h.clock.ms + (RECONNECT_BACKOFF_MS[0] ?? 500));
+  const second = h.sockets[1];
+  assert.ok(second !== undefined);
+  second.fireOpen();
+  second.fireText(JSON.stringify({ t: "helloAck" }));
+
+  // 新しい主からは渡る。
+  second.fireBinary(new Uint8Array([2]));
+  assert.equal(h.media.length, 2);
+
+  // **古い実体からは渡さない。**
+  first.fireBinary(new Uint8Array([3]));
+  assert.equal(h.media.length, 2, "古い実体の媒体は捨てる");
+
+  // 古い実体の閉鎖も無視する（生きている新しい接続を切ってはならない）。
+  first.fireClose(1006);
+  assert.equal(link.phase(), "ACTIVE", "新しい主は生き続ける");
+});
+
+test("**応答が途絶えたら張り直す**（close が来ない切れ方に備える。段 E の実測）", () => {
+  const h = harness();
+  const link = createLink(h.deps);
+  link.open();
+  const first = h.sockets[0];
+  assert.ok(first !== undefined);
+  first.fireOpen();
+  first.fireText(JSON.stringify({ t: "helloAck" }));
+  assert.equal(link.phase(), "ACTIVE");
+
+  // 応答があるうちは点検しても何も起きない。
+  h.clock.ms += 1000;
+  first.fireText(JSON.stringify({ t: "heartbeatAck" }));
+  link.checkLiveness();
+  assert.equal(link.phase(), "ACTIVE");
+
+  // 途絶えたら閉じて張り直す。
+  h.clock.ms += HEARTBEAT_TIMEOUT_MS;
+  link.checkLiveness();
+  assert.equal(link.phase(), "RECONNECT_WAIT", "自分から張り直す");
+  h.advanceTo(h.clock.ms + (RECONNECT_BACKOFF_MS[0] ?? 500));
+  assert.equal(link.phase(), "CONNECTING");
+  assert.ok(h.sockets[1] !== undefined, "新しいソケットを開く");
 });
 
 test("回復不可のコードでは再接続しない", () => {

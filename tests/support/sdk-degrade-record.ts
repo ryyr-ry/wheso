@@ -23,7 +23,10 @@ import type {
   DegradeReceived,
 } from "./degrade-judge.ts";
 import { ERROR_DEFINITIONS } from "../../packages/core/src/generated/errors.ts";
-import { KEYFRAME_REQUEST_MIN_INTERVAL_MS } from "../../packages/core/src/generated/constants.ts";
+import {
+  AV_RESYNC_GAP_MS,
+  KEYFRAME_REQUEST_MIN_INTERVAL_MS,
+} from "../../packages/core/src/generated/constants.ts";
 
 export interface ObservedSentVideo {
   readonly frameIndex: number;
@@ -226,6 +229,32 @@ function selectedAt(timeline: readonly ObservedArrived[], captureUs: number): nu
   return first === undefined ? null : first.spatialId;
 }
 
+/**
+ * その取得時刻が「音声の経路が途切れていた期間」に入るか。
+ *
+ * 再生された音声の取得時刻を並べ、`AV_RESYNC_GAP_MS` を超える穴を探す。穴の中に入る映像は
+ * 同期の判定から外す（断であり、同期の失敗ではない）。穴の外で 1 件だけ欠けているものは
+ * 違反として残す（音声は破棄禁止である）。
+ */
+function audioInterrupted(playedByCapture: ReadonlyMap<number, number>, captureUs: number): boolean {
+  const captures = [...playedByCapture.keys()].sort((a, b) => a - b);
+  const holeUs = AV_RESYNC_GAP_MS * 1000;
+  for (let index = 1; index < captures.length; index += 1) {
+    const previous = captures[index - 1];
+    const current = captures[index];
+    if (previous === undefined || current === undefined) {
+      continue;
+    }
+    if (current - previous <= holeUs) {
+      continue;
+    }
+    if (captureUs > previous && captureUs < current) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** 最も近い取得時刻の音声を選ぶ。無音（DTX）は対にしない。 */
 function nearestAudio(sentAudio: readonly ObservedSentAudio[], captureUs: number): number | null {
   let best: number | null = null;
@@ -350,6 +379,16 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     }
     if (entry.captureUs > lastPlayedCaptureUs) {
       // まだ経路に音声が残っている。切る。
+      droppedForNoAudio += 1;
+      continue;
+    }
+    if (audioInterrupted(playedByCapture, entry.captureUs)) {
+      // **音声の経路が途切れていた期間は同期を測らない。**
+      //
+      // 経路が切れている間、音声は流れない（届かないのであって捨てたのではない）。その期間の
+      // 映像に「対応する音声が無い」と言っても、それは同期の失敗ではなく断である。規範の
+      // 再生クロックも `AV_RESYNC_GAP_MS` を超える欠落を不連続として作り直す（ADR-0028）。
+      // 同じ閾値で「断」と「1 件の欠落」を分ける。**1 件の欠落は違反として残す。**
       droppedForNoAudio += 1;
       continue;
     }

@@ -206,6 +206,55 @@ test("表 22 行目: FAILED からは open() のみで復帰し試行回数が 0
   assert.equal(reopened.state.attempts, 0);
 });
 
+test("**応答が途絶えたら自分から閉じて張り直す**（規範 1 節の HEARTBEAT_TIMEOUT_MS）", () => {
+  // `close` の事象が来ない切れ方が実際にある。実測（段 E）: 経路を落としたとき `vr` だけが
+  // `close` を受け取り、`ctl` / `vs` / `as` / `ar` は `CLOSING` のまま `close` が来ず、
+  // **音声が二度と戻らなかった**。心拍の応答の途絶を自分で見て張り直す。
+  const active = drive([
+    { event: { kind: "open" }, t: 0 },
+    { event: { kind: "socketOpen" }, t: 10 },
+    { event: { kind: "inbound" }, t: 20 },
+    { event: { kind: "helloAck" }, t: 20 },
+  ]);
+  assert.equal(active.state.phase, "ACTIVE");
+
+  // 応答があるうちは何もしない。
+  const alive = drive(
+    [
+      { event: { kind: "inbound" }, t: 1000 },
+      { event: { kind: "timeout" }, t: 1000 + HEARTBEAT_TIMEOUT_MS - 1 },
+    ],
+    active.state,
+  );
+  assert.equal(alive.state.phase, "ACTIVE", "途絶えていなければ ACTIVE のままである");
+  assert.deepEqual(kinds(alive.commands), [], "何も起こさない");
+
+  // 途絶えたら閉じて再接続を待つ。
+  const dead = drive(
+    [
+      { event: { kind: "inbound" }, t: 1000 },
+      { event: { kind: "timeout" }, t: 1000 + HEARTBEAT_TIMEOUT_MS },
+    ],
+    active.state,
+  );
+  assert.equal(dead.state.phase, "RECONNECT_WAIT");
+  assert.ok(kinds(dead.commands).includes("closeSocket"), "こちらから閉じる");
+  assert.ok(kinds(dead.commands).includes("schedule"), "バックオフを予約する");
+});
+
+test("受け取ったことが無い接続では死活監視が働かない（誤検知しない）", () => {
+  // 確立の直後は受信が無い。ここで閉じると、遅い握手を切ってしまう。
+  // `HELLO_SENT` の時限は表の別の行が扱う。
+  const active = drive([
+    { event: { kind: "open" }, t: 0 },
+    { event: { kind: "socketOpen" }, t: 10 },
+    { event: { kind: "helloAck" }, t: 20 },
+  ]);
+  assert.equal(active.state.phase, "ACTIVE");
+  const later = drive([{ event: { kind: "timeout" }, t: 100_000 }], active.state);
+  assert.equal(later.state.phase, "ACTIVE", "受信の記録が無ければ判定しない");
+});
+
 test("表に無いイベントは無視して記録する", () => {
   const result = connectionStep(initialConnectionState(0), { kind: "helloAck" }, 10);
   assert.equal(result.state.phase, "IDLE");

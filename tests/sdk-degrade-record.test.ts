@@ -298,6 +298,26 @@ test("**キーフレーム要求は山で数える**（待っている間の連�
   assert.equal(countRequestBursts([base + 900, base, base + 66]), 2);
 });
 
+test("**音声の経路が途切れた期間は D-1 から外す。1 件の欠落は残す**（同じ閾値で分ける）", () => {
+  const run = baseRun(60);
+  // (1) 途切れ: 真ん中の 20 件ぶん（20 × 66 ms = 1,320 ms > AV_RESYNC_GAP_MS）を落とす。
+  const played = run.playedAudio.filter((_entry, index) => index < 20 || index >= 40);
+  const interrupted = buildDegradeRecord({ ...run, playedAudio: played });
+  assert.deepEqual(
+    judgeAvSkew(interrupted.record, 22, 30),
+    [],
+    "途切れていた期間は同期の失敗にしない",
+  );
+  assert.ok(interrupted.droppedForNoAudio >= 19, "外した数を数える");
+
+  // (2) 1 件だけ落とす（穴は 132 ms であり閾値の内側）。**違反として残る。**
+  const single = run.playedAudio.filter((_entry, index) => index !== 30);
+  const dropped = buildDegradeRecord({ ...run, playedAudio: single });
+  const violations = judgeAvSkew(dropped.record, 22, 30);
+  assert.equal(violations.length, 1, JSON.stringify(violations));
+  assert.match(violations[0]?.detail ?? "", /対応する音声/);
+});
+
 test("**戻れない閉鎖だけが失敗になる**（設計どおりの再接続を失敗と読まない）", () => {
   const run = baseRun(6);
   // E_AUTH（4020）は `autoReconnect: false` である。1 度でも起きれば経路は戻らない。

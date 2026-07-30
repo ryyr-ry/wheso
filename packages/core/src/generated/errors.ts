@@ -32,6 +32,7 @@ export const ERROR_DEFINITIONS = {
   E_AUTH_AUDIENCE: { closeCode: 4022, recoverable: false, autoReconnect: false, i18nKey: "error.auth.audience" },
   E_NODE_AUTH: { closeCode: 4023, recoverable: true, autoReconnect: true, i18nKey: "error.auth.node" },
   E_FORBIDDEN: { closeCode: 4024, recoverable: false, autoReconnect: false, i18nKey: "error.auth.forbidden" },
+  E_HELLO_TIMEOUT: { closeCode: 4025, recoverable: true, autoReconnect: true, i18nKey: "error.auth.helloTimeout" },
   E_AUTH_ROOM: { closeCode: 4022, recoverable: false, autoReconnect: false, i18nKey: "error.auth.room" },
   E_AUTH_KIND: { closeCode: 4020, recoverable: false, autoReconnect: false, i18nKey: "error.auth.kind" },
   E_RATE_LIMIT_MESSAGES: { closeCode: 4030, recoverable: true, autoReconnect: true, i18nKey: "error.rate.messages" },

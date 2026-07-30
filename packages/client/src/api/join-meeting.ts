@@ -783,6 +783,12 @@ export async function joinWith(
     const beat = JSON.stringify({ t: "heartbeat" });
     for (const link of links.values()) {
       link.send(beat);
+      // **同じ周期で死活を点検する**（規範 1 節の `HEARTBEAT_TIMEOUT_MS`）。
+      //
+      // `close` の事象が来ない切れ方が実際にある。実測（段 E）: 経路を落としたとき `vr`
+      // だけが `close` を受け取り、`ctl` / `vs` / `as` / `ar` は `CLOSING` のまま `close` が
+      // 来ず、**音声が二度と戻らなかった**。応答の途絶を自分で見て張り直す。
+      link.checkLiveness();
     }
   });
 

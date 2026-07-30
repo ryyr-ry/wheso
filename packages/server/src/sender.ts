@@ -14,6 +14,7 @@
  */
 
 import type * as Party from "partykit/server";
+import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
 
 import { REGION_AUTO, resolveAudioShard, resolveVideoShard } from "@wheso/core/src/naming.ts";
 import { NODE_CONNECT_TIMEOUT_MS } from "@wheso/core/src/generated/constants.ts";
@@ -182,6 +183,13 @@ export class SenderNode implements Party.Server {
         this.authenticating.delete(sender.id);
         return;
       }
+      // **心拍に応える**（規範 1 節の `HEARTBEAT_TIMEOUT_MS`）。応えないと静かな部屋
+      // （`vs` / `as`）では受信が 1 度も起きず、クライアントは切れたことを知れない
+      // （実測: 段 E で `close` の事象が来ず、音声が二度と戻らなかった）。
+      if (message.includes('"t":"heartbeat"')) {
+        sender.send(JSON.stringify({ t: "heartbeatAck" }));
+        return;
+      }
       // クライアントの制御メッセージ。はしごの申告は中継ノードと ctl へ写す。
       // **`await` してはならない**（入力ゲートで握手が完了しない。F-046）。
       void this.ensureShardLink(SHARD_PEER_CURRENT);
@@ -263,7 +271,7 @@ export class SenderNode implements Party.Server {
       if (now - openedAt < HELLO_TIMEOUT_MS) {
         continue;
       }
-      connection.close(4001, "hello timeout");
+      connection.close(ERROR_DEFINITIONS.E_HELLO_TIMEOUT.closeCode, "hello timeout");
     }
     // 旧接続の残量を伝える。0 になったら旧接続を閉じる判断が下る（state-machines.md 5 節）。
     const stale = this.shards.get(SHARD_PEER_CURRENT);

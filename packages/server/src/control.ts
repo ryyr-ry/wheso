@@ -159,6 +159,9 @@ export class ControlNode implements Party.Server {
     // **接続はここ（`onMessage` の文脈）でしか張れない**（`onAlarm` は `context.parties` に
     // 触れられない）。かつ背後で進めるには入力が続く必要がある（F-046）。
     if (isHeartbeat(message)) {
+      // **応える**（規範 1 節の `HEARTBEAT_TIMEOUT_MS`）。応えないとクライアントは切れたことを
+      // 知る手立てを持たない（`close` の事象が来ない切れ方が実際にある。段 E の実測）。
+      sender.send(JSON.stringify({ t: "heartbeatAck" }));
       // 名簿を取り直す。他の参加者の出入りはここで反映される（低頻度の情報である）。
       await this.callMeta(JSON.stringify({ t: "poll" }));
       return;
@@ -301,7 +304,7 @@ export class ControlNode implements Party.Server {
       if (now - openedAt < HELLO_TIMEOUT_MS) {
         continue;
       }
-      connection.close(ERROR_DEFINITIONS.E_AUTH.closeCode, "hello timeout");
+      connection.close(ERROR_DEFINITIONS.E_HELLO_TIMEOUT.closeCode, "hello timeout");
     }
   }
 

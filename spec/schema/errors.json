@@ -135,6 +135,13 @@
       "i18nKey": "error.auth.forbidden"
     },
     {
+      "name": "E_HELLO_TIMEOUT",
+      "closeCode": 4025,
+      "recoverable": true,
+      "autoReconnect": true,
+      "i18nKey": "error.auth.helloTimeout"
+    },
+    {
       "name": "E_AUTH_ROOM",
       "closeCode": 4022,
       "recoverable": false,

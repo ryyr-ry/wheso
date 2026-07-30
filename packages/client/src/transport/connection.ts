@@ -36,6 +36,11 @@ export interface ConnectionState {
   readonly enteredAt: number;
   /** 予備接続が使えるか。切替の可否を決める。 */
   readonly standbyReady: boolean;
+  /**
+   * 最後にこの接続で何かを受け取った論理時刻。**死活監視に使う**（規範 1 節の
+   * `HEARTBEAT_TIMEOUT_MS`）。0 は「まだ受け取っていない」。
+   */
+  readonly lastInboundAt: number;
   /** 表に無いイベントの記録。 */
   readonly unexpectedEvents: readonly string[];
 }
@@ -53,6 +58,15 @@ export type ConnectionEvent =
   | { readonly kind: "stall"; readonly durationMs: number }
   | { readonly kind: "standbyReady"; readonly ready: boolean }
   | { readonly kind: "standbyKeyframe" }
+  /**
+   * この接続で何かを受け取った（本文でも媒体でも）。**死活監視の起点である。**
+   *
+   * `close` の事象が来ない切れ方が実際にある。実測（段 E）: 経路を落としたとき、
+   * `vr` だけが `close` を受け取り、`ctl` / `vs` / `as` / `ar` は `CLOSING` のまま
+   * `close` が来なかった。したがって**音声が二度と戻らなかった**（`ar` が再接続しない）。
+   * 実際の回線でも同じことが起きる（Wi-Fi を切る、経路が消える）。
+   */
+  | { readonly kind: "inbound" }
   | { readonly kind: "timeout" };
 
 export type ConnectionCommand =
@@ -83,7 +97,7 @@ export interface ConnectionStepResult {
 }
 
 export function initialConnectionState(t: number): ConnectionState {
-  return { phase: "IDLE", attempts: 0, enteredAt: t, standbyReady: false, unexpectedEvents: [] };
+  return { phase: "IDLE", attempts: 0, enteredAt: t, standbyReady: false, lastInboundAt: 0, unexpectedEvents: [] };
 }
 
 /** 純関数の状態遷移。 */
@@ -92,6 +106,27 @@ export function connectionStep(
   event: ConnectionEvent,
   t: number,
 ): ConnectionStepResult {
+  // 受け取った時刻は状態に依らず記録する。遷移は起こさない。
+  if (event.kind === "inbound") {
+    return { state: { ...state, lastInboundAt: t }, commands: [] };
+  }
+
+  // **死活監視**（規範 1 節の `HEARTBEAT_TIMEOUT_MS`）。
+  //
+  // `close` の事象が来ない切れ方が実際にある。実測（段 E）: 経路を落としたとき `vr` だけが
+  // `close` を受け取り、`ctl` / `vs` / `as` / `ar` は `CLOSING` のまま `close` が来ず、
+  // **音声が二度と戻らなかった**。心拍の応答が途絶えたら、こちらから閉じて張り直す。
+  //
+  // 判定は「確立してから」に限る（`HELLO_SENT` の時限は表の別の行が扱う）。
+  if (
+    event.kind === "timeout" &&
+    (state.phase === "ACTIVE" || state.phase === "DEGRADED") &&
+    state.lastInboundAt > 0 &&
+    t - state.lastInboundAt >= HEARTBEAT_TIMEOUT_MS
+  ) {
+    return scheduleReconnect(state, t, [{ kind: "closeSocket" }]);
+  }
+
   // 予備接続の可否は状態に依らず記録する。遷移は起こさない。
   if (event.kind === "standbyReady") {
     return { state: { ...state, standbyReady: event.ready }, commands: [] };

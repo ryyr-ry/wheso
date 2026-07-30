@@ -161,6 +161,8 @@ export interface SdkDegradeParticipant {
   readonly uplinkBps: number;
   readonly downlinkBps: number;
   readonly participantCount: number;
+  /** 部屋の種別ごとの接続の開閉（`vr` / `ar` / `ctl` / `vs` / `as`）。 */
+  readonly socketStats: readonly { readonly kind: string; readonly opened: number; readonly closed: number; readonly lastCode: number }[];
   /** 実際の復号器の出入り（生成・設定・投入・出力・失敗）。 */
   readonly decoderIo: {
     readonly created: number;
@@ -196,6 +198,10 @@ declare global {
       participantCount: number,
       durationMs: number,
     ) => Promise<SdkDegradeParticipant>;
+    /** 走行中の計数（段 E で経過を刻む）。 */
+    __whesoCounts?: () => Record<string, number>;
+    /** 開いている接続を全部落とす（段 E。戻り値は「部屋:前の状態→後の状態」の一覧）。 */
+    __whesoDropLinks?: () => string;
   }
 }
 
@@ -228,6 +234,23 @@ const closeNotes: CloseNote[] = [];
  * （`tests/e2e/page/sdk.ts` と同じ技法）。
  */
 const decoderIo = { created: 0, configured: 0, submitted: 0, output: 0, failed: 0 };
+
+/**
+ * 開いている WebSocket の実体。**段 E（耐久）で経路を故意に落とすために持つ。**
+ *
+ * 再デプロイでは既存の接続が切れない（実行環境が古い実体を動かし続ける）。切断が起きないと
+ * 再接続の経路が 1 度も通らないため、段 E は切断を試験側から起こす（実測に基づく）。
+ */
+const liveSockets = new Map<WebSocket, string>();
+
+/**
+ * 部屋の種別ごとの接続の開閉（観測）。
+ *
+ * **どの部屋が戻らなかったかを見るために要る。** 段 E で経路を落としたとき、映像は戻ったが
+ * 音声が戻らなかった（実測: 音声の再生が 5,890 件で止まったまま 40 秒）。種別ごとに数えないと、
+ * 「再接続しなかった」のか「再接続したが購読が戻らなかった」のかを区別できない。
+ */
+const socketStats = new Map<string, { opened: number; closed: number; lastCode: number }>();
 const decoderMessages: string[] = [];
 
 function installDecoderWatch(): void {
@@ -274,7 +297,16 @@ function installSocketWatch(): void {
       const text = String(url);
       const match = /\/parties\/[a-z]+\/([a-z]+)-/.exec(text);
       const kind = match?.[1] ?? "other";
+      liveSockets.set(this, kind);
+      const stat = socketStats.get(kind) ?? { opened: 0, closed: 0, lastCode: 0 };
+      stat.opened += 1;
+      socketStats.set(kind, stat);
       this.addEventListener("close", (event: CloseEvent) => {
+        liveSockets.delete(this);
+        const seen = socketStats.get(kind) ?? { opened: 0, closed: 0, lastCode: 0 };
+        seen.closed += 1;
+        seen.lastCode = event.code;
+        socketStats.set(kind, seen);
         if (event.code !== 1000 && event.code !== 1001 && closeNotes.length < 60) {
           closeNotes.push({ kind, code: event.code, reason: event.reason });
         }
@@ -351,6 +383,9 @@ interface Recorder {
   windowClosedAtMs: number;
   frameCounter: number;
 }
+
+/** 走行中の記録。`__whesoCounts` が読む（1 ページに 1 人であるため 1 個で足りる）。 */
+let activeRecorder: Recorder | null = null;
 
 function newRecorder(label: string): Recorder {
   return {
@@ -580,6 +615,7 @@ async function joinOne(spec: Spec, meetingId: string, tokenKey: string, logs: st
     return null;
   }
   const recorder = newRecorder(spec.label);
+  activeRecorder = recorder;
   const joined = await joinMeeting(
     `${spec.base}/j/${meetingId}#${token}`,
     // 受信専用の参加者はカメラとマイクを開かない。**開くと劣化の原因が 2 つになり**、
@@ -617,6 +653,7 @@ function snapshot(joined: Joined): SdkDegradeParticipant {
     encodedAudioCount: recorder.encodedAudioCount,
     decoderEvents: { ...recorder.decoderEvents },
     decoderIo: { ...decoderIo, messages: [...decoderMessages] },
+    socketStats: [...socketStats.entries()].map(([kind, value]) => ({ kind, ...value })),
     sentAudio: [...recorder.sentAudio],
     received: [...recorder.received],
     decoded: [...recorder.decoded],
@@ -641,6 +678,7 @@ const EMPTY: SdkDegradeParticipant = {
   encodedAudioCount: 0,
   decoderEvents: { configure: 0, reset: 0, close: 0, error: 0 },
   decoderIo: { created: 0, configured: 0, submitted: 0, output: 0, failed: 0, messages: [] },
+  socketStats: [],
   sentAudio: [],
   received: [],
   decoded: [],
@@ -707,6 +745,50 @@ async function runOne(
   joined.leave();
   return { ...result, logs, closeNotes: [...closeNotes] };
 }
+
+/**
+ * 走行中の観測（段 E で経過を刻むために使う）。
+ * 記録そのものは終わりに返すため、ここでは数だけを返す。
+ */
+function currentCounts(): Record<string, number> {
+  const recorder = activeRecorder;
+  if (recorder === null) {
+    return {};
+  }
+  return {
+    sentVideo: recorder.sentVideo.length,
+    sentAudio: recorder.sentAudio.length,
+    arrived: recorder.arrived.length,
+    decoded: recorder.decoded.length,
+    presented: recorder.received.length,
+    playedAudio: recorder.playedAudio.length,
+    keyframeRequests: recorder.keyframeRequestAtMs.length,
+    closures: recorder.closures.length,
+    socketsOpened: [...socketStats.values()].reduce((total, entry) => total + entry.opened, 0),
+    decoderCreated: decoderIo.created,
+    decoderFailed: decoderIo.failed,
+    decoderOutput: decoderIo.output,
+  };
+}
+
+window.__whesoCounts = (): Record<string, number> => currentCounts();
+
+/**
+ * 開いている接続を全部落とす（段 E）。
+ *
+ * **コードなしで落とす。** 実行環境や回線が落ちたときと同じ形にするためである。規範の
+ * 閉鎖コードで閉じると、そのコードに応じた振る舞い（自動再接続の可否）が選ばれてしまい、
+ * 「経路が切れた」ことの試験にならない。
+ */
+window.__whesoDropLinks = (): string => {
+  const detail: string[] = [];
+  for (const [socket, kind] of [...liveSockets.entries()]) {
+    const before = socket.readyState;
+    socket.close();
+    detail.push(`${kind}:${String(before)}→${String(socket.readyState)}`);
+  }
+  return detail.join(",");
+};
 
 window.__whesoDegradeOne = async (spec, meetingId, tokenKey, participantCount, durationMs) => {
   try {
