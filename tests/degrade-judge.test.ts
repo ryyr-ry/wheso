@@ -14,6 +14,8 @@ import {
   judgeConnections,
   judgeCompleteness,
   judgeContinuity,
+  judgeDependencies,
+  judgeIdenticalPixels,
   judgeDrops,
   judgeHashes,
   judgeAvSkew,
@@ -124,6 +126,65 @@ test("C-1: 送信を止めた後の空白は違反にしない", () => {
   received[received.length - 1] = { ...last, atMs: base.lastSentAtMs + 3000 };
   const violations = judgeContinuity({ ...base, received }, 1000);
   assert.deepEqual(violations, [], "送信終了後の空白は固まりではない");
+});
+
+test("**A-2: キーフレームより前に描いたら違反である**（参照が無い）", () => {
+  const base = healthyRecord(10);
+  // キーフレームを提示しなかったことにする（送信はしている）。
+  const received = base.received.filter((entry) => !(base.sent.find((s) => s.frameIndex === entry.frameIndex)?.isKey ?? false));
+  const violations = judgeDependencies({ ...base, received });
+  assert.ok(violations.length > 0, "参照の無い提示を検出する");
+  assert.equal(violations[0]?.judgement, "A-2");
+});
+
+test("**A-2: 低い層を落としたまま高い層を描いたら違反である**", () => {
+  const base = healthyRecord(30);
+  // 時間層 1 のフレームを提示せず、層 2 は提示したことにする。
+  const received = base.received.filter((entry) => {
+    const meta = base.sent.find((s) => s.frameIndex === entry.frameIndex);
+    return meta === undefined || meta.isKey || meta.temporalId !== 1;
+  });
+  const violations = judgeDependencies({ ...base, received });
+  assert.ok(violations.length > 0, JSON.stringify(violations.slice(0, 2)));
+  assert.equal(violations[0]?.judgement, "A-2");
+});
+
+test("A-2: 健全な記録では違反が無い", () => {
+  assert.deepEqual(judgeDependencies(healthyRecord(30)), []);
+  // 最上位の層だけを落とした記録も有効である（破棄可能であり参照されない）。
+  const base = healthyRecord(30);
+  const topOnly = base.received.filter((entry) => {
+    const meta = base.sent.find((s) => s.frameIndex === entry.frameIndex);
+    return meta === undefined || meta.temporalId !== 2;
+  });
+  assert.deepEqual(judgeDependencies({ ...base, received: topOnly }), []);
+});
+
+test("**A-1 の完全形: 同じ段を受けた購読者は同じ画素を得る**", () => {
+  const base = healthyRecord(10);
+  const same = { label: "健全", record: base };
+  const other = { label: "劣化", record: base };
+  assert.deepEqual(judgeIdenticalPixels([same, other]), [], "同じなら違反は無い");
+
+  // 片方の画素が違う。転送か復号のどこかが壊れている。
+  const differing = {
+    label: "劣化",
+    record: {
+      ...base,
+      received: base.received.map((entry, index) =>
+        index === 4 ? { ...entry, sha256: "f".repeat(64) } : entry,
+      ),
+    },
+  };
+  const violations = judgeIdenticalPixels([same, differing]);
+  assert.equal(violations.length, 1, JSON.stringify(violations));
+  assert.equal(violations[0]?.judgement, "A-1");
+
+  // 片方にしか届いていないフレームは比べない（劣化が違えば当然である）。
+  const fewer = { label: "劣化", record: { ...base, received: base.received.slice(0, 3) } };
+  assert.deepEqual(judgeIdenticalPixels([same, fewer]), []);
+  // 1 人では判定しない。
+  assert.deepEqual(judgeIdenticalPixels([same]), []);
 });
 
 test("B-2: 最上位の時間層の欠落は許す", () => {

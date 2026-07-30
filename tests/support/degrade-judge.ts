@@ -373,6 +373,128 @@ export function judgeAvSkew(
   return violations;
 }
 
+/**
+ * 判定 A-2: 提示したフレームの集合が**依存構造の上で有効である**（受入条件 4.1）。
+ *
+ * 時間スケーラビリティでは、時間層 T のフレームは「同じキーフレーム以降で、より低い層の
+ * 直近のフレーム」を参照する（`wire-format.md` 1.3）。したがって次が成り立たなければ、
+ * 復号器は参照の無いフレームを描いたことになる。
+ *
+ *   キーフレーム以降に、より低い層のフレームが 1 枚も提示されていない層のフレームを
+ *   提示してはならない。
+ *
+ * **なぜ判定 B-2 と別に要るか。** B-2 は「落ちたものが破棄可能だったか」を見る。A-2 は
+ * 「描いたものが有効だったか」を見る。落ちてよいものだけが落ちていても、受け側が参照の
+ * 欠けたフレームを描いていれば画は壊れる（ADR-0049 で受け側の守りを入れた理由でもある）。
+ *
+ * 判定には送信側の記録（層とキーフレームの旗）を使う。提示の記録は `frameIndex` で引く。
+ */
+export function judgeDependencies(record: DegradeRecord): readonly Violation[] {
+  const presentedIndexes = new Set(record.received.map((entry) => entry.frameIndex));
+  const violations: Violation[] = [];
+  /**
+   * 層ごとの「直近に送られたフレーム」の位置と、それが提示されたか。
+   * 参照するのは**より低い層の直近のフレーム**であるため、層ごとに最後の 1 枚を覚える。
+   */
+  const lastByLayer = new Map<number, { readonly frameIndex: number; readonly presented: boolean }>();
+  let sawKey = false;
+  // 送出の順（frameIndex の昇順）で見る。提示の順序の異常は A-3 が見る。
+  for (const meta of [...record.sent].sort((a, b) => a.frameIndex - b.frameIndex)) {
+    const presented = presentedIndexes.has(meta.frameIndex);
+    if (meta.isKey) {
+      // キーフレームは参照を持たない。ここから数え直す。
+      lastByLayer.clear();
+      sawKey = sawKey || presented;
+      if (presented) {
+        lastByLayer.set(meta.temporalId, { frameIndex: meta.frameIndex, presented: true });
+      }
+      continue;
+    }
+    if (!presented) {
+      lastByLayer.set(meta.temporalId, { frameIndex: meta.frameIndex, presented: false });
+      continue;
+    }
+    if (!sawKey) {
+      violations.push({
+        judgement: "A-2",
+        detail: `キーフレームを提示していないのに ${String(meta.frameIndex)} を提示した（参照が無い）`,
+      });
+      lastByLayer.set(meta.temporalId, { frameIndex: meta.frameIndex, presented: true });
+      continue;
+    }
+    if (meta.temporalId > 0) {
+      // **より低い層の直近のフレーム**を探す（それが参照先である）。
+      let nearest: { readonly frameIndex: number; readonly presented: boolean } | undefined;
+      for (let layer = 0; layer < meta.temporalId; layer += 1) {
+        const candidate = lastByLayer.get(layer);
+        if (candidate === undefined) {
+          continue;
+        }
+        if (nearest === undefined || candidate.frameIndex > nearest.frameIndex) {
+          nearest = candidate;
+        }
+      }
+      if (nearest !== undefined && !nearest.presented) {
+        violations.push({
+          judgement: "A-2",
+          detail:
+            `${String(meta.frameIndex)}（時間層 ${String(meta.temporalId)}）を提示したが、` +
+            `参照先の ${String(nearest.frameIndex)} を提示していない`,
+        });
+      }
+    }
+    lastByLayer.set(meta.temporalId, { frameIndex: meta.frameIndex, presented: true });
+  }
+  return violations;
+}
+
+/**
+ * 判定 A-1 の完全形: **同じ段を受けた購読者は同じ画素を得る**（受入条件 4.1）。
+ *
+ * ハッシュを 1 人ぶんだけ見ても「同一に再生された」ことは言えない。転符号化しない設計
+ * （ADR-0001）であるから、同じ段の同じフレームは全員に同じバイト列で届き、同じ画素になる。
+ * **食い違えば転送か復号のどこかが壊れている。**
+ *
+ * 走行をまたいで比べることはできない（カメラの内容が毎回違う）。同じ走行の購読者どうしで
+ * 比べる。N-8（参加者ごとに別々の劣化）では 2 人の購読者が居るため、この判定が働く。
+ */
+export function judgeIdenticalPixels(
+  records: readonly { readonly label: string; readonly record: DegradeRecord }[],
+): readonly Violation[] {
+  if (records.length < 2) {
+    return [];
+  }
+  const first = records[0];
+  if (first === undefined) {
+    return [];
+  }
+  const violations: Violation[] = [];
+  const base = new Map<number, string>();
+  for (const entry of first.record.received) {
+    if (entry.sha256.length === 64) {
+      base.set(entry.frameIndex, entry.sha256);
+    }
+  }
+  for (const other of records.slice(1)) {
+    for (const entry of other.record.received) {
+      const expected = base.get(entry.frameIndex);
+      if (expected === undefined || entry.sha256.length !== 64) {
+        // 片方にしか届いていないフレームは比べられない（劣化が違えば当然である）。
+        continue;
+      }
+      if (entry.sha256 !== expected) {
+        violations.push({
+          judgement: "A-1",
+          detail:
+            `${String(entry.frameIndex)} の画素が購読者ごとに違う` +
+            `（${first.label} と ${other.label}）`,
+        });
+      }
+    }
+  }
+  return violations;
+}
+
 /** すべての判定を行い、違反の一覧を返す。空であれば合格である。 */
 export function judgeAll(record: DegradeRecord, options: JudgeOptions): readonly Violation[] {
   // 接続が切れていたら、そこで報告を打ち切る。以降の判定は経路の失敗の写しになる。
@@ -383,6 +505,7 @@ export function judgeAll(record: DegradeRecord, options: JudgeOptions): readonly
   const violations: Violation[] = [
     ...judgeMonotonic(record),
     ...judgeHashes(record),
+    ...judgeDependencies(record),
     ...judgeContinuity(record, options.maxGapMs),
     ...judgeDrops(record),
     ...judgeKeyframeRequests(record, options.allowedKeyframeRequests ?? 0),

@@ -34,7 +34,7 @@ import {
   IMPAIRMENT_PROFILES,
 } from "../../packages/core/src/generated/impairment.ts";
 import { applyStep, canImpair, clearImpairment, prepareDevice, stepAt } from "../../tools/impair.ts";
-import { judgeAll } from "../support/degrade-judge.ts";
+import { judgeAll, judgeIdenticalPixels } from "../support/degrade-judge.ts";
 import { buildDegradeRecord, type ObservedRun } from "../support/sdk-degrade-record.ts";
 import {
   bridgeReaches,
@@ -537,6 +537,21 @@ test("SDK 経由 N-8: 劣化した購読者が健全な購読者を壊さない"
     `劣化側に劣化の影響が現れている（切替 ${String(impairedBuilt.switches.length)} / 届 ${String(
       impairedBuilt.record.arrived?.length ?? 0,
     )} / 判定対象 ${String(impairedBuilt.judgedSent)}）`,
+  );
+
+  // **同じ段を受けた購読者は同じ画素を得る**（判定 A-1 の完全形）。
+  //
+  // ハッシュを 1 人ぶん見ても「同一に再生された」ことは言えない。転符号化しない設計
+  // （ADR-0001）であるから、同じ段の同じフレームは全員に同じバイト列で届き、同じ画素になる。
+  // 食い違えば転送か復号のどこかが壊れている。**購読者が 2 人居る N-8 でのみ判定できる。**
+  const pixels = judgeIdenticalPixels([
+    { label: "健全", record: healthyBuilt.record },
+    { label: "劣化", record: impairedBuilt.record },
+  ]);
+  assert.deepEqual(
+    pixels.map((entry) => `${entry.judgement}: ${entry.detail}`),
+    [],
+    "同じ段を受けた購読者の画素が一致する",
   );
 
   // **健全な購読者は無傷であること。** これが N-8 の主張である。
