@@ -222,7 +222,7 @@ test("**応答が途絶えたら自分から閉じて張り直す**（規範 1 �
   const alive = drive(
     [
       { event: { kind: "inbound" }, t: 1000 },
-      { event: { kind: "timeout" }, t: 1000 + HEARTBEAT_TIMEOUT_MS - 1 },
+      { event: { kind: "livenessCheck" }, t: 1000 + HEARTBEAT_TIMEOUT_MS - 1 },
     ],
     active.state,
   );
@@ -233,7 +233,7 @@ test("**応答が途絶えたら自分から閉じて張り直す**（規範 1 �
   const dead = drive(
     [
       { event: { kind: "inbound" }, t: 1000 },
-      { event: { kind: "timeout" }, t: 1000 + HEARTBEAT_TIMEOUT_MS },
+      { event: { kind: "livenessCheck" }, t: 1000 + HEARTBEAT_TIMEOUT_MS },
     ],
     active.state,
   );
@@ -251,8 +251,40 @@ test("受け取ったことが無い接続では死活監視が働かない（�
     { event: { kind: "helloAck" }, t: 20 },
   ]);
   assert.equal(active.state.phase, "ACTIVE");
-  const later = drive([{ event: { kind: "timeout" }, t: 100_000 }], active.state);
+  const later = drive([{ event: { kind: "livenessCheck" }, t: 100_000 }], active.state);
   assert.equal(later.state.phase, "ACTIVE", "受信の記録が無ければ判定しない");
+});
+
+test("**死活の点検は予約した時限を満了させない**（段 E の churn の原因）", () => {
+  // 心拍の周期（3 秒）で `timeout` を送っていたため、(1) `HELLO_SENT` の接続が `helloAck` を
+  // 待たずに捨てられ、(2) 再接続の待ちが即座に明けた。実測では映像の受信部屋が 100 秒で
+  // 19 本の接続を開き、到着が 1,295/1,553 まで落ちた。
+  const helloSent = drive([
+    { event: { kind: "open" }, t: 0 },
+    { event: { kind: "socketOpen" }, t: 10 },
+  ]);
+  assert.equal(helloSent.state.phase, "HELLO_SENT");
+  const checked = drive([{ event: { kind: "livenessCheck" }, t: 20 }], helloSent.state);
+  assert.equal(checked.state.phase, "HELLO_SENT", "点検では捨てない");
+  assert.deepEqual(kinds(checked.commands), []);
+
+  // 猶予の内側の `timeout`（早すぎる予約）でも捨てない。
+  const early = drive([{ event: { kind: "timeout" }, t: 20 }], helloSent.state);
+  assert.equal(early.state.phase, "HELLO_SENT", "経過で判定する");
+
+  // 猶予を過ぎた `timeout` では捨てる（規範の表 8 行目）。
+  const late = drive([{ event: { kind: "timeout" }, t: 10 + HEARTBEAT_TIMEOUT_MS }], helloSent.state);
+  assert.equal(late.state.phase, "RECONNECT_WAIT");
+
+  // 再接続の待ちは点検では明けない（バックオフを飛ばさない）。
+  const waiting = drive(
+    [{ event: { kind: "socketClose", code: ERROR_DEFINITIONS.E_WIRE_TOO_LARGE.closeCode }, t: 30 }],
+    helloSent.state,
+  );
+  assert.equal(waiting.state.phase, "RECONNECT_WAIT");
+  const stillWaiting = drive([{ event: { kind: "livenessCheck" }, t: 31 }], waiting.state);
+  assert.equal(stillWaiting.state.phase, "RECONNECT_WAIT", "点検でバックオフを飛ばさない");
+  assert.deepEqual(kinds(stillWaiting.commands), []);
 });
 
 test("表に無いイベントは無視して記録する", () => {

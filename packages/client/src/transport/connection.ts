@@ -67,6 +67,16 @@ export type ConnectionEvent =
    * 実際の回線でも同じことが起きる（Wi-Fi を切る、経路が消える）。
    */
   | { readonly kind: "inbound" }
+  /**
+   * 死活の点検（心拍の周期で呼ぶ）。**`timeout` と分ける。**
+   *
+   * `timeout` は予約した時限（`HELLO_SENT` の猶予、切替の時限、再接続の待ち）の満了を表す。
+   * 死活の点検を同じ事象で表すと、点検のたびにそれらが満了したことになる。実測（段 E）:
+   * 心拍の周期（3 秒）で `timeout` を送っていたため、(1) `HELLO_SENT` の接続が `helloAck` を
+   * 待たずに捨てられ、(2) 再接続の待ちが即座に明けた。結果として映像の受信部屋が 100 秒で
+   * 19 本の接続を開き、到着が 1,295/1,553 まで落ちた。
+   */
+  | { readonly kind: "livenessCheck" }
   | { readonly kind: "timeout" };
 
 export type ConnectionCommand =
@@ -118,13 +128,16 @@ export function connectionStep(
   // **音声が二度と戻らなかった**。心拍の応答が途絶えたら、こちらから閉じて張り直す。
   //
   // 判定は「確立してから」に限る（`HELLO_SENT` の時限は表の別の行が扱う）。
-  if (
-    event.kind === "timeout" &&
-    (state.phase === "ACTIVE" || state.phase === "DEGRADED") &&
-    state.lastInboundAt > 0 &&
-    t - state.lastInboundAt >= HEARTBEAT_TIMEOUT_MS
-  ) {
-    return scheduleReconnect(state, t, [{ kind: "closeSocket" }]);
+  if (event.kind === "livenessCheck") {
+    if (
+      (state.phase === "ACTIVE" || state.phase === "DEGRADED") &&
+      state.lastInboundAt > 0 &&
+      t - state.lastInboundAt >= HEARTBEAT_TIMEOUT_MS
+    ) {
+      return scheduleReconnect(state, t, [{ kind: "closeSocket" }]);
+    }
+    // 点検しただけである。**表に無い遷移として記録してはならない**（毎回記録が膨らむ）。
+    return { state, commands: [] };
   }
 
   // 予備接続の可否は状態に依らず記録する。遷移は起こさない。
@@ -167,7 +180,8 @@ export function connectionStep(
           ? moveTo(state, "FAILED", t, [{ kind: "fail", code: event.code }])
           : scheduleReconnect(state, t);
       }
-      if (event.kind === "timeout") {
+      if (event.kind === "timeout" && t - state.enteredAt >= HEARTBEAT_TIMEOUT_MS) {
+        // 猶予を過ぎた。**経過で判定する**（早すぎる時限で `helloAck` を待たずに捨てない）。
         return scheduleReconnect(state, t, [{ kind: "closeSocket" }]);
       }
       if (event.kind === "close") {

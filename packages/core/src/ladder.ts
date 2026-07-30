@@ -229,7 +229,7 @@ export function deriveLadder(
       sid: index,
       width: candidate.width,
       height: candidate.height,
-      framerate: candidate.framerate,
+      framerate: declaredFramerate(source.framerate, candidate.framerate),
       // H.264 は時間スケーラビリティを使えない（F-027）。
       temporalLayers: capability.encodeAv1 ? candidate.temporalLayers : 1,
       targetBitrate: candidate.targetBitrate,
@@ -306,4 +306,36 @@ export function buildLadderAnnounce(channel: number, rungs: readonly SendRung[])
   });
 }
 
-
+/**
+ * 申告する fps。**送信側が実際に出せる値だけを申告する。**
+ *
+ * 送出は取得したフレームを間引いて作る。間引きは整数でしかできないため、実際に出る fps は
+ * `源 ÷ k`（k は整数）である。代表点の fps をそのまま申告すると、源が代表点の整数倍でない
+ * 装置では**間隔が不均等**になる（源 20 fps から 15 fps を作ると 50 / 50 / 100 ms の
+ * 繰り返しになる）。中継ノードの送信窓は「申告 fps × `SEND_WINDOW_MS`」の枚数しか許さない
+ * ため、2 枚が 100 ms に固まると窓が閉じ、破棄不可のユニットまで落ちる（実測: 劣化が無い
+ * 40 秒で送信ノード 5 件・中継ノード 6 件。F-073）。
+ *
+ *   k        = ceil(源 ÷ 代表点)      間引きの間隔（1 以上の整数）
+ *   実際     = 源 ÷ k                  均等に出せる fps（分数になり得る）
+ *   申告     = ceil(実際)              **切り上げる**（窓を小さく見せない）
+ *
+ * 例: 源 30 → 代表点 15 なら k=2、実際 15、申告 15（変わらない）。
+ *     源 20 → 代表点 15 なら k=2、実際 10、申告 10。
+ *     源 25 → 代表点 15 なら k=2、実際 12.5、申告 13。
+ *
+ * **整数演算のみで計算する**（ADR-0017）。分数は切り上げの形で扱う。
+ */
+export function declaredFramerate(sourceFramerate: number, candidateFramerate: number): number {
+  if (sourceFramerate <= 0 || candidateFramerate <= 0) {
+    return candidateFramerate;
+  }
+  if (sourceFramerate <= candidateFramerate) {
+    // 源が代表点以下なら間引かない。源をそのまま申告する（拡大しない。ADR-0026）。
+    return sourceFramerate;
+  }
+  // k = ceil(源 ÷ 代表点)
+  const k = Math.trunc((sourceFramerate + candidateFramerate - 1) / candidateFramerate);
+  // 申告 = ceil(源 ÷ k)
+  return Math.trunc((sourceFramerate + k - 1) / k);
+}

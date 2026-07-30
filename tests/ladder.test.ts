@@ -14,6 +14,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  declaredFramerate,
   buildLadderAnnounce,
   deriveLadder,
   type EncodeCapability,
@@ -42,6 +43,22 @@ const SW: EncodeCapability = { ...HW, hardwareAv1For4K60: false };
 function source(width: number, height: number, framerate: number): SourceSpec {
   return { width, height, framerate };
 }
+
+test("**申告する fps は「源 ÷ 整数」に丸める**（間引きは整数でしかできない。ADR-0051）", () => {
+  // 源が代表点の整数倍でないと、代表点の fps を申告しても均等に出せない。実測（F-073）:
+  // 源 20 fps から 15 fps を作ると 50 / 50 / 100 ms の繰り返しになり、2 枚が 100 ms に
+  // 固まって送信窓（申告 fps × SEND_WINDOW_MS ぶんの枚数）を閉じ、破棄不可まで落ちた。
+  assert.equal(declaredFramerate(30, 15), 15, "整数倍ならそのまま（30 ÷ 2）");
+  assert.equal(declaredFramerate(60, 15), 15, "60 ÷ 4");
+  assert.equal(declaredFramerate(60, 30), 30, "60 ÷ 2");
+  assert.equal(declaredFramerate(30, 30), 30, "間引かない");
+  assert.equal(declaredFramerate(20, 15), 10, "**20 ÷ 2 = 10**（15 は均等に作れない）");
+  assert.equal(declaredFramerate(25, 15), 13, "25 ÷ 2 = 12.5 → 切り上げる（窓を小さく見せない）");
+  assert.equal(declaredFramerate(24, 15), 12, "24 ÷ 2");
+  // 源が代表点以下なら源をそのまま申告する（拡大しない。ADR-0026）。
+  assert.equal(declaredFramerate(10, 15), 10);
+  assert.equal(declaredFramerate(15, 15), 15);
+});
 
 test("4K60 の源とハードウェア符号化器では 3 段になる", () => {
   const rungs = deriveLadder(source(V_4K60.width, V_4K60.height, V_4K60.framerate), "camera", HW);

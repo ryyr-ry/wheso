@@ -246,6 +246,9 @@ export class SenderNode implements Party.Server {
         },
         pendingShard: this.pendingShard.length,
         windows: this.state.core.windows,
+        // Q-027 の測定。**判断には使わない**（窓の幅を決めるための観測である）。
+        ackIntervalsMs: this.state.core.ackIntervalsMs,
+        windowDropInFlight: this.state.core.windowDropInFlight,
         phase: this.state.core.phase,
         epoch: this.state.core.epoch,
         counters: this.counters,

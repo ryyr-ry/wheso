@@ -73,6 +73,20 @@ export interface SenderState {
   readonly staleBacklogBytes: number;
   /** 表に無いイベントの記録。 */
   readonly unexpectedEvents: readonly string[];
+  /**
+   * ack が届いた間隔（ミリ秒。直近 `MAX_UNEXPECTED_EVENTS` 件）。**観測のみ。**
+   *
+   * 送信窓は `SEND_WINDOW_MS`（200 ms）ぶんの未確認しか許さない。したがって ack が
+   * 200 ms 途絶えると、破棄不可のユニットまで落ちる。**その頻度を決めるのは実行環境の
+   * 刻みである**（F-064: アラームは約 100 ms）。窓の幅を決めるにはこの分布が必要である
+   * （Q-027）。判断には使わない。
+   */
+  readonly ackIntervalsMs: readonly number[];
+  /**
+   * 送信窓が閉じて落としたときの未確認量（フレーム数。直近 `MAX_UNEXPECTED_EVENTS` 件）。
+   * **観測のみ。** 窓の幅（申告 fps × `SEND_WINDOW_MS` ÷ 1000）と並べて読む。
+   */
+  readonly windowDropInFlight: readonly number[];
 }
 
 export type SenderEvent =
@@ -130,6 +144,8 @@ export function initialSenderState(epoch: number): SenderState {
     dualSubscribeSince: null,
     staleBacklogBytes: 0,
     unexpectedEvents: [],
+    ackIntervalsMs: [],
+    windowDropInFlight: [],
   };
 }
 
@@ -229,11 +245,16 @@ function handleMedia(
     // **順位 4・5 を落としたら次の KEY まで落とし続け、キーフレームを要求する**（規範 1.4）。
     // 順位 1 から 3（破棄可能）では連鎖を始めず、要求も作らない。
     const breaksChain = priority === 4 || priority === 5;
+    // 窓が閉じて落とした時点の未確認量を記録する（観測のみ。Q-027）。
+    const observed: SenderState = {
+      ...state,
+      windowDropInFlight: appendSample(state.windowDropInFlight, inFlight),
+    };
     if (!breaksChain) {
-      return { state, commands: [{ kind: "drop", priority, count: 1 }] };
+      return { state: observed, commands: [{ kind: "drop", priority, count: 1 }] };
     }
     return {
-      state: upsertWindow(state, {
+      state: upsertWindow(observed, {
         channel: event.ch,
         spatialId: event.sid,
         highestSent: window?.highestSent ?? 0,
@@ -265,6 +286,17 @@ function handleMedia(
   return { state: updated, commands: [{ kind: "forward", to: targets }] };
 }
 
+/**
+ * 観測の標本を 1 個足す。上限を超えたら古い側を捨てる（ADR-0034）。
+ * 記録が無制限に伸びると Durable Object の記憶を食う。
+ */
+function appendSample(samples: readonly number[], value: number): readonly number[] {
+  const appended = [...samples, value];
+  return appended.length > MAX_UNEXPECTED_EVENTS
+    ? appended.slice(appended.length - MAX_UNEXPECTED_EVENTS)
+    : appended;
+}
+
 /** ack の適用。確認済みの位置は単調増加のみとする。 */
 function handleAck(
   state: SenderState,
@@ -284,7 +316,11 @@ function handleAck(
     return { state, commands: [] };
   }
   return {
-    state: upsertWindow(state, { ...window, highestAcked: event.highestSeq, lastAckAtMs: t }),
+    state: {
+      ...upsertWindow(state, { ...window, highestAcked: event.highestSeq, lastAckAtMs: t }),
+      // ack の間隔を記録する（観測のみ。Q-027 の窓の幅を決めるために要る）。
+      ackIntervalsMs: appendSample(state.ackIntervalsMs, t - window.lastAckAtMs),
+    },
     commands: [],
   };
 }

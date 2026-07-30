@@ -38,6 +38,7 @@ function makeEpochClock(): (timestampUs: number) => number {
  */
 
 import type { SendRung, SourceSpec } from "@wheso/core/src/ladder.ts";
+import { V_1080P30 } from "@wheso/core/src/generated/constants.ts";
 import { audioConfigFor } from "./audio-send.ts";
 import { temporalIdFrom } from "./encoder-set.ts";
 import type { EncodedVideo } from "../api/send-pipeline.ts";
@@ -125,10 +126,12 @@ export function browserCaptureDeps(): CaptureDeps {
   /** 次のフレームでキーフレームを要求する段。 */
   const keyframeWanted = new Set<number>();
   /**
-   * 段ごとの「次に符号化器へ渡してよい時刻」（ミリ秒）。
+   * 段ごとの、取得したフレームの数え上げ（間引きに使う）。
    * 申告 fps を超えて渡さないために持つ（`encodeFrame` の注記）。
    */
-  const nextDueMs = new Map<number, number>();
+  const seenFrames = new Map<number, number>();
+  /** 取得の実測 fps（`MediaStreamTrack.getSettings()` 由来）。0 は不明。 */
+  let sourceFramerate = 0;
   /** 取得したトラックの読み出しを止めるための取り消し。 */
   const stops: (() => void)[] = [];
 
@@ -184,7 +187,24 @@ export function browserCaptureDeps(): CaptureDeps {
       let stream: unknown;
       try {
         stream = await Reflect.apply(getUserMedia, devices, [
-          { video: request.camera, audio: request.microphone },
+          {
+            // **代表点の fps の整数倍を求める**（`V_1080P30.framerate` = 30）。
+            //
+            // 段の fps は代表点の値（15 / 30 / 60）である。取得がその整数倍でないと、
+            // 申告 fps を守る送出は間隔が不均等になる（20 fps から 15 fps を作ると
+            // 50 / 50 / 100 ms の繰り返しになる）。中継ノードの送信窓は「申告 fps ×
+            // `SEND_WINDOW_MS`」の枚数しか許さないため、2 枚が 100 ms に固まると窓が閉じ、
+            // 破棄不可のユニットまで落ちる（実測: 劣化が無い 40 秒で送信ノード 5 件・
+            // 中継ノード 6 件。F-073）。
+            //
+            // `ideal` で求める。**強制しない**（対応しない装置で取得そのものを失敗させない）。
+            // 整数倍にならない装置が残る場合の扱いは Q-027 に登録してある。
+            video:
+              request.camera === true
+                ? { frameRate: { ideal: V_1080P30.framerate } }
+                : request.camera,
+            audio: request.microphone,
+          },
         ]);
       } catch {
         // 拒否された。参加そのものは成立させる（受信はできる）。
@@ -198,8 +218,13 @@ export function browserCaptureDeps(): CaptureDeps {
       if (audioTrack !== null) {
         pump(audioTrack, encodeAudio);
       }
+      const measured = sourceOf(videoTrack);
+      if (measured !== null) {
+        // **間引きの基準になる。** 実測値が無ければ間引かない（全フレームを渡す）。
+        sourceFramerate = measured.framerate;
+      }
       return {
-        source: sourceOf(videoTrack),
+        source: measured,
         video: videoTrack !== null,
         audio: audioTrack !== null,
       };
@@ -357,26 +382,25 @@ export function browserCaptureDeps(): CaptureDeps {
    *
    * **申告した fps を超えて渡してはならない。**
    *
-   * `VideoEncoder` の `framerate` は助言であり、投入した数がそのまま出る。取得の
-   * トラックは 30 fps で回るため、15 fps と申告した段へ全フレームを渡すと**申告の 2 倍**が
-   * ワイヤへ出る。中継ノードの送信窓は申告 fps から幅を決める
-   * （`inFlight × 1000 > SEND_WINDOW_MS × framerate`。congestion.md 2 節）ため、
-   * 2 倍の速さで届くと窓が閉じ、**基底層まで捨てられる**。
-   * 実測（2026-07-30、実環境・劣化なし）: 符号化 1,472 件のうちワイヤへ 1,342 件、
-   * 中継ノードが 842 件（うち優先度 4 が 417 件）を捨て、購読者へは 413 件しか届かなかった。
-   * 受信側は 1 枚おきに欠けた（判定 B-2 が 363 件）。
+   * `VideoEncoder` の `framerate` は助言であり、投入した数がそのまま出る。取得のトラックの
+   * 全フレームを渡すと申告を超える量がワイヤへ出る。中継ノードの送信窓は申告 fps から幅を
+   * 決める（`inFlight × 1000 > SEND_WINDOW_MS × framerate`。congestion.md 2 節）ため、
+   * 超えた分で窓が閉じ、**基底層まで捨てられる**。実測（実環境・劣化なし）: 符号化 1,472 件の
+   * うちワイヤへ 1,342 件、中継ノードが 842 件（うち優先度 4 が 417 件）を捨て、購読者へは
+   * 413 件しか届かなかった（判定 B-2 が 363 件）。
    *
-   * 間隔は整数で数える。段ごとに「次に渡してよい時刻」を持ち、それより前のフレームは
-   * その段に渡さない（他の段には渡す。段ごとに fps が違う）。
+   * **間引きは整数で行う**（`k` 枚に 1 枚を渡す。ADR-0051）。時刻で間引くと、源が申告の
+   * 整数倍でない装置で間隔が不均等になる（源 20 fps から 15 fps を作ると 50 / 50 / 100 ms の
+   * 繰り返しになり、2 枚が 100 ms に固まって窓を閉じる。F-073）。申告 fps は
+   * `declaredFramerate` が「源 ÷ 整数」に丸めてあるため、整数の間引きで一致する。
    */
   function encodeFrame(frame: unknown): void {
     if (!videoEnabled) {
       closeFrame(frame);
       return;
     }
-    const nowMs = Date.now();
     for (const entry of videoEncoders.values()) {
-      if (!dueForRung(entry.spatialId, entry.framerate, nowMs)) {
+      if (!dueForRung(entry.spatialId, entry.framerate)) {
         continue;
       }
       const wantKey = keyframeWanted.delete(entry.spatialId);
@@ -392,22 +416,16 @@ export function browserCaptureDeps(): CaptureDeps {
    * 進める**（前者だと 1 回の遅れが累積し、実効 fps が申告より下がり続ける）。
    * 予定が現在から 1 間隔以上遅れていれば現在に合わせ直す（停止からの復帰）。
    */
-  function dueForRung(spatialId: number, framerate: number, nowMs: number): boolean {
-    if (framerate <= 0) {
+  function dueForRung(spatialId: number, framerate: number): boolean {
+    if (framerate <= 0 || sourceFramerate <= 0 || sourceFramerate <= framerate) {
       return true;
     }
-    const intervalMs = Math.trunc(1000 / framerate);
-    const planned = nextDueMs.get(spatialId);
-    if (planned === undefined) {
-      nextDueMs.set(spatialId, nowMs + intervalMs);
-      return true;
-    }
-    if (nowMs < planned) {
-      return false;
-    }
-    const advanced = planned + intervalMs;
-    nextDueMs.set(spatialId, advanced <= nowMs ? nowMs + intervalMs : advanced);
-    return true;
+    // k = round(源 ÷ 申告)。`declaredFramerate` が「源 ÷ 整数」に丸めているため整数になる。
+    const k = Math.trunc((sourceFramerate + Math.trunc(framerate / 2)) / framerate);
+    const interval = k < 1 ? 1 : k;
+    const seen = (seenFrames.get(spatialId) ?? 0) + 1;
+    seenFrames.set(spatialId, seen);
+    return seen % interval === 0;
   }
 
   /** 音声のかたまりを符号化する。 */

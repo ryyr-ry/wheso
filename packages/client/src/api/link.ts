@@ -481,7 +481,7 @@ export function createLink(deps: LinkDeps): Link {
      * `vr` だけが `close` を受け取り、他の 4 部屋は `CLOSING` のまま `close` が来ず、
      * 音声が二度と戻らなかった。心拍の周期で呼び、応答が途絶えていれば張り直す。
      */
-    checkLiveness: (): void => dispatch({ kind: "timeout" }),
+    checkLiveness: (): void => dispatch({ kind: "livenessCheck" }),
     noteTrend: (degrading): void =>
       dispatch(degrading ? { kind: "trendDegrade" } : { kind: "trendRecover" }),
     connects: (): number => connects,
