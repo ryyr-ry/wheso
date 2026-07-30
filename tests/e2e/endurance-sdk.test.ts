@@ -136,11 +136,23 @@ async function nodeCounters(
         item["congestion"],
       )} stalled=${String(item["stalled"])}`;
     });
+    // ack の間隔は「窓が閉じるか」を決める（congestion.md 2 節）。分位で出す。
+    const acks = readList<number>(record["ackIntervalsMs"])
+      .slice()
+      .sort((left, right) => left - right);
+    const at = (ratio: number): number => acks[Math.min(acks.length - 1, Math.trunc(acks.length * ratio))] ?? 0;
+    const ackText =
+      acks.length === 0
+        ? ""
+        : ` ack間隔=[件数 ${String(acks.length)} p50 ${String(at(0.5))} p90 ${String(at(0.9))} p99 ${String(
+            at(0.99),
+          )} 最大 ${String(acks[acks.length - 1] ?? 0)}]`;
     return (
       `${role}: in=${String(counters["binaryIn"] ?? counters["upstreamBinaryIn"])}` +
       ` out=${String(counters["binaryOut"] ?? counters["toClient"])}` +
       ` drops=${JSON.stringify(record["drops"])} clients=${String(record["clients"])}` +
       ` streams=${JSON.stringify(record["streams"])}` +
+      ackText +
       (subs.length > 0 ? ` subs=[${subs.join(" | ")}]` : "")
     );
   } catch (error) {
@@ -317,6 +329,14 @@ test("**段 E: 再デプロイと切断を挟んでも送受信が続き、自�
     "receiver",
     `vr-${meetingId}-${USER_RECEIVER}`,
   );
+  // 送信ノードの側は ack の間隔と窓の破棄を持つ（Q-027 の判断材料）。
+  const senderNode = await nodeCounters(
+    liveRef.host,
+    meetingId,
+    "sender",
+    "sender",
+    `vs-${meetingId}-${USER_SENDER}`,
+  );
   await sender.tab.close();
   await receiver.tab.close();
   await sender.browser.close();
@@ -353,7 +373,7 @@ test("**段 E: 再デプロイと切断を挟んでも送受信が続き、自�
           return `${String(item["kind"])} 開 ${String(num(item["opened"]))} 閉 ${String(num(item["closed"]))} 最後 ${String(num(item["lastCode"]))}`;
         })
         .join(" / ")}` +
-      ` / 節点 ${receiverNode}` +
+      ` / 節点 ${receiverNode} / ${senderNode}` +
       ` / 戻れない切断 ${(built.record.closures ?? []).join(", ") || "なし"}` +
       ` / 戻れた切断 ${built.transientClosures.join(", ") || "なし"}\n`,
   );

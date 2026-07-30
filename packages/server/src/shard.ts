@@ -236,6 +236,12 @@ export class ShardNode implements Party.Server {
       }
       this.counters = { ...this.counters, textIn: this.counters.textIn + 1 };
       this.state = handleText(this.state, peer, message, now, this.transport);
+      // **制御の到着でも ack を返す。** 規範は 50 ms ごとの ack を前提に送信窓を 200 ms と
+      // 定めている（congestion.md 2 節: 「4 回の更新で窓を使い切るまでの粒度」）。媒体の
+      // 到着だけを引き金にすると、ack の間隔が**媒体の間隔**で決まってしまう（10 fps なら
+      // 100 ms。実測 p50 95 ms）。すると窓の更新は 2 回しか入らず、1 度の遅れで窓が閉じて
+      // 破棄不可のユニットが落ちる。購読者の ack や報告も入力であるから、これも引き金にする。
+      this.maybeTick(now);
       return;
     }
 
@@ -316,7 +322,9 @@ export class ShardNode implements Party.Server {
     // 回復方向の遷移は送信が止まった状態でも起きる必要がある（state-machines.md 3 節）。
     const now = Date.now();
     this.counters = { ...this.counters, alarms: this.counters.alarms + 1 };
-    this.state = handleTimer(this.state, now, this.transport);
+    // **アラームも同じ律で通す。** 直接 `handleTimer` を呼ぶと、入力で回した直後に
+    // 二重に ack を返し、`ACK_INTERVAL_MS` の下限を破る（メッセージレートを無駄に食う）。
+    this.maybeTick(now);
     // 接続がある間だけ起き続ける。誰も居ない部屋を起こし続けない。
     // **`onAlarm` では `room.id` と `context.parties` に触れられない**（PartyKit の制約）。
     // ここでは接続の数と storage しか使わない。
