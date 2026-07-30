@@ -131,6 +131,7 @@ test("**音声の予約はジッタバッファの深さより先へ積み上が
       },
       onFrame: (): void => undefined,
       onDecodeError: (): void => undefined,
+      onAudioScheduled: (): void => undefined,
 
     });
     // 一度に大量の音声が届く（復旧直後に経路の分がまとめて届く状況）。

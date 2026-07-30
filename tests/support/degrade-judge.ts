@@ -219,10 +219,21 @@ export function judgeCompleteness(record: DegradeRecord): readonly Violation[] {
   if (record.received.length === record.sent.length) {
     return [];
   }
+  // **どの番号が欠けたかを出す。** 端（暖機・締め）と定常の欠落は原因が違う。
+  const arrived = new Set(record.received.map((entry) => entry.frameIndex));
+  const missing = record.sent
+    .map((entry) => entry.frameIndex)
+    .filter((index) => !arrived.has(index));
+  const head = missing.slice(0, 8).join(", ");
+  const first = record.sent[0]?.frameIndex ?? 0;
+  const last = record.sent[record.sent.length - 1]?.frameIndex ?? 0;
   return [
     {
       judgement: "B-1",
-      detail: `欠落がある（送 ${String(record.sent.length)} / 受 ${String(record.received.length)}）`,
+      detail:
+        `欠落がある（送 ${String(record.sent.length)} / 受 ${String(record.received.length)}）` +
+        `。判定の範囲は ${String(first)}〜${String(last)}、欠けた番号 ${String(missing.length)} 件` +
+        `（最初の 8 件: ${head}）`,
     },
   ];
 }
@@ -325,6 +336,11 @@ export function judgeAvSkew(
   }
 
   const skews: number[] = [];
+  /** どのフレームで最も大きくずれたかを残す（暖機の端か定常かを見分けるため）。 */
+  let worstLeadFrame = -1;
+  let worstLeadValue = 0;
+  let worstLagFrame = -1;
+  let worstLagValue = 0;
   const violations: Violation[] = [];
   for (const frame of video) {
     const at = audioAt.get(frame.frameIndex);
@@ -336,7 +352,16 @@ export function judgeAvSkew(
       });
       continue;
     }
-    skews.push(frame.atMs - at);
+    const skew = frame.atMs - at;
+    if (skew > worstLeadValue) {
+      worstLeadValue = skew;
+      worstLeadFrame = frame.frameIndex;
+    }
+    if (-skew > worstLagValue) {
+      worstLagValue = -skew;
+      worstLagFrame = frame.frameIndex;
+    }
+    skews.push(skew);
   }
 
   if (skews.length === 0) {
@@ -365,7 +390,7 @@ export function judgeAvSkew(
       judgement: "D-1",
       detail:
         `音声が先行しすぎている（p99 ${String(upper)} ms、許容 ${String(audioLeadMaxMs)} ms、` +
-        `最大 ${String(worst)} ms、組 ${String(sorted.length)}）`,
+        `最大 ${String(worst)} ms は frameIndex ${String(worstLeadFrame)}、組 ${String(sorted.length)}）`,
     });
   }
   if (-lower > audioLagMaxMs) {
@@ -373,7 +398,7 @@ export function judgeAvSkew(
       judgement: "D-1",
       detail:
         `音声が遅れすぎている（p99 ${String(-lower)} ms、許容 ${String(audioLagMaxMs)} ms、` +
-        `最大 ${String(-best)} ms、組 ${String(sorted.length)}）`,
+        `最大 ${String(-best)} ms は frameIndex ${String(worstLagFrame)}、組 ${String(sorted.length)}）`,
     });
   }
   return violations;

@@ -14,6 +14,7 @@ import { createServer, type Server } from "node:http";
 import { createServer as createNetServer, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { build } from "esbuild";
+import { createShaper, type ShapeState, type ShapeStats } from "./link-shaper.ts";
 
 const root = new URL("../..", import.meta.url).pathname;
 
@@ -33,6 +34,15 @@ export async function findFreePort(): Promise<number> {
 export interface Bridge {
   readonly port: number;
   readonly close: () => void;
+  /**
+   * 利用側の回線を劣化させる（`tc` の代わり。**root を要さない**）。
+   *
+   * 上り（ブラウザ → 実環境）と下り（実環境 → ブラウザ）を別に設定できる。`tc` は装置
+   * 単位で効くため、帯域は**この終端を通る全接続で共有する**。
+   */
+  readonly shape: (egress: ShapeState, ingress: ShapeState) => void;
+  /** 整形の観測（本当に効いたかを数で確かめるため）。 */
+  readonly shapeStats: () => { readonly egress: ShapeStats; readonly ingress: ShapeStats };
 }
 
 /**
@@ -44,6 +54,9 @@ export interface Bridge {
  */
 export function startTlsBridge(port: number, host: string): Bridge {
   const open = new Set<Socket>();
+  // 方向ごとに 1 個。**接続をまたいで共有する**（装置単位の制限を再現するため）。
+  const egress = createShaper((): number => Date.now());
+  const ingress = createShaper((): number => Date.now());
   const server = createNetServer((client) => {
     // **小さな書き込みを遅らせない。** 制御メッセージ（`hello` など）は数十バイトであり、
     // Nagle と遅延 ACK が噛み合うと数百ミリ秒遅れる。認証には猶予（`HELLO_TIMEOUT_MS`）が
@@ -51,18 +64,33 @@ export function startTlsBridge(port: number, host: string): Bridge {
     client.setNoDelay(true);
     const upstream = tlsConnect({ host, port: 443, servername: host }, () => {
       upstream.setNoDelay(true);
-      upstream.pipe(client);
     });
+    // **`pipe` を使わない。** 整形器を通すため、書き込みを自分で行う。
+    const down = ingress.attach((chunk: Buffer): void => {
+      if (client.writable) {
+        client.write(chunk);
+      }
+    }, upstream);
+    const up = egress.attach((chunk: Buffer): void => {
+      if (upstream.writable) {
+        upstream.write(chunk);
+      }
+    }, client);
+    upstream.on("data", (chunk: Buffer) => down.push(chunk));
     let rewritten = false;
     client.on("data", (chunk: Buffer) => {
       if (rewritten) {
-        upstream.write(chunk);
+        up.push(chunk);
         return;
       }
       rewritten = true;
       const text = chunk.toString("latin1");
       const fixed = text.replace(/\r\nHost:[^\r\n]*\r\n/i, `\r\nHost: ${host}\r\n`);
-      upstream.write(Buffer.from(fixed, "latin1"));
+      up.push(Buffer.from(fixed, "latin1"));
+    });
+    client.on("close", () => {
+      up.detach();
+      down.detach();
     });
     open.add(client);
     client.on("close", () => open.delete(client));
@@ -80,12 +108,19 @@ export function startTlsBridge(port: number, host: string): Bridge {
   return {
     port,
     close: (): void => {
+      egress.stop();
+      ingress.stop();
       for (const socket of open) {
         socket.destroy();
       }
       open.clear();
       server.close();
     },
+    shape: (up, down): void => {
+      egress.set(up);
+      ingress.set(down);
+    },
+    shapeStats: () => ({ egress: egress.stats(), ingress: ingress.stats() }),
   };
 }
 

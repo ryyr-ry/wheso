@@ -32,8 +32,10 @@ import {
   IMPAIRMENT_MAX_GAP_MS,
   IMPAIRMENT_MAX_GAP_WITH_OUTAGE_MS,
   IMPAIRMENT_PROFILES,
+  type ImpairmentStep,
 } from "../../packages/core/src/generated/impairment.ts";
-import { applyStep, canImpair, clearImpairment, prepareDevice, stepAt } from "../../tools/impair.ts";
+import { stepAt } from "../../tools/impair.ts";
+import { NO_SHAPE, type ShapeState } from "../support/link-shaper.ts";
 import { judgeAll, judgeIdenticalPixels } from "../support/degrade-judge.ts";
 import { buildDegradeRecord, type ObservedRun } from "../support/sdk-degrade-record.ts";
 import {
@@ -61,12 +63,8 @@ let live: LiveEnvironment | null = null;
 let impairAvailable = false;
 
 before(async () => {
-  impairAvailable = canImpair();
-  if (!impairAvailable) {
-    process.stdout.write("SKIP 段 D（劣化を適用できない。tc に root が要る）\n");
-    return;
-  }
-  prepareDevice();
+  // **root は要らない。** 劣化は終端（`startTlsBridge`）で掛ける。
+  impairAvailable = true;
   live = await startLive();
   bridgeA = startTlsBridge(await findFreePort(), live.host);
   bridgeB = startTlsBridge(await findFreePort(), live.host);
@@ -89,9 +87,6 @@ after(async () => {
   bridgeA = null;
   bridgeB?.close();
   bridgeB = null;
-  if (impairAvailable) {
-    clearImpairment();
-  }
 });
 
 /** 試験の長さ。既定は規範の 60 秒。CI では短くできる。 */
@@ -101,12 +96,20 @@ function durationSec(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : IMPAIRMENT_DURATION_SEC;
 }
 
-/** プロファイルの段を時刻に沿って適用し続ける。終わったら劣化を解除する。 */
+/**
+ * プロファイルの段を時刻に沿って適用し続ける。終わったら劣化を解除する。
+ *
+ * **`tc` ではなく終端（`startTlsBridge`）で整形する。** `tc` は root を要するため、root の
+ * 無い環境では 8 プロファイルすべてが飛ばされ、判定 D-1・B-2・C-1・C-3 に実入力が一度も
+ * 与えられない。終端で整形すれば利用者権限で足りる。再現できる範囲と限界は
+ * `tests/support/link-shaper.ts` の冒頭に書いた（再順序と重複は TCP のバイト列では
+ * 再現できない。`tc` でも TCP が復元するため、利用側から見える影響は遅延だけである）。
+ */
 function driveProfile(
   profileId: string,
   seconds: number,
-  port: number,
-): { stop: () => void; failures: () => number; applied: () => number } {
+  bridge: Bridge,
+): { stop: () => void; failures: () => number; applied: () => number; outages: () => number } {
   const profile = IMPAIRMENT_PROFILES.find((entry) => entry.id === profileId);
   if (profile === undefined) {
     throw new Error(`未知のプロファイル: ${profileId}`);
@@ -114,40 +117,64 @@ function driveProfile(
   const startedAt = Date.now();
   let appliedAtSec = -1;
   let appliedCount = 0;
-  let failureCount = 0;
+  let outageCount = 0;
+  let blacked = false;
+
+  /** 段を終端へ適用する。`egressOnly` のプロファイルは上りだけに掛ける。 */
+  const apply = (step: ImpairmentStep, blackout: boolean): void => {
+    const shape: ShapeState = {
+      rateKbit: step.rateKbit,
+      delayMs: step.delayMs,
+      jitterMs: step.jitterMs,
+      blackout,
+    };
+    const other: ShapeState = profile.egressOnly === true ? { ...NO_SHAPE, blackout } : shape;
+    bridge.shape(shape, other);
+  };
+
   const timer = setInterval(() => {
     const elapsedSec = Math.trunc((Date.now() - startedAt) / 1000);
     if (elapsedSec > seconds) {
       return;
     }
     const step = stepAt(profile, elapsedSec);
-    if (step !== undefined && step.atSec !== appliedAtSec) {
+    if (step !== undefined && step.atSec !== appliedAtSec && !blacked) {
       appliedAtSec = step.atSec;
-      if (applyStep(step, port)) {
-        appliedCount += 1;
-      } else {
-        failureCount += 1;
-      }
+      apply(step, false);
+      appliedCount += 1;
     }
     const outage = profile.outage;
-    if (outage !== undefined && elapsedSec > 0 && elapsedSec % outage.everySec === 0) {
-      void (async () => {
-        const { outage: applyOutage } = await import("../../tools/impair.ts");
-        await applyOutage(outage.durationMs, port);
-        const back = stepAt(profile, elapsedSec);
-        if (back !== undefined) {
-          applyStep(back, port);
-        }
-      })();
+    if (outage !== undefined && elapsedSec > 0 && elapsedSec % outage.everySec === 0 && !blacked) {
+      const current = stepAt(profile, elapsedSec);
+      if (current !== undefined) {
+        blacked = true;
+        outageCount += 1;
+        apply(current, true);
+        setTimeout(() => {
+          apply(current, false);
+          blacked = false;
+        }, outage.durationMs);
+      }
     }
   }, 1000);
+
+  // 最初の段は直ちに掛ける（1 秒待たない。60 秒のうち 1 秒は判定に影響する）。
+  const first = stepAt(profile, 0);
+  if (first !== undefined) {
+    appliedAtSec = 0;
+    apply(first, false);
+    appliedCount += 1;
+  }
+
   return {
     stop: (): void => {
       clearInterval(timer);
-      clearImpairment();
+      bridge.shape(NO_SHAPE, NO_SHAPE);
     },
-    failures: (): number => failureCount,
+    // 終端の整形は失敗しない（外部命令を呼ばない）。数は残す（判定の形を変えないため）。
+    failures: (): number => 0,
     applied: (): number => appliedCount,
+    outages: (): number => outageCount,
   };
 }
 
@@ -178,6 +205,8 @@ interface ParticipantView {
   readonly encodedVideoCount: number;
   /** 符号化器が出した音声ユニットの数（無音は送らないためワイヤの数と一致しない）。 */
   readonly encodedAudioCount: number;
+  /** SDK 自身が観測した A/V のずれ（ミリ秒）。器の対応付けとの食い違いを見るため。 */
+  readonly avSkewMs: number;
   readonly uplinkBps: number;
   readonly downlinkBps: number;
   readonly participantCount: number;
@@ -245,6 +274,7 @@ function readParticipant(value: unknown): ParticipantView {
     },
     encodedVideoCount: num(record["encodedVideoCount"]),
     encodedAudioCount: num(record["encodedAudioCount"]),
+    avSkewMs: num(record["avSkewMs"]),
     uplinkBps: num(record["uplinkBps"]),
     downlinkBps: num(record["downlinkBps"]),
     participantCount: num(record["participantCount"]),
@@ -372,13 +402,13 @@ function pick(
 for (const profile of IMPAIRMENT_PROFILES) {
   test(`SDK 経由 ${profile.id}: ${profile.note}`, { timeout: 420_000 }, async (context) => {
     if (!impairAvailable || live === null || bridgeA === null || page === null) {
-      context.skip("劣化を適用できない（tc に root が要る）");
+      context.skip("実環境へ繋げない（器の準備に失敗した）");
       return;
     }
     const seconds = durationSec();
     const meetingId = newMeetingId();
     const base = `http://127.0.0.1:${String(bridgeA.port)}`;
-    const driver = driveProfile(profile.id, seconds, bridgeA.port);
+    const driver = driveProfile(profile.id, seconds, bridgeA);
     let views: readonly ParticipantView[];
     try {
       views = await runParticipants(
@@ -418,18 +448,37 @@ for (const profile of IMPAIRMENT_PROFILES) {
     );
     const built = buildDegradeRecord(merge(sender, receiver));
 
+    // **音声の間隔を測る。** 音声は破棄禁止であり、1 秒を超える隙間は再生クロックの
+    // 作り直し（`AV_RESYNC_GAP_MS`。ADR-0028）を起こす。作り直すと映像の提示時刻の写像が
+    // 飛び、映像側に連鎖する。原因を音声に辿れるよう、隙間の最大を必ず出す。
+    const gapOf = (times: readonly number[]): number => {
+      const sorted = [...times].sort((left, right) => left - right);
+      let worst = 0;
+      for (let index = 1; index < sorted.length; index += 1) {
+        const gap = (sorted[index] ?? 0) - (sorted[index - 1] ?? 0);
+        if (gap > worst) {
+          worst = gap;
+        }
+      }
+      return worst;
+    };
+    const audioSendGap = gapOf(sender.run.sentAudio.map((entry) => entry.atMs));
+    const audioPlayGap = gapOf(receiver.run.playedAudio.map((entry) => entry.atMs));
+
     process.stdout.write(
       `SDK ${profile.id} の実測: 符号化 ${String(sender.encodedVideoCount)}` +
         ` / ワイヤ ${String(sender.run.sentVideo.length)}` +
         ` / 判定対象 ${String(built.judgedSent)} / 届 ${String(built.record.arrived?.length ?? 0)}` +
         ` / 提示 ${String(built.record.received.length)}` +
         ` / 音声（符号化 ${String(sender.encodedAudioCount)} / ワイヤ ${String(sender.run.sentAudio.length)}` +
-        ` / 再生 ${String(receiver.run.playedAudio.length)}）` +
+        ` / 再生 ${String(receiver.run.playedAudio.length)}` +
+        ` / 隙間 送 ${String(audioSendGap)} ms・再生 ${String(audioPlayGap)} ms）` +
         ` / 対 ${String(built.record.playedAudio?.length ?? 0)}` +
         ` / 連鎖切れ ${String(built.chainBreaks)}` +
         ` / 段の切替 ${String(built.switches.length)}` +
         ` / 要求 ${String(built.record.keyframeRequests)}` +
         ` / 上り ${String(sender.uplinkBps)} bps` +
+        ` / SDK が思うずれ ${String(receiver.avSkewMs)} ms` +
         ` / 戻れない切断 ${built.record.closures?.length === 0 ? "なし" : (built.record.closures ?? []).join(", ")}` +
         ` / 戻れた切断 ${built.transientClosures.length === 0 ? "なし" : built.transientClosures.join(", ")}\n`,
     );
@@ -474,7 +523,7 @@ for (const profile of IMPAIRMENT_PROFILES) {
  */
 test("SDK 経由 N-8: 劣化した購読者が健全な購読者を壊さない", { timeout: 420_000 }, async (context) => {
   if (!impairAvailable || live === null || bridgeA === null || bridgeB === null || page === null) {
-    context.skip("劣化を適用できない（tc に root が要る）");
+    context.skip("実環境へ繋げない（器の準備に失敗した）");
     return;
   }
   const seconds = durationSec();
@@ -482,7 +531,7 @@ test("SDK 経由 N-8: 劣化した購読者が健全な購読者を壊さない"
   const healthyBase = `http://127.0.0.1:${String(bridgeA.port)}`;
   const impairedBase = `http://127.0.0.1:${String(bridgeB.port)}`;
   // 劣化させるのは受信者 B のポートだけである。送信者と受信者 A には何も掛けない。
-  const driver = driveProfile("N-6", seconds, bridgeB.port);
+  const driver = driveProfile("N-6", seconds, bridgeB);
   let views: readonly ParticipantView[];
   try {
     views = await runParticipants(

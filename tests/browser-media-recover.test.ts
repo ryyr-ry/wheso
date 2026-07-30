@@ -142,6 +142,7 @@ function harness(): Harness {
     onDecodeError: (senderId): void => {
       errors.push(senderId);
     },
+    onAudioScheduled: (): void => undefined,
   });
   return { deps, fakes, frames, errors };
 }

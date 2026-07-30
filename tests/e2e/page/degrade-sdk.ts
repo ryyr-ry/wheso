@@ -160,6 +160,8 @@ export interface SdkDegradeParticipant {
    * 排水の待ちは、窓の中で送ったものが届くための時間である。
    */
   readonly windowClosedAtMs: number;
+  /** SDK 自身が観測した A/V のずれ（ミリ秒）。 */
+  readonly avSkewMs: number;
   readonly uplinkBps: number;
   readonly downlinkBps: number;
   readonly participantCount: number;
@@ -421,6 +423,12 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
     ...base,
     bindOutput: (output: FrameOutput): void => {
       base.bindOutput({
+        // **実際に鳴る時刻を記録する。** 予定時刻で代用すると写像の値を測ってしまう
+        // （実測: 偽のずれ p99 1,976 ms。SDK 自身の観測は 129 ms であった）。
+        onAudioScheduled: (senderId, captureUs, atMs): void => {
+          void senderId;
+          recorder.playedAudio.push({ captureUs, atMs });
+        },
         onFrame: (senderId, frame): void => {
           const timestamp = Reflect.get(Object(frame), "timestamp");
           const captureUs = typeof timestamp === "number" ? timestamp : -1;
@@ -488,10 +496,8 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
         base.media.decodeVideo(input);
       },
       enqueueAudio: (input: DecodeInput): void => {
-        // **鳴る時刻を記録する。** 待ち行列へ入れた時刻ではない。音声は再生クロックの
-        // 写像（`audioPresentAtMs`）に従って鳴るため、入れた時刻で測ると深度ぶん
-        // 先行しているように見える（実測: それで p99 176 ms の偽のずれが出た）。
-        recorder.playedAudio.push({ captureUs: input.captureTimestampUs, atMs: input.presentAtMs });
+        // **ここでは記録しない。** 待ち行列へ入れた時刻でも予定時刻でもなく、
+        // `onAudioScheduled`（実際に鳴る時刻）で記録する。
         base.media.enqueueAudio(input);
       },
     },
@@ -576,6 +582,7 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
 interface Joined {
   readonly recorder: Recorder;
   readonly participants: () => number;
+  readonly avSkewMs: () => number;
   readonly uplinkBps: () => number;
   readonly downlinkBps: () => number;
   readonly leave: () => void;
@@ -638,6 +645,8 @@ async function joinOne(spec: Spec, meetingId: string, tokenKey: string, logs: st
   return {
     recorder,
     participants: (): number => meeting.participants.length,
+    // SDK 自身が思っているずれ。器の対応付けと食い違えば、どちらが狂っているか分かる。
+    avSkewMs: (): number => meeting.quality.avSkewMs,
     uplinkBps: (): number => meeting.quality.uplinkBps,
     downlinkBps: (): number => meeting.quality.downlinkBps,
     leave: (): void => {
@@ -666,6 +675,7 @@ function snapshot(joined: Joined): SdkDegradeParticipant {
     closures: [...recorder.closures],
     lastSentAtMs: recorder.lastSentAtMs,
     windowClosedAtMs: recorder.windowClosedAtMs,
+    avSkewMs: joined.avSkewMs(),
     uplinkBps: joined.uplinkBps(),
     downlinkBps: joined.downlinkBps(),
     participantCount: joined.participants(),
@@ -676,6 +686,7 @@ function snapshot(joined: Joined): SdkDegradeParticipant {
 
 const EMPTY: SdkDegradeParticipant = {
   label: "",
+  avSkewMs: 0,
   sentVideo: [],
   encodedVideoCount: 0,
   encodedAudioCount: 0,

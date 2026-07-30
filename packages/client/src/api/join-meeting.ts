@@ -118,6 +118,13 @@ export interface FrameOutput {
   readonly onFrame: (senderId: number, frame: MediaFrame) => void;
   /** 復号に失敗した。キーフレームを要求し直す。 */
   readonly onDecodeError: (senderId: number, channel: number) => void;
+  /**
+   * 音声 1 個が実際に鳴る時刻（局所の壁時計）。**観測のみ**で振る舞いは変えない。
+   *
+   * 受入条件 4.4 は「鳴った時刻」と「描いた時刻」の差を測る。鳴る時刻は音声の時計の上に
+   * しかなく、外から観測できないため、ここで出す。
+   */
+  readonly onAudioScheduled: (senderId: number, captureUs: number, atMs: number) => void;
   /** 受け皿の寸法が変わった。受信部屋へ申告する。 */
   readonly onDisplaySize: (participantId: string, width: number, height: number) => void;
 }
@@ -319,6 +326,7 @@ export function browserDeps(capability: DeviceCapability, source: SourceSpec): J
       },
       onFrame: (senderId, frame) => bound?.onFrame(senderId, frame),
       onDecodeError: (senderId, channel) => bound?.onDecodeError(senderId, channel),
+      onAudioScheduled: (senderId, captureUs, atMs) => bound?.onAudioScheduled(senderId, captureUs, atMs),
     }),
     capture: browserCaptureDeps(),
     createSink: (participantId) =>
@@ -755,6 +763,9 @@ export async function joinWith(
       if (profile !== null) {
         meeting.updateParticipant(participantId, { receivedProfile: profile });
       }
+    },
+    onAudioScheduled: (): void => {
+      // 既定の束ねでは使わない（器が観測する）。
     },
     onDecodeError: (senderId, channel): void => {
       // 復号が壊れた。キーフレームを要求し直す（wire-format.md 2.5）。

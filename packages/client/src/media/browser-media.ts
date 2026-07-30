@@ -29,6 +29,16 @@ export interface BrowserMediaOptions {
   readonly onFrame: (senderId: number, frame: DecodedFrame) => void;
   /** 復号に失敗したことを伝える。キーフレームの再要求に使う。 */
   readonly onDecodeError: (senderId: number, channel: number) => void;
+  /**
+   * 音声 1 個が**実際に鳴る時刻**（局所の壁時計。ミリ秒）を伝える観測。
+   *
+   * **なぜ製品側に置くか。** 受入条件 4.4（判定 D-1）は「音声バーストの検出時刻」と
+   * 「描画時刻」の差を測る。**鳴る時刻は `AudioContext` の時計の上にしかない**ため、
+   * 外からは観測できない。予定時刻（`audioPresentAtMs`）で代用すると、実際の音の位置
+   * ではなく写像の値を測ることになる（実測: 器がそれで p99 1,976 ms の偽のずれを
+   * 報じた。SDK 自身の観測は 129 ms であった）。振る舞いは変えない。
+   */
+  readonly onAudioScheduled: (senderId: number, captureUs: number, atMs: number) => void;
 }
 
 /** 復号器 1 個ぶんの記録。 */
@@ -56,7 +66,7 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
    * 渡さないための印である（受入条件 A-3）。購読を捨てるときに忘れる。
    */
   const presentedUs = new Map<string, number>();
-  const audio = createAudioSink();
+  const audio = createAudioSink(options.onAudioScheduled);
 
   const videoDecoderCtor = Reflect.get(globalThis, "VideoDecoder");
   const chunkCtor = Reflect.get(globalThis, "EncodedVideoChunk");
@@ -285,7 +295,7 @@ interface AudioSink {
  *
  * Web Audio が無い環境では何もしない。参加そのものは成立させる。
  */
-function createAudioSink(): AudioSink {
+function createAudioSink(onScheduled: (senderId: number, captureUs: number, atMs: number) => void): AudioSink {
   const contextCtor = Reflect.get(globalThis, "AudioContext");
   const decoderCtor = Reflect.get(globalThis, "AudioDecoder");
   const chunkCtor = Reflect.get(globalThis, "EncodedAudioChunk");
@@ -349,7 +359,7 @@ function createAudioSink(): AudioSink {
     return planned;
   }
 
-  function play(senderId: number, data: unknown): void {
+  function play(senderId: number, data: unknown, captureUs: number): void {
     // **`AudioData` をそのまま `AudioBufferSourceNode.buffer` へ入れてはならない。**
     // 型が違うため «Failed to convert value to 'AudioBuffer'» で失敗する（実測。
     // ブラウザの E2E で毎パケット例外が出ていた）。標本を写して `AudioBuffer` を作る。
@@ -366,6 +376,10 @@ function createAudioSink(): AudioSink {
     callMethod(source, "connect", [destination]);
     const at = scheduleAt(senderId);
     callMethod(source, "start", [at]);
+    // 予約は `AudioContext` の時計の上にある。壁時計へ写して観測へ出す。
+    const nowSeconds = readProperty(context, "currentTime");
+    const offsetMs = typeof nowSeconds === "number" ? (at - nowSeconds) * 1000 : 0;
+    onScheduled(senderId, captureUs, Date.now() + offsetMs);
     const duration = readProperty(buffer, "duration");
     const seconds = typeof duration === "number" ? duration : OPUS_FRAME_MS / 1000;
     nextAt.set(senderId, at + seconds);
@@ -416,7 +430,9 @@ function createAudioSink(): AudioSink {
     const created = construct(decoderCtor, [
       {
         output: (frame: unknown): void => {
-          play(senderId, frame);
+          // 取得時刻は復号できた音声そのものが持つ（`AudioData.timestamp`）。
+          const stamp = readProperty(frame, "timestamp");
+          play(senderId, frame, typeof stamp === "number" ? stamp : 0);
         },
         error: (): void => {
           // 音声の復号の失敗は次のパケットで復帰する。捨てて続ける。
