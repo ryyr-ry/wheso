@@ -40,20 +40,20 @@ export function liveHost(): string {
 }
 
 /**
- * 配備する PartyKit の企画名。**環境変数 WHESO_PARTYKIT_PROJECT で与える。**
+ * 配備する PartyKit のプロジェクト名。**環境変数 WHESO_PARTYKIT_PROJECT で与える。**
  *
  * **なぜ必須にするか。** `partykit.json` の `name` を既定として使うと、環境変数を
- * 与え忘れたときに**設定ファイルに書かれた企画へ配備してしまう**。同じ帳場に別の
- * 企画があると、試験のための配備が無関係の企画を上書きする（実際に起きた）。
+ * 与え忘れたときに**設定ファイルに書かれたプロジェクトへ配備してしまう**。同じ帳場に別の
+ * プロジェクトがあると、試験のための配備が無関係のプロジェクトを上書きする（実際に起きた）。
  * 配備先は必ず呼び出し側が名指しする。
  */
 export function livePartykitProject(): string {
   const project = process.env["WHESO_PARTYKIT_PROJECT"];
   if (project === undefined || project === "") {
-    throw new Error("WHESO_PARTYKIT_PROJECT が無い（配備先の企画名を環境変数で与える）");
+    throw new Error("WHESO_PARTYKIT_PROJECT が無い（配備先のプロジェクト名を環境変数で与える）");
   }
   const host = liveHost();
-  // **企画名とホストが対応していなければ失敗させる。** 片方だけを書き換えると、
+  // **プロジェクト名とホストが対応していなければ失敗させる。** 片方だけを書き換えると、
   // 「A へ配備して B を試験する」状態になり、何を測っているのか分からなくなる。
   if (!host.startsWith(`${project}.`)) {
     throw new Error(

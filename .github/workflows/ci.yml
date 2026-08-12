@@ -159,7 +159,11 @@ jobs:
           fi
           WHESO_PARTYKIT_PROJECT="${WHESO_LIVE_HOST%%.*}"
           export WHESO_PARTYKIT_PROJECT
-          echo "配備先の企画: $WHESO_PARTYKIT_PROJECT"
+          if [ -z "$WHESO_PARTYKIT_PROJECT" ]; then
+            echo "WHESO_PARTYKIT_PROJECT が空。配備先が定まらないため配備しない"
+            exit 1
+          fi
+          echo "配備先のプロジェクト: $WHESO_PARTYKIT_PROJECT"
           npm run deploy:test
       - id: mark
         run: echo "deployed=yes" >> "$GITHUB_OUTPUT"

@@ -1,5 +1,5 @@
 {
-  "name": "wheso",
+  "name": "cron-test",
   "main": "packages/server/src/index.ts",
   "parties": {
     "sender": "packages/server/src/sender.ts",

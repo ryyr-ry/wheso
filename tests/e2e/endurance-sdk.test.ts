@@ -16,7 +16,7 @@
  * 実行:
  *
  * ```
- * export WHESO_PARTYKIT_PROJECT=<配備先の企画>
+ * export WHESO_PARTYKIT_PROJECT=<配備先のプロジェクト>
  * export WHESO_LIVE_HOST=<配備先のホスト>
  * WHESO_ENDURANCE_SEC=1800 npm run test:endurance:sdk    # 30 分
  * WHESO_ENDURANCE_SEC=180  npm run test:endurance:sdk    # 手早く確かめる
