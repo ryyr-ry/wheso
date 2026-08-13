@@ -133,16 +133,16 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
   // **映像の切り落としは warmup 境界で切る。** キーフレームが切られる可能性があるが、
   // それは `buildDegradeRecord` 側で補う（参照の基点を復元する）。
   const videoBoundaryUs = warmupBoundaryUs;
-  // **キーフレーム要求は映像が最初に提示できた時刻で切る。**
+  // **キーフレーム要求は映像が最初に提示できた受信時刻で切る。**
   //
   // キーフレーム要求は映像の購読確立時に出るものである。音声の再生開始時刻で切ると、
   // 音声が遅い環境（headed Chrome）で映像の購読は整っているのに warmup として扱われ、
-  // 整った後の要求が残ってしまう。映像の最初の提示時刻で切れば、購読が整う前の要求
-  // （最初の delta フレーム到着時の要求）は常に切り落とされる。
-  let firstPresentedAtMs = -1;
-  for (const unit of run.sentVideo) {
-    if (unit.captureUs === firstPresentedCaptureUs) {
-      firstPresentedAtMs = unit.atMs;
+  // 整った後の要求が残ってしまう。最初に提示できた映像の**受信時刻**で切れば、
+  // 購読が整ってからの要求だけが残る。
+  let firstPresentedReceivedAtMs = -1;
+  for (const entry of run.received) {
+    if (entry.captureUs === firstPresentedCaptureUs) {
+      firstPresentedReceivedAtMs = entry.atMs;
       break;
     }
   }
@@ -162,7 +162,7 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
     playedAudio: keep(run.playedAudio),
     arrived: keep(run.arrived),
     keyframeRequestAtMs:
-      firstPresentedAtMs < 0 ? run.keyframeRequestAtMs : run.keyframeRequestAtMs.filter((at) => at >= firstPresentedAtMs),
+      firstPresentedReceivedAtMs < 0 ? run.keyframeRequestAtMs : run.keyframeRequestAtMs.filter((at) => at >= firstPresentedReceivedAtMs),
   };
 }
 
