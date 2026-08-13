@@ -117,15 +117,28 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
     // 1 枚も提示できていない。切らない（そのまま判定して失敗させる）。
     return run;
   }
+  // **音声の最初の再生も基準に加える。** 音声と映像は別の部屋（`ar` と `vr`）を通り、
+  // 購読の確立も別である。映像が先に整い、音声がまだ届いていない間に提示された映像は
+  // 「対応する音声が無い」となり D-1 の偽の違反になる。音声の最初の再生時刻より前の
+  // 映像は暖機として切り落とす。
+  let firstPlayedCaptureUs = -1;
+  for (const entry of run.playedAudio) {
+    if (firstPlayedCaptureUs < 0 || entry.captureUs < firstPlayedCaptureUs) {
+      firstPlayedCaptureUs = entry.captureUs;
+    }
+  }
+  const warmupBoundaryUs = firstPlayedCaptureUs > 0 && firstPlayedCaptureUs > firstPresentedCaptureUs
+    ? firstPlayedCaptureUs
+    : firstPresentedCaptureUs;
   let boundaryAtMs = -1;
   for (const unit of run.sentVideo) {
-    if (unit.captureUs === firstPresentedCaptureUs) {
+    if (unit.captureUs === warmupBoundaryUs) {
       boundaryAtMs = unit.atMs;
       break;
     }
   }
   const keep = <T extends { readonly captureUs: number }>(list: readonly T[]): readonly T[] =>
-    list.filter((entry) => entry.captureUs >= firstPresentedCaptureUs);
+    list.filter((entry) => entry.captureUs >= warmupBoundaryUs);
   // 末尾も切る。窓を閉じた後に送ったものは、記録を取る時点でまだ経路にある。
   const inWindow = <T extends { readonly captureUs: number; readonly atMs: number }>(
     list: readonly T[],

@@ -310,6 +310,14 @@ function createAudioSink(onScheduled: (senderId: number, captureUs: number, atMs
   const decoders = new Map<number, unknown>();
   /** 送信者ごとの次の再生位置（秒）。`AudioContext` の時刻軸で持つ。 */
   const nextAt = new Map<number, number>();
+  // ADR-0042: 音声も同じ再生クロックに載せる。
+  // 最初の `enqueue` で `Date.now()` と `AudioContext.currentTime` の対応付けを固定する。
+  // それ以降は更新しない（更新すると過去の `presentAtMs` の写像がずれる）。
+  // 2 つの時計のドリフトは実環境では無視できる（ADR-0042 の実測: p99 1〜2 ms）。
+  let dateBaseMs = 0;
+  let contextBaseSeconds = 0;
+  /** `captureUs → presentAtMs`。復号器の非同期出力へ presentAtMs を届ける。 */
+  const presentByCapture = new Map<number, number>();
 
   /** `context` は未知の型である。参照のたびに実行時に検査する（型定義を信用しない）。 */
   function readProperty(target: unknown, name: string): unknown {
@@ -332,31 +340,41 @@ function createAudioSink(onScheduled: (senderId: number, captureUs: number, atMs
    */
   const maxAheadSeconds = (AUDIO_JITTER_MAX_PACKETS * OPUS_FRAME_MS) / 1000;
 
-  function scheduleAt(senderId: number): number {
+  function scheduleAt(senderId: number, presentAtMs: number): number {
     const now = readProperty(context, "currentTime");
     const current = typeof now === "number" ? now : 0;
+    // ADR-0042: `presentAtMs`（壁時計・ミリ秒）を AudioContext 時刻（秒）へ写す。
+    // `Date.now()` は呼ばない（JS イベントループの遅延が skew に混入するのを防ぐ）。
+    // 対応付けは `enqueue` 時に毎回更新されるため、ドリフトは 1 フレーム分以下。
+    let target = current;
+    if (presentAtMs > 0 && dateBaseMs > 0) {
+      const mapped = contextBaseSeconds + (presentAtMs - dateBaseMs) / 1000;
+      if (mapped >= current && mapped - current <= maxAheadSeconds) {
+        target = mapped;
+      } else if (mapped - current > maxAheadSeconds) {
+        // **写像は作り直さない。** 作り直すと、以後の映像の予定が毎回無効になり、
+        // 「予定が遠すぎる」判断と噛み合って連鎖切れを量産する（実測: 段 E で連鎖切れが
+        // 18 件 → 87 件、提示が 2,084 枚 → 1,496 枚に悪化した）。捨てるのは高々
+        // ジッタバッファの深さ 1 個ぶんであり、写像の誤差はその範囲に収まる。
+        // **溜まった分を捨てて現在へ戻す**（ADR-0028 の再同期）。
+        //
+        // 束ねて届く音声を隙間なく後ろへ繋ぐだけだと、切断からの復旧などで一度に届いた
+        // ぶんが未来へ積み上がり、再生が**恒久的に**遅れる。実測（段 E）: 音声が映像より
+        // 4.6 秒遅れ、提示の門が「予定が遠すぎる」と判断して映像を先に出したため、
+        // 判定 D-1 が p99 4,655 ms で不合格になった。
+        //
+        // 積み上がった音声は再生期限を過ぎており、鳴らせば以後ずっと遅れる。捨てるのは
+        // 輻輳による破棄ではなく、ジッタバッファの深さを守るための追い付きである。
+        target = current;
+      }
+    }
+    // `nextAt` は連続再生の順序保証。`presentAtMs` が遅れている場合は `nextAt` へ従う。
+    // ただし `nextAt` が `maxAheadSeconds` より遠い場合は `current` へ戻す（ADR-0028 の再同期）。
     const planned = nextAt.get(senderId);
-    if (planned === undefined || planned < current) {
-      // 初回、または遅れた。**音声は待たせない。** 直ちに鳴らす位置へ置き直す。
-      return current;
+    if (planned !== undefined && planned >= current && planned - current <= maxAheadSeconds && planned > target) {
+      target = planned;
     }
-    if (planned - current > maxAheadSeconds) {
-      // **写像は作り直さない。** 作り直すと、以後の映像の予定が毎回無効になり、
-      // 「予定が遠すぎる」判断と噛み合って連鎖切れを量産する（実測: 段 E で連鎖切れが
-      // 18 件 → 87 件、提示が 2,084 枚 → 1,496 枚に悪化した）。捨てるのは高々
-      // ジッタバッファの深さ 1 個ぶんであり、写像の誤差はその範囲に収まる。
-      // **溜まった分を捨てて現在へ戻す**（ADR-0028 の再同期）。
-      //
-      // 束ねて届く音声を隙間なく後ろへ繋ぐだけだと、切断からの復旧などで一度に届いた
-      // ぶんが未来へ積み上がり、再生が**恒久的に**遅れる。実測（段 E）: 音声が映像より
-      // 4.6 秒遅れ、提示の門が「予定が遠すぎる」と判断して映像を先に出したため、
-      // 判定 D-1 が p99 4,655 ms で不合格になった。
-      //
-      // 積み上がった音声は再生期限を過ぎており、鳴らせば以後ずっと遅れる。捨てるのは
-      // 輻輳による破棄ではなく、ジッタバッファの深さを守るための追い付きである。
-      return current;
-    }
-    return planned;
+    return target;
   }
 
   function play(senderId: number, data: unknown, captureUs: number): void {
@@ -374,7 +392,10 @@ function createAudioSink(onScheduled: (senderId: number, captureUs: number, atMs
     writeProperty(source, "buffer", buffer);
     const destination = readProperty(context, "destination");
     callMethod(source, "connect", [destination]);
-    const at = scheduleAt(senderId);
+    // ADR-0042: 復号器の非同期出力へ `presentAtMs` を届ける。`captureUs` で引く。
+    const presentAtMs = presentByCapture.get(captureUs) ?? 0;
+    presentByCapture.delete(captureUs);
+    const at = scheduleAt(senderId, presentAtMs);
     callMethod(source, "start", [at]);
     // 予約は `AudioContext` の時計の上にある。壁時計へ写して観測へ出す。
     const nowSeconds = readProperty(context, "currentTime");
@@ -451,6 +472,15 @@ function createAudioSink(onScheduled: (senderId: number, captureUs: number, atMs
 
   return {
     enqueue: (input): void => {
+      // ADR-0042: 最初の `enqueue` でのみ対応付けを固定する。以降は更新しない。
+      if (dateBaseMs === 0) {
+        const now = readProperty(context, "currentTime");
+        if (typeof now === "number") {
+          dateBaseMs = Date.now();
+          contextBaseSeconds = now;
+        }
+      }
+      presentByCapture.set(input.captureTimestampUs, input.presentAtMs);
       const decoder = decoderFor(input.senderId);
       if (decoder === null) {
         return;

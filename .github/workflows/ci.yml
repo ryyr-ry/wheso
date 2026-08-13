@@ -214,13 +214,18 @@ jobs:
       - run: npm ci
       - name: Chromium を導入する
         run: npx playwright install --with-deps chromium
+      - name: xvfb を導入する（headed Chrome 用）
+        run: sudo apt-get update && sudo apt-get install -y xvfb
       - name: root で tc を触れることを確認する
         run: sudo -n tc qdisc show dev lo
       - name: 劣化下の記録と判定
         # **器は SDK 経由である**（F-10）。生の WebSocket の器は `ack` を返さないため、
         # 購読単位の送信窓（ADR-0025）を入れた後は `ACK_TIMEOUT_MS` で切断される
         # （実測: 9 本すべてが code=4034 で落ちた）。判定するのは製品の判断である。
-        run: node --test --test-force-exit --test-name-pattern='SDK 経由 ${{ matrix.profile }}:' tests/e2e/degrade-sdk.test.ts
+        # **headed Chrome で回す**（F-083）。headless では AudioContext.currentTime
+        # のドリフトが不安定で D-1 p99 が閾値を超える（実測: 31〜130ms のばらつき）。
+        # xvfb-run で仮想ディスプレイを与え、headless: false で起動する。
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' node --test --test-force-exit --test-name-pattern='SDK 経由 ${{ matrix.profile }}:' tests/e2e/degrade-sdk.test.ts
 
   # ── 段 B（疎通）: 5 言語が実環境へ実データを流す。言語ごとに並列 ──
   transport:

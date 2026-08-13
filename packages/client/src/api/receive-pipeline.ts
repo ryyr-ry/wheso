@@ -460,12 +460,31 @@ function handleVideoUnit(
     });
   }
   if (missed && (unit.flags & FLAG_KEY) === 0) {
-    const gapResult = noteGap(next.decoders, senderId, channel);
-    next = { ...next, decoders: gapResult.state, reporter: recordVideoDrop(next.reporter) };
-    deps.sendReceiveControl(
-      JSON.stringify({ t: "keyframeRequest", senderId, channel, spatialId: unit.spatialId }),
-    );
-    return next;
+    // **ギャップの大きさと時間層の数で破棄可否を判定する。**
+    //
+    // サーバーは非破棄可能ユニットを落とすとき chain を開始し（`dropWithChain`）、
+    // 次の KEY まで全非キーフレームを落とし続ける（`shard-core.ts` 行 734-742）。
+    // したがって非破棄可能ユニットの脱落は常にギャップ >= 2 を生む。
+    //
+    // 一方、破棄可能ユニット（最上位時間層 T2）の脱落は chain なしで落とされる
+    // （`dropWithChain` 行 760-762: priority 1-3 は `breaksChain = false`）。
+    // このときギャップ = 1 であり、より低い層は届いているため復号器は正しく動く。
+    //
+    // **時間層が 1 以下（または未知）のときはギャップ = 1 でも要求する。**
+    // 時間層が 1 なら破棄可能な層が存在せず、gap = 1 は非破棄可能ユニットの脱落である。
+    // 時間層が 0（未申告）なら何が落ちたか分からないため、安全に要求する。
+    const temporalLayers = observationOf(next, senderId).temporalLayers;
+    const gap = wrap32(unit.sequenceNumber - seenSeq.seq) - 1;
+    if (gap > 1 || temporalLayers <= 1) {
+      const gapResult = noteGap(next.decoders, senderId, channel);
+      next = { ...next, decoders: gapResult.state, reporter: recordVideoDrop(next.reporter) };
+      if (gapResult.actions.length > 0) {
+        deps.sendReceiveControl(
+          JSON.stringify({ t: "keyframeRequest", senderId, channel, spatialId: unit.spatialId }),
+        );
+      }
+      return next;
+    }
   }
 
   // 復号の可否は decoder-pool の判断のみを使う（独自判断を書かない）。

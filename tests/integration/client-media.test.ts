@@ -769,6 +769,19 @@ test("**A/V 同期が規範の許容に収まる**（判定 D-1 に実測を与�
   }
   await waitFor(() => b.decoded.length > 0, 30_000, "暖機の映像が届く");
 
+  // **音声の経路が整うまで待つ。** 音声と映像は別の部屋（`ar` と `vr`）を通り、
+  // 購読の確立も別である。映像が先に整い、音声がまだ届いていない間に送った映像は
+  // 「対応する音声が無い」となり D-1 の偽の違反になる。音声の最初の 1 件が届くまで待つ。
+  for (let index = 0; index < 24 && b.audioIn.length === 0; index += 1) {
+    output.onAudio({
+      captureTimestampUs: BigInt(Date.now()) * 1000n,
+      silent: false,
+      payload: new Uint8Array([250, 0x33, 0x44]),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  await waitFor(() => b.audioIn.length > 0, 30_000, "暖機の音声が届く");
+
   // **音声と映像を混ぜて送る。** 実際のクライアントはこう送る。片方を後から一括で
   // 送ると、新しい取得時刻の音声に対して古い映像が「遅すぎる」と捨てられる（X-046）。
   for (let index = 0; index < PAIR_COUNT; index += 1) {
