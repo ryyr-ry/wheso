@@ -170,6 +170,8 @@ export interface SdkDegradeParticipant {
   /** 実際の復号器の出入り（生成・設定・投入・出力・失敗）。 */
   /** 音声の出入り（渡した数と鳴った数）。 */
   readonly audioIo: { readonly submitted: number; readonly played: number };
+  /** 音声のワイヤ到着数。`sentAudio` との差が shard->receiver 経路の消失量。 */
+  readonly audioArrived: number;
   readonly decoderIo: {
     readonly created: number;
     readonly configured: number;
@@ -402,6 +404,8 @@ interface Recorder {
   readonly decoderEvents: { configure: number; reset: number; close: number; error: number };
   /** 音声の出入り。**渡した数と鳴った数の差が「落とした量」である**（音声は破棄禁止）。 */
   readonly audioIo: { submitted: number; played: number };
+  /** 音声のワイヤ到着数。`sentAudio` との差が shard->receiver 経路の消失量。 */
+  audioArrived: number;
   readonly sentAudio: SentAudio[];
   readonly received: ReceivedVideo[];
   readonly decoded: DecodedVideo[];
@@ -427,6 +431,7 @@ function newRecorder(label: string): Recorder {
     encodedAudioCount: 0,
     decoderEvents: { configure: 0, reset: 0, close: 0, error: 0 },
     audioIo: { submitted: 0, played: 0 },
+    audioArrived: 0,
     sentAudio: [],
     received: [],
     decoded: [],
@@ -598,6 +603,9 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
                 }
               }
             }
+            if (message.ok && message.value.channel === CHANNEL_AUDIO) {
+              recorder.audioArrived += message.value.units.length;
+            }
             handler(bytes);
           });
         },
@@ -702,6 +710,7 @@ function snapshot(joined: Joined): SdkDegradeParticipant {
     decoderEvents: { ...recorder.decoderEvents },
     decoderIo: { ...decoderIo, messages: [...decoderMessages] },
     audioIo: { ...joined.recorder.audioIo },
+    audioArrived: recorder.audioArrived,
     socketStats: [...socketStats.entries()].map(([kind, value]) => ({ kind, ...value })),
     sentAudio: [...recorder.sentAudio],
     received: [...recorder.received],
@@ -730,6 +739,7 @@ const EMPTY: SdkDegradeParticipant = {
   decoderEvents: { configure: 0, reset: 0, close: 0, error: 0 },
   decoderIo: { created: 0, configured: 0, submitted: 0, output: 0, failed: 0, messages: [] },
   audioIo: { submitted: 0, played: 0 },
+  audioArrived: 0,
   socketStats: [],
   sentAudio: [],
   received: [],
