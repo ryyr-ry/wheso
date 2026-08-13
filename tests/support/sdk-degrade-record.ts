@@ -130,15 +130,34 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
   const warmupBoundaryUs = firstPlayedCaptureUs > 0 && firstPlayedCaptureUs > firstPresentedCaptureUs
     ? firstPlayedCaptureUs
     : firstPresentedCaptureUs;
-  let boundaryAtMs = -1;
+  // **境界以降の最初のキーフレームを実際の境界にする。**
+  //
+  // 音声の再生開始が映像より遅いとき、warmup の境界は音声の最初の再生時刻になる。
+  // この境界がキーフレームと delta フレームの間に落ちると、キーフレームだけが切り落とされ、
+  // 残った delta フレームが「参照が無い」A-2 違反になる（実測: headed Chrome で frameIndex
+  // 15〜34 が A-2）。境界以降の最初のキーフレームを見つけてそこを境界にすれば、常に
+  // キーフレームから始まり、A-2 は起きない。
+  let keyframeBoundaryUs = warmupBoundaryUs;
+  for (const unit of run.sentVideo) {
+    if (unit.captureUs >= warmupBoundaryUs && unit.isKey) {
+      keyframeBoundaryUs = unit.captureUs;
+      break;
+    }
+  }
+  // **キーフレーム要求の切り落としは warmup 境界（音声の最初の再生時刻）で切る。**
+  //
+  // キーフレーム境界は映像の依存構造を正しくするために上げた境界である。しかし
+  // キーフレーム要求は購読の確立時に出るものであり、音声が整う前の出来事である。
+  // したがって要求の切り落としは音声の整った時刻（warmup 境界）で行う。
+  let warmupBoundaryAtMs = -1;
   for (const unit of run.sentVideo) {
     if (unit.captureUs === warmupBoundaryUs) {
-      boundaryAtMs = unit.atMs;
+      warmupBoundaryAtMs = unit.atMs;
       break;
     }
   }
   const keep = <T extends { readonly captureUs: number }>(list: readonly T[]): readonly T[] =>
-    list.filter((entry) => entry.captureUs >= warmupBoundaryUs);
+    list.filter((entry) => entry.captureUs >= keyframeBoundaryUs);
   // 末尾も切る。窓を閉じた後に送ったものは、記録を取る時点でまだ経路にある。
   const inWindow = <T extends { readonly captureUs: number; readonly atMs: number }>(
     list: readonly T[],
@@ -153,7 +172,7 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
     playedAudio: keep(run.playedAudio),
     arrived: keep(run.arrived),
     keyframeRequestAtMs:
-      boundaryAtMs < 0 ? run.keyframeRequestAtMs : run.keyframeRequestAtMs.filter((at) => at >= boundaryAtMs),
+      warmupBoundaryAtMs < 0 ? run.keyframeRequestAtMs : run.keyframeRequestAtMs.filter((at) => at >= warmupBoundaryAtMs),
   };
 }
 
