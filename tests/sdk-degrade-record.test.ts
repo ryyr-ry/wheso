@@ -190,6 +190,8 @@ test("**暖機は内容で切る**（提示できた最初のフレームより�
     playedAudio: run.playedAudio.filter((entry) => !early.has(entry.captureUs)),
   });
   // 3 枚ぶん（段 0 と段 1 の対で 6 ユニット）を切るため、判定の対象は 7 件になる。
+  // キーフレームは warmup で切られるが、`judgeDependencies` は `sawKey = true` で
+  // 初期化するため A-2 違反にはならない。
   assert.equal(trimmed.judgedSent, 7, "切った後の送信だけを判定する");
   assert.deepEqual(judgeDrops(trimmed.record), [], "経路が整う前の欠落は違反にしない");
   assert.equal(trimmed.chainBreaks, 0);

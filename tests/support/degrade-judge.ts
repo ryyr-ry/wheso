@@ -463,7 +463,15 @@ export function judgeDependencies(record: DegradeRecord): readonly Violation[] {
    * 参照するのは**より低い層の直近のフレーム**であるため、層ごとに最後の 1 枚を覚える。
    */
   const lastByLayer = new Map<number, { readonly frameIndex: number; readonly presented: boolean }>();
-  let sawKey = false;
+  // **`sent` にキーフレームが無いときは `sawKey = true` で始める。**
+  //
+  // `trimWarmup` が音声の再生開始時刻で映像を切ったとき、最初のキーフレームが
+  // 切られて delta フレームだけが残ることがある（実測: headed Chrome で frameIndex
+  // 25〜44 が A-2）。このとき `sent` にキーフレームが存在しない。キーフレームは
+  // warmup より前に届いて復号に渡されているため、残った delta フレームの参照は
+  // 有効である。`sawKey = false` で始めると「参照が無い」A-2 違反を量産する。
+  const hasKeyInSent = record.sent.some((entry) => entry.isKey);
+  let sawKey = !hasKeyInSent;
   // 送出の順（frameIndex の昇順）で見る。提示の順序の異常は A-3 が見る。
   for (const meta of [...record.sent].sort((a, b) => a.frameIndex - b.frameIndex)) {
     const presented = presentedIndexes.has(meta.frameIndex);
