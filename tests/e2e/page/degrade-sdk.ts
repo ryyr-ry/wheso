@@ -413,6 +413,8 @@ interface Recorder {
   readonly arrived: ArrivedVideo[];
   /** 二度数えを防ぐ鍵の集合（`段:連番`）。注入の口は複数回 `onBinary` を登録する。 */
   readonly arrivedKeys: Set<string>;
+  /** 音声の二度数えを防ぐ鍵の集合（`連番`）。 */
+  readonly audioArrivedKeys: Set<string>;
   readonly keyframeRequestAtMs: number[];
   readonly closures: ClosureRecord[];
   lastSentAtMs: number;
@@ -438,6 +440,7 @@ function newRecorder(label: string): Recorder {
     playedAudio: [],
     arrived: [],
     arrivedKeys: new Set<string>(),
+    audioArrivedKeys: new Set<string>(),
     keyframeRequestAtMs: [],
     closures: [],
     lastSentAtMs: 0,
@@ -604,7 +607,13 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
               }
             }
             if (message.ok && message.value.channel === CHANNEL_AUDIO) {
-              recorder.audioArrived += message.value.units.length;
+              for (const unit of message.value.units) {
+                const key = String(unit.sequenceNumber);
+                if (!recorder.audioArrivedKeys.has(key)) {
+                  recorder.audioArrivedKeys.add(key);
+                  recorder.audioArrived += 1;
+                }
+              }
             }
             handler(bytes);
           });
