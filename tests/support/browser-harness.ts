@@ -207,4 +207,9 @@ export const FAKE_MEDIA_ARGS: readonly string[] = [
   "--use-fake-device-for-media-stream",
   "--use-fake-ui-for-media-stream",
   "--autoplay-policy=no-user-gesture-required",
+  // xvfb 環境では GPU が無いため、ソフトウェアレンダリングを明示的に有効にする。
+  // 無いと Canvas への描画が極端に遅くなり、C-1（描画間隔超過）と B-2（提示遅延）が発生する。
+  "--use-gl=angle",
+  "--use-angle=swiftshader",
+  "--disable-gpu-compositing",
 ];
