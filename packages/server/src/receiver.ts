@@ -196,6 +196,12 @@ export class ReceiverNode implements Party.Server {
         this.authenticating.add(sender.id);
         await this.authenticateClient(message, sender, now);
         this.authenticating.delete(sender.id);
+        // **認証が済んだ直後に上流への接続を始める。**
+        //
+        // `ensureUpstream` は心拍や購読の到着でも呼ばれるが、最初の `subscribe` が届く前に
+        // 上流を確立しておかないと、shard がまだ購読を持たない状態で音声が届き、転送されず
+        // に失われる。認証直後に始めれば `subscribe` が届く頃には上流が整っている。
+        void this.ensureUpstream();
         return;
       }
       // **心拍に応える**（規範 1 節の `HEARTBEAT_TIMEOUT_MS`）。
