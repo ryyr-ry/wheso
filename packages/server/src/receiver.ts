@@ -202,6 +202,16 @@ export class ReceiverNode implements Party.Server {
         // 上流を確立しておかないと、shard がまだ購読を持たない状態で音声が届き、転送されず
         // に失われる。認証直後に始めれば `subscribe` が届く頃には上流が整っている。
         void this.ensureUpstream();
+        // **認証直後にアラームを ACK_INTERVAL_MS に切り替える。**
+        //
+        // `onConnect` で設定した最初のアラームは `HELLO_TIMEOUT_MS`（5 秒）後である。
+        // 認証が済んでも次のアラームまで 5 秒待つ間、`handleAckTimer` が呼ばれず ack が
+        // 返らない。音声部屋（`ar`）は音声しか流れず、DTX の無音期間中は `onBinary` も
+        // 呼ばれないため、ack が 5 秒間届かず shard が `stalled` になる（実測: ワイヤ 3126
+        // に対し到着 3102、差 24 ユニットが shard→receiver 経路で消失）。認証直後に
+        // アラームを `ACK_INTERVAL_MS` に切り替えれば、50 ms ごとに `handleAckTimer` が
+        // 呼ばれ、ack が継続して返る。
+        void this.room.storage.setAlarm(now + ACK_INTERVAL_MS);
         return;
       }
       // **心拍に応える**（規範 1 節の `HEARTBEAT_TIMEOUT_MS`）。
