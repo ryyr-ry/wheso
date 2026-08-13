@@ -361,7 +361,7 @@ async function runParticipants(
   const consoleLogs = specs.map((): string[] => []);
   try {
     for (const [index, _spec] of specs.entries()) {
-      const instance = await chromium.launch({ headless: false, args: [...FAKE_MEDIA_ARGS] });
+      const instance = await chromium.launch({ args: [...FAKE_MEDIA_ARGS] });
       instances.push(instance);
       const tab = await instance.newPage();
       tabs.push(tab);
