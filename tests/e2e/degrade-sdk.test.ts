@@ -506,6 +506,7 @@ for (const profile of IMPAIRMENT_PROFILES) {
         ` / 提示 ${String(built.record.received.length)}` +
         ` / 音声（符号化 ${String(sender.encodedAudioCount)} / ワイヤ ${String(sender.run.sentAudio.length)}` +
         ` / 到着 ${String(receiver.audioArrived)}` +
+        ` / 到着cap ${String(receiver.run.audioArrivedCaptureUs.length)}` +
         ` / 再生 ${String(receiver.run.playedAudio.length)}` +
         ` / 隙間 送 ${String(audioSendGap)} ms・再生 ${String(audioPlayGap)} ms` +
         ` / 音声の復号 渡 ${String(receiver.audioIo.submitted)} 鳴 ${String(receiver.audioIo.played)}）` +
