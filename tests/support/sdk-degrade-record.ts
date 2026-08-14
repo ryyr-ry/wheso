@@ -177,6 +177,7 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
     decoded: keep(run.decoded),
     playedAudio: keep(run.playedAudio),
     arrived: keep(run.arrived),
+    audioArrivedCaptureUs: run.audioArrivedCaptureUs.filter((us) => us >= videoBoundaryUs),
     keyframeRequestAtMs:
       firstPresentedReceivedAtMs < 0 ? run.keyframeRequestAtMs : run.keyframeRequestAtMs.filter((at) => at >= firstPresentedReceivedAtMs),
   };
