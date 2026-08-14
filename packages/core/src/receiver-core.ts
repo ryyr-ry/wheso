@@ -773,6 +773,20 @@ function handleMedia(
 ): ReceiverStepResult {
   const stream = findStream(state, event.from, event.ch);
   if (stream === undefined || stream.phase !== "SUBSCRIBED") {
+    // **音声は購読が未確立でも転送する（音声は破棄禁止）。**
+    //
+    // 音声と映像は別の部屋（`ar` と `vr`）を通り、購読の確立も別である。`vr` の購読が
+    // 先に確立し、`ar` が後に確立する間に届いた音声がここで消える。また、upstream の
+    // 確立が非同期であるため、`subscribe` を受け取った後でも `subscribeChange` が
+    // shard に届くまでの間に音声が届くことがある。
+    //
+    // 映像は落として正しい（購読していない送信者の映像を復号器へ渡すと参照が壊れる）。
+    // 音声は段を持たず、参照連鎖の制約が無いため、購読未確立でもクライアントへ渡して
+    // よい。ack 位置も記録する（`markReceived` は `stream` に依存しない）。ack 位置が
+    // 記録されれば shard の送信窓が進み、`stalled` になりにくくなる。
+    if (isAudio(event.ch)) {
+      return { state: markReceived(state, event), commands: [{ kind: "forward", to: [RECEIVER_SELF_ID] }] };
+    }
     return { state, commands: [] };
   }
   if (event.sid > stream.spatialId || event.tid > stream.temporalId) {

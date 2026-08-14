@@ -698,7 +698,21 @@ function decideForSubscription(
   priority: number | null,
   t: number,
 ): SubscriptionDecision {
+  // **音声は接続が停止していても通す（音声は破棄禁止）。**
+  //
+  // `stalled` は「ACK_TIMEOUT_MS の間 ack が届かない」状態であり、接続が切れたと判断した
+  // ものである。しかし音声は破棄禁止であり、`stalled` で落とすと接続が復帰したときに
+  // 音声が途切れる。音声部屋（`ar`）は音声しか流れず、DTX の無音期間中に `onBinary` が
+  // 呼ばれず ack が遅延して `stalled` になることがある。このとき音声を落とすと、
+  // 復帰後も `stalled` が解除されない限り音声が届かない（実測: ワイヤ 3114 に対し
+  // 到着 3099、差 15 ユニットが shard→receiver 経路で消失）。
+  //
+  // 映像は `stalled` の間落としてよい。接続が切れた相手へ映像を送り続けるとノードの
+  // 予算を食う。音声だけは通すことで、接続が復帰したときに音声が即座に戻る。
   if (sub.stalled) {
+    if (isAudioChannel(event.ch)) {
+      return forwardDecision(state, sub, event);
+    }
     return { subscription: sub, forward: false, dropPriority: null, requestKeyframe: false };
   }
 
