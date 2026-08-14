@@ -381,31 +381,6 @@ function shouldHash(captureUs: number): boolean {
   return Math.trunc(captureUs / 1000) % 4 === 0;
 }
 
-async function hashFrame(frame: unknown): Promise<string> {
-  const width = Reflect.get(Object(frame), "displayWidth");
-  const height = Reflect.get(Object(frame), "displayHeight");
-  if (typeof width !== "number" || typeof height !== "number" || width === 0 || height === 0) {
-    return "";
-  }
-  if (hashCanvas === null) {
-    hashCanvas = new OffscreenCanvas(HASH_SIDE, HASH_SIDE);
-    hashContext = hashCanvas.getContext("2d");
-  }
-  const context = hashContext;
-  if (context === null) {
-    return "";
-  }
-  // `drawImage` は `VideoFrame` を受ける。型はブラウザにしか無いため実行時に確かめる。
-  const draw = Reflect.get(context, "drawImage");
-  if (typeof draw !== "function") {
-    return "";
-  }
-  Reflect.apply(draw, context, [frame, 0, 0, HASH_SIDE, HASH_SIDE]);
-  const image = context.getImageData(0, 0, HASH_SIDE, HASH_SIDE);
-  const digest = await crypto.subtle.digest("SHA-256", image.data);
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 /** 記録の入れ物。参加者ごとに 1 個持つ。 */
 interface Recorder {
   readonly label: string;
@@ -496,19 +471,38 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
           // 詰まる（実測: 音声の再生が 875 ms 途切れた）。選ぶ基準は取得時刻であるから、
           // 購読者どうしで同じ枠が選ばれる（判定 A-1 は購読者間の一致を見る）。
           if (shouldHash(captureUs)) {
-            // **ハッシュ計算を次のティックに遅らせる。** `drawImage` と `getImageData` は
-            // 同期処理であり、そのまま実行するとイベントループが阻塞して音声の
-            // WebSocket メッセージ処理が遅延する（実測: 到着gap 100ms 以上が 125 件）。
-            // `setTimeout(0)` で遅らせることで、音声の処理が先に走る。
-            const capturedFrame = frame;
-            setTimeout(() => {
-              void hashFrame(capturedFrame).then((sha256) => {
-                const entry = recorder.received[slot];
-                if (entry !== undefined) {
-                  recorder.received[slot] = { ...entry, sha256 };
+            // **画素の読み戻し（getImageData）と SHA-256 を次のティックに遅らせる。**
+            //
+            // `drawImage` は GPU で実行され軽いが、`getImageData` は CPU で画素を読み戻すため
+            // 重い。同期的に実行するとイベントループが阻塞して音声の WebSocket メッセージ
+            // 処理が遅延する（実測: 到着gap 100ms 以上が 125 件）。`drawImage` は即座に実行し、
+            // `getImageData` と `SHA-256` を `setTimeout(0)` で遅らせることで、音声の処理が
+            // 先に走る。`drawImage` は `VideoFrame` の参照を必要とするため、`onFrame` の前に
+            // 実行する必要がある。
+            if (hashCanvas === null) {
+              hashCanvas = new OffscreenCanvas(HASH_SIDE, HASH_SIDE);
+              hashContext = hashCanvas.getContext("2d");
+            }
+            const ctx = hashContext;
+            const draw = ctx !== null ? Reflect.get(ctx, "drawImage") : null;
+            if (typeof draw === "function" && ctx !== null) {
+              Reflect.apply(draw, ctx, [frame, 0, 0, HASH_SIDE, HASH_SIDE]);
+              const slotRef = slot;
+              setTimeout(() => {
+                const context = hashContext;
+                if (context === null) {
+                  return;
                 }
-              });
-            }, 0);
+                const image = context.getImageData(0, 0, HASH_SIDE, HASH_SIDE);
+                void crypto.subtle.digest("SHA-256", image.data).then((digest) => {
+                  const sha256 = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+                  const entry = recorder.received[slotRef];
+                  if (entry !== undefined) {
+                    recorder.received[slotRef] = { ...entry, sha256 };
+                  }
+                });
+              }, 0);
+            }
           }
           output.onFrame(senderId, frame);
         },
