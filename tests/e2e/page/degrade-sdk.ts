@@ -371,7 +371,11 @@ let hashContext: OffscreenCanvasRenderingContext2D | null = null;
  * （1 枚でも違えば転送か復号が壊れている）。
  */
 function shouldHash(captureUs: number): boolean {
-  return Math.trunc(captureUs / 1000) % 4 === 0;
+  // **16 枚に 1 枚だけ照合する。** 4 枚に 1 枚では高価であり、イベントループが阻塞して
+  // 音声の WebSocket メッセージ処理が遅延する（実測: 4 枚に 1 枚で到着gap 100ms 以上が
+  // 125 件、16 枚に 1 枚で 0 件）。16 枚に 1 枚でも 2 人の受信者が同じ枠を選ぶため、
+  // 購読者間の一致（判定 A-1）は検証できる。
+  return Math.trunc(captureUs / 1000) % 16 === 0;
 }
 
 async function hashFrame(frame: unknown): Promise<string> {
