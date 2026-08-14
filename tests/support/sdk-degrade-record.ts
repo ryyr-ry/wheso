@@ -86,6 +86,8 @@ export interface ObservedRun {
   readonly arrived: readonly ObservedArrived[];
   /** 音声の到着取得時刻。warmup 境界を音声の到着まで広げる。 */
   readonly audioArrivedCaptureUs: readonly number[];
+  /** 音声の到着時刻。到着間隔のギャップを分析する。 */
+  readonly audioArrivedAtMs: readonly number[];
   /** キーフレームを要求した時刻の一覧（ミリ秒）。暖機より前の要求は数えない。 */
   readonly keyframeRequestAtMs: readonly number[];
   readonly closures: readonly ObservedClosure[];
@@ -178,6 +180,7 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
     playedAudio: keep(run.playedAudio),
     arrived: keep(run.arrived),
     audioArrivedCaptureUs: run.audioArrivedCaptureUs.filter((us) => us >= videoBoundaryUs),
+    audioArrivedAtMs: run.audioArrivedAtMs.filter((_at, i) => run.audioArrivedCaptureUs[i] !== undefined && run.audioArrivedCaptureUs[i] >= videoBoundaryUs),
     keyframeRequestAtMs:
       firstPresentedReceivedAtMs < 0 ? run.keyframeRequestAtMs : run.keyframeRequestAtMs.filter((at) => at >= firstPresentedReceivedAtMs),
   };

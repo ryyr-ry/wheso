@@ -174,6 +174,8 @@ export interface SdkDegradeParticipant {
   readonly audioArrived: number;
   /** 音声の到着取得時刻。warmup 境界を音声の到着まで広げるために要る。 */
   readonly audioArrivedCaptureUs: readonly number[];
+  /** 音声の到着時刻。到着間隔のギャップを分析するために要る。 */
+  readonly audioArrivedAtMs: readonly number[];
   readonly decoderIo: {
     readonly created: number;
     readonly configured: number;
@@ -410,6 +412,8 @@ interface Recorder {
   audioArrived: number;
   /** 音声の到着取得時刻。warmup 境界を音声の到着まで広げるために要る。 */
   readonly audioArrivedCaptureUs: number[];
+  /** 音声の到着時刻。到着間隔のギャップを分析するために要る。 */
+  readonly audioArrivedAtMs: number[];
   readonly sentAudio: SentAudio[];
   readonly received: ReceivedVideo[];
   readonly decoded: DecodedVideo[];
@@ -439,6 +443,7 @@ function newRecorder(label: string): Recorder {
     audioIo: { submitted: 0, played: 0 },
     audioArrived: 0,
     audioArrivedCaptureUs: [],
+    audioArrivedAtMs: [],
     sentAudio: [],
     received: [],
     decoded: [],
@@ -612,12 +617,14 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
               }
             }
             if (message.ok && message.value.channel === CHANNEL_AUDIO) {
+              const arrivedAtMs = Date.now();
               for (const unit of message.value.units) {
                 const key = String(unit.sequenceNumber);
                 if (!recorder.audioArrivedKeys.has(key)) {
                   recorder.audioArrivedKeys.add(key);
                   recorder.audioArrived += 1;
                   recorder.audioArrivedCaptureUs.push(Number(unit.captureTimestampUs));
+                  recorder.audioArrivedAtMs.push(arrivedAtMs);
                 }
               }
             }
@@ -727,6 +734,7 @@ function snapshot(joined: Joined): SdkDegradeParticipant {
     audioIo: { ...joined.recorder.audioIo },
     audioArrived: recorder.audioArrived,
     audioArrivedCaptureUs: [...recorder.audioArrivedCaptureUs],
+    audioArrivedAtMs: [...recorder.audioArrivedAtMs],
     socketStats: [...socketStats.entries()].map(([kind, value]) => ({ kind, ...value })),
     sentAudio: [...recorder.sentAudio],
     received: [...recorder.received],
@@ -757,6 +765,7 @@ const EMPTY: SdkDegradeParticipant = {
   audioIo: { submitted: 0, played: 0 },
   audioArrived: 0,
   audioArrivedCaptureUs: [],
+  audioArrivedAtMs: [],
   socketStats: [],
   sentAudio: [],
   received: [],

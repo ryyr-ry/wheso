@@ -352,6 +352,7 @@ test("**段 E: 再デプロイと切断を挟んでも送受信が続き、自�
     playedAudio: readList(receiverRaw["playedAudio"]),
     arrived: readList(receiverRaw["arrived"]),
     audioArrivedCaptureUs: readList(receiverRaw["audioArrivedCaptureUs"]).map((v: unknown) => num(v)),
+    audioArrivedAtMs: readList(receiverRaw["audioArrivedAtMs"]).map((v: unknown) => num(v)),
     keyframeRequestAtMs: readList(receiverRaw["keyframeRequestAtMs"]),
     closures: readList(receiverRaw["closures"]),
     lastSentAtMs: num(senderRaw["lastSentAtMs"]),

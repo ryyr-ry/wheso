@@ -101,7 +101,7 @@ export class ReceiverNode implements Party.Server {
   private readonly subscribedClients = new Set<string>();
 
   /** 観測のための計数。判断には使わない。 */
-  private counters = { upstreamBinaryIn: 0, toClient: 0, clientTextIn: 0, alarms: 0, upstreamTextOut: 0 };
+  private counters = { upstreamBinaryIn: 0, toClient: 0, clientTextIn: 0, alarms: 0, upstreamTextOut: 0, lastAlarmAtMs: 0, maxAlarmGapMs: 0 };
 
   /** この部屋の会議 ID と利用者 ID。`onMessage` の文脈でのみ決める。 */
   private identity: { readonly meetingId: string; readonly userId: string; readonly role: ReceiveRole } | null =
@@ -314,7 +314,13 @@ export class ReceiverNode implements Party.Server {
       connection.close(ERROR_DEFINITIONS.E_HELLO_TIMEOUT.closeCode, "hello timeout");
     }
     // ACK_INTERVAL_MS ごとに受信位置を上流へ返す（congestion.md 2 節）。
-    this.counters = { ...this.counters, alarms: this.counters.alarms + 1 };
+    const alarmGap = this.counters.lastAlarmAtMs > 0 ? now - this.counters.lastAlarmAtMs : 0;
+    this.counters = {
+      ...this.counters,
+      alarms: this.counters.alarms + 1,
+      lastAlarmAtMs: now,
+      maxAlarmGapMs: Math.max(this.counters.maxAlarmGapMs, alarmGap),
+    };
     this.state = handleAckTimer(this.state, now, this.transport);
     // 望む集合を押し付け直す。中継ノードが購読を失っていても自力で復帰する（F-056）。
     if (now - this.resyncAtMs >= ACK_TIMEOUT_MS && this.state.core.streams.length > 0) {

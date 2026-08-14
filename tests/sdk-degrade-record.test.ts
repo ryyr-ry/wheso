@@ -64,6 +64,7 @@ function baseRun(frames: number, options: { readonly arriveLayer0?: boolean } = 
     playedAudio,
     arrived,
     audioArrivedCaptureUs: playedAudio.map((entry) => entry.captureUs),
+    audioArrivedAtMs: playedAudio.map((_entry, i) => 1000 + i * 66),
     keyframeRequestAtMs: [],
     closures: [],
     lastSentAtMs: 1000 + frames * 66,
