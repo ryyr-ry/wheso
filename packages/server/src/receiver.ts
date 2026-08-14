@@ -101,7 +101,7 @@ export class ReceiverNode implements Party.Server {
   private readonly subscribedClients = new Set<string>();
 
   /** 観測のための計数。判断には使わない。 */
-  private counters = { upstreamBinaryIn: 0, toClient: 0, clientTextIn: 0, alarms: 0, upstreamTextOut: 0, lastAlarmAtMs: 0, maxAlarmGapMs: 0 };
+  private counters = { upstreamBinaryIn: 0, toClient: 0, clientTextIn: 0, alarms: 0, upstreamTextOut: 0, lastAlarmAtMs: 0, maxAlarmGapMs: 0, upstreamCloseCount: 0, upstreamNullOnAlarm: 0 };
 
   /** この部屋の会議 ID と利用者 ID。`onMessage` の文脈でのみ決める。 */
   private identity: { readonly meetingId: string; readonly userId: string; readonly role: ReceiveRole } | null =
@@ -320,6 +320,7 @@ export class ReceiverNode implements Party.Server {
       alarms: this.counters.alarms + 1,
       lastAlarmAtMs: now,
       maxAlarmGapMs: Math.max(this.counters.maxAlarmGapMs, alarmGap),
+      upstreamNullOnAlarm: this.upstream === null ? this.counters.upstreamNullOnAlarm + 1 : this.counters.upstreamNullOnAlarm,
     };
     this.state = handleAckTimer(this.state, now, this.transport);
     // 望む集合を押し付け直す。中継ノードが購読を失っていても自力で復帰する（F-056）。
@@ -432,6 +433,7 @@ export class ReceiverNode implements Party.Server {
       },
       onClose: () => {
         this.upstream = null;
+        this.counters = { ...this.counters, upstreamCloseCount: this.counters.upstreamCloseCount + 1 };
       },
     });
     this.connecting = false;

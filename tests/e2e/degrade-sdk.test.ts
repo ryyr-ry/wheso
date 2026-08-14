@@ -336,6 +336,19 @@ function countLargeGaps(atMs: readonly number[], threshold: number): number {
   return count;
 }
 
+function largeGapTimestamps(atMs: readonly number[], threshold: number): string {
+  const stamps: number[] = [];
+  const start = atMs.length > 0 && atMs[0] !== undefined ? atMs[0] : 0;
+  for (let i = 1; i < atMs.length; i++) {
+    const prev = atMs[i - 1];
+    const curr = atMs[i];
+    if (prev !== undefined && curr !== undefined && curr - prev > threshold) {
+      stamps.push(curr - start);
+    }
+  }
+  return stamps.join(",");
+}
+
 function merge(sender: ParticipantView, receiver: ParticipantView): ObservedRun {
   return {
     ...receiver.run,
@@ -534,6 +547,7 @@ for (const profile of IMPAIRMENT_PROFILES) {
         ` / 到着cap ${String(receiver.run.audioArrivedCaptureUs.length)}` +
         ` / 到着gap ${String(maxArrivalGapMs(receiver.run.audioArrivedAtMs))}ms` +
         ` / 到着gap100以上 ${String(countLargeGaps(receiver.run.audioArrivedAtMs, 100))}件` +
+        ` / gap時刻 ${largeGapTimestamps(receiver.run.audioArrivedAtMs, 100)}` +
         ` / 再生 ${String(receiver.run.playedAudio.length)}` +
         ` / 隙間 送 ${String(audioSendGap)} ms・再生 ${String(audioPlayGap)} ms` +
         ` / 音声の復号 渡 ${String(receiver.audioIo.submitted)} 鳴 ${String(receiver.audioIo.played)}）` +
