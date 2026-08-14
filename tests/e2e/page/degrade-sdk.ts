@@ -370,9 +370,11 @@ let hashContext: OffscreenCanvasRenderingContext2D | null = null;
  * 取得時刻は源のものであり全員に共通であるから、取得時刻から決める。4 枚に 1 枚で足りる
  * （1 枚でも違えば転送か復号が壊れている）。
  */
-function shouldHash(_captureUs: number): boolean {
-  // ハッシュ計算は一時的に無効化。D-1 の根本原因を切り分けるため。
-  return false;
+function shouldHash(captureUs: number): boolean {
+  // **4 枚に 1 枚だけ照合する。** 画素の読み戻しは高価であり、毎枚行うと頁の主筋が
+  // 詰まる（実測: 音声の再生が 875 ms 途切れた）。選ぶ基準は取得時刻であるから、
+  // 購読者どうしで同じ枠が選ばれる（判定 A-1 は購読者間の一致を見る）。
+  return Math.trunc(captureUs / 1000) % 4 === 0;
 }
 
 /** 記録の入れ物。参加者ごとに 1 個持つ。 */
@@ -471,8 +473,7 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
             // 重い。同期的に実行するとイベントループが阻塞して音声の WebSocket メッセージ
             // 処理が遅延する（実測: 到着gap 100ms 以上が 125 件）。`drawImage` は即座に実行し、
             // `getImageData` と `SHA-256` を `setTimeout(0)` で遅らせることで、音声の処理が
-            // 先に走る。`drawImage` は `VideoFrame` の参照を必要とするため、`onFrame` の前に
-            // 実行する必要がある。
+            // 先に走る。
             if (hashCanvas === null) {
               hashCanvas = new OffscreenCanvas(HASH_SIDE, HASH_SIDE);
               hashContext = hashCanvas.getContext("2d");
