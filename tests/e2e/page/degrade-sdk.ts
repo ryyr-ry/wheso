@@ -370,15 +370,9 @@ let hashContext: OffscreenCanvasRenderingContext2D | null = null;
  * 取得時刻は源のものであり全員に共通であるから、取得時刻から決める。4 枚に 1 枚で足りる
  * （1 枚でも違えば転送か復号が壊れている）。
  */
-function shouldHash(captureUs: number): boolean {
-  // **4 枚に 1 枚だけ照合する。** 画素の読み戻しは高価であり、毎枚行うと頁の主筋が
-  // 詰まる（実測: 音声の再生が 875 ms 途切れた）。選ぶ基準は取得時刻であるから、
-  // 購読者どうしで同じ枠が選ばれる（判定 A-1 は購読者間の一致を見る）。
-  //
-  // **ハッシュ計算は `setTimeout(0)` で遅延実行する。** 同期実行するとイベントループが
-  // 阻塞して音声の WebSocket メッセージ処理が遅延する（実測: 到着gap 100ms 以上が 125 件）。
-  // 遅延実行すれば音声の処理が先に走り、ハッシュの重さが音声に影響しない。
-  return Math.trunc(captureUs / 1000) % 4 === 0;
+function shouldHash(_captureUs: number): boolean {
+  // ハッシュ計算は一時的に無効化。D-1 の根本原因を切り分けるため。
+  return false;
 }
 
 /** 記録の入れ物。参加者ごとに 1 個持つ。 */
