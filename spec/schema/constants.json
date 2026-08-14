@@ -206,8 +206,8 @@
       "derivation": "送信窓 200 ms を 4 分割する粒度"
     },
     "ACK_TIMEOUT_MS": {
-      "value": 5000,
-      "derivation": "ack 100 回連続欠落"
+      "value": 10000,
+      "derivation": "ack 200 回連続欠落。PartyKit のアラームが粗い環境（DTX の無音期間中に onBinary が呼ばれず ack が遅延する）でも stalled にならない猶予。実測: 5000ms では音声が周期的に失われた（ワイヤ-到着 60-170 ユニット）。10000ms は接続が本当に切れたときの検出遅れとの妥協である。"
     },
     "UPLINK_DEGRADE_STREAK": {
       "value": 3,

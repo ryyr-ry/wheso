@@ -98,7 +98,7 @@ public enum WhesoConstants {
     public static let SHEDDING_HYSTERESIS_MS: Int64 = 500
     public static let SEND_WINDOW_MS: Int64 = 200
     public static let ACK_INTERVAL_MS: Int64 = 50
-    public static let ACK_TIMEOUT_MS: Int64 = 5000
+    public static let ACK_TIMEOUT_MS: Int64 = 10000
     public static let UPLINK_DEGRADE_STREAK: Int64 = 3
     public static let UPLINK_RECOVER_MS: Int64 = 5000
     public static let UPLINK_UPGRADE_HOLD_MS: Int64 = 10000

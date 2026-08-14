@@ -139,8 +139,8 @@ export const SHEDDING_HYSTERESIS_MS = 500;
 export const SEND_WINDOW_MS = 200;
 /** 送信窓 200 ms を 4 分割する粒度 */
 export const ACK_INTERVAL_MS = 50;
-/** ack 100 回連続欠落 */
-export const ACK_TIMEOUT_MS = 5000;
+/** ack 200 回連続欠落。PartyKit のアラームが粗い環境（DTX の無音期間中に onBinary が呼ばれず ack が遅延する）でも stalled にならない猶予。実測: 5000ms では音声が周期的に失われた（ワイヤ-到着 60-170 ユニット）。10000ms は接続が本当に切れたときの検出遅れとの妥協である。 */
+export const ACK_TIMEOUT_MS = 10000;
 /** 上りの滞留が UPLINK_BACKLOG_BYTES を超えた観測が何回連続したら降格するか。congestion.md 3 節の「3 回連続（200 ms 周期）」。1 回で降格すると正常な送信の揺れで誤検知する */
 export const UPLINK_DEGRADE_STREAK = 3;
 /** 滞留が 0 の状態がこの時間続いたら 1 段昇格する。congestion.md 3 節の「5 秒」 */
