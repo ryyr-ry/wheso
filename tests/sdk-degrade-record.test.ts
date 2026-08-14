@@ -63,6 +63,7 @@ function baseRun(frames: number, options: { readonly arriveLayer0?: boolean } = 
     decoded,
     playedAudio,
     arrived,
+    audioArrivedCaptureUs: playedAudio.map((entry) => entry.captureUs),
     keyframeRequestAtMs: [],
     closures: [],
     lastSentAtMs: 1000 + frames * 66,

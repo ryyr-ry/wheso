@@ -172,6 +172,8 @@ export interface SdkDegradeParticipant {
   readonly audioIo: { readonly submitted: number; readonly played: number };
   /** 音声のワイヤ到着数。`sentAudio` との差が shard->receiver 経路の消失量。 */
   readonly audioArrived: number;
+  /** 音声の到着取得時刻。warmup 境界を音声の到着まで広げるために要る。 */
+  readonly audioArrivedCaptureUs: readonly number[];
   readonly decoderIo: {
     readonly created: number;
     readonly configured: number;
@@ -406,6 +408,8 @@ interface Recorder {
   readonly audioIo: { submitted: number; played: number };
   /** 音声のワイヤ到着数。`sentAudio` との差が shard->receiver 経路の消失量。 */
   audioArrived: number;
+  /** 音声の到着取得時刻。warmup 境界を音声の到着まで広げるために要る。 */
+  readonly audioArrivedCaptureUs: number[];
   readonly sentAudio: SentAudio[];
   readonly received: ReceivedVideo[];
   readonly decoded: DecodedVideo[];
@@ -434,6 +438,7 @@ function newRecorder(label: string): Recorder {
     decoderEvents: { configure: 0, reset: 0, close: 0, error: 0 },
     audioIo: { submitted: 0, played: 0 },
     audioArrived: 0,
+    audioArrivedCaptureUs: [],
     sentAudio: [],
     received: [],
     decoded: [],
@@ -612,6 +617,7 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
                 if (!recorder.audioArrivedKeys.has(key)) {
                   recorder.audioArrivedKeys.add(key);
                   recorder.audioArrived += 1;
+                  recorder.audioArrivedCaptureUs.push(Number(unit.captureTimestampUs));
                 }
               }
             }
@@ -720,6 +726,7 @@ function snapshot(joined: Joined): SdkDegradeParticipant {
     decoderIo: { ...decoderIo, messages: [...decoderMessages] },
     audioIo: { ...joined.recorder.audioIo },
     audioArrived: recorder.audioArrived,
+    audioArrivedCaptureUs: [...recorder.audioArrivedCaptureUs],
     socketStats: [...socketStats.entries()].map(([kind, value]) => ({ kind, ...value })),
     sentAudio: [...recorder.sentAudio],
     received: [...recorder.received],
@@ -749,6 +756,7 @@ const EMPTY: SdkDegradeParticipant = {
   decoderIo: { created: 0, configured: 0, submitted: 0, output: 0, failed: 0, messages: [] },
   audioIo: { submitted: 0, played: 0 },
   audioArrived: 0,
+  audioArrivedCaptureUs: [],
   socketStats: [],
   sentAudio: [],
   received: [],

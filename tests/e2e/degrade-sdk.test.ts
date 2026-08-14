@@ -275,6 +275,7 @@ function readParticipant(value: unknown): ParticipantView {
         const item = asRecord(entry);
         return { captureUs: num(item["captureUs"]), spatialId: num(item["spatialId"]) };
       }),
+      audioArrivedCaptureUs: list(record["audioArrivedCaptureUs"]).map((entry) => num(entry)),
       keyframeRequestAtMs: list(record["keyframeRequestAtMs"]).map((entry) => num(entry)),
       closures: list(record["closures"]).map((entry) => {
         const item = asRecord(entry);

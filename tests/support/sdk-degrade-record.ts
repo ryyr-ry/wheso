@@ -84,6 +84,8 @@ export interface ObservedRun {
   readonly decoded: readonly ObservedDecoded[];
   readonly playedAudio: readonly ObservedPlayedAudio[];
   readonly arrived: readonly ObservedArrived[];
+  /** 音声の到着取得時刻。warmup 境界を音声の到着まで広げる。 */
+  readonly audioArrivedCaptureUs: readonly number[];
   /** キーフレームを要求した時刻の一覧（ミリ秒）。暖機より前の要求は数えない。 */
   readonly keyframeRequestAtMs: readonly number[];
   readonly closures: readonly ObservedClosure[];
@@ -130,9 +132,23 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
   const warmupBoundaryUs = firstPlayedCaptureUs > 0 && firstPlayedCaptureUs > firstPresentedCaptureUs
     ? firstPlayedCaptureUs
     : firstPresentedCaptureUs;
+  // **音声の最初の到着も基準に加える。**
+  //
+  // upstream 確立前に届いた音声は shard から receiver へ転送されず、クライアントに届かない。
+  // この間の映像に「対応する音声が無い」と言っても、それは同期の失敗ではなく経路確立の
+  // 順序である。音声の最初の到着時刻より前の映像は暖機として切り落とす。
+  let firstAudioArrivedCaptureUs = -1;
+  for (const captureUs of run.audioArrivedCaptureUs) {
+    if (firstAudioArrivedCaptureUs < 0 || captureUs < firstAudioArrivedCaptureUs) {
+      firstAudioArrivedCaptureUs = captureUs;
+    }
+  }
+  const audioBoundaryUs = firstAudioArrivedCaptureUs > 0 && firstAudioArrivedCaptureUs > warmupBoundaryUs
+    ? firstAudioArrivedCaptureUs
+    : warmupBoundaryUs;
   // **映像の切り落としは warmup 境界で切る。** キーフレームが切られる可能性があるが、
   // それは `buildDegradeRecord` 側で補う（参照の基点を復元する）。
-  const videoBoundaryUs = warmupBoundaryUs;
+  const videoBoundaryUs = audioBoundaryUs;
   // **キーフレーム要求は映像が最初に提示できた受信時刻で切る。**
   //
   // キーフレーム要求は映像の購読確立時に出るものである。音声の再生開始時刻で切ると、
