@@ -371,11 +371,14 @@ let hashContext: OffscreenCanvasRenderingContext2D | null = null;
  * （1 枚でも違えば転送か復号が壊れている）。
  */
 function shouldHash(captureUs: number): boolean {
-  // **16 枚に 1 枚だけ照合する。** 4 枚に 1 枚では高価であり、イベントループが阻塞して
-  // 音声の WebSocket メッセージ処理が遅延する（実測: 4 枚に 1 枚で到着gap 100ms 以上が
-  // 125 件、16 枚に 1 枚で 0 件）。16 枚に 1 枚でも 2 人の受信者が同じ枠を選ぶため、
-  // 購読者間の一致（判定 A-1）は検証できる。
-  return Math.trunc(captureUs / 1000) % 16 === 0;
+  // **4 枚に 1 枚だけ照合する。** 画素の読み戻しは高価であり、毎枚行うと頁の主筋が
+  // 詰まる（実測: 音声の再生が 875 ms 途切れた）。選ぶ基準は取得時刻であるから、
+  // 購読者どうしで同じ枠が選ばれる（判定 A-1 は購読者間の一致を見る）。
+  //
+  // **ハッシュ計算は `setTimeout(0)` で遅延実行する。** 同期実行するとイベントループが
+  // 阻塞して音声の WebSocket メッセージ処理が遅延する（実測: 到着gap 100ms 以上が 125 件）。
+  // 遅延実行すれば音声の処理が先に走り、ハッシュの重さが音声に影響しない。
+  return Math.trunc(captureUs / 1000) % 4 === 0;
 }
 
 async function hashFrame(frame: unknown): Promise<string> {
@@ -493,12 +496,19 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
           // 詰まる（実測: 音声の再生が 875 ms 途切れた）。選ぶ基準は取得時刻であるから、
           // 購読者どうしで同じ枠が選ばれる（判定 A-1 は購読者間の一致を見る）。
           if (shouldHash(captureUs)) {
-            void hashFrame(frame).then((sha256) => {
-              const entry = recorder.received[slot];
-              if (entry !== undefined) {
-                recorder.received[slot] = { ...entry, sha256 };
-              }
-            });
+            // **ハッシュ計算を次のティックに遅らせる。** `drawImage` と `getImageData` は
+            // 同期処理であり、そのまま実行するとイベントループが阻塞して音声の
+            // WebSocket メッセージ処理が遅延する（実測: 到着gap 100ms 以上が 125 件）。
+            // `setTimeout(0)` で遅らせることで、音声の処理が先に走る。
+            const capturedFrame = frame;
+            setTimeout(() => {
+              void hashFrame(capturedFrame).then((sha256) => {
+                const entry = recorder.received[slot];
+                if (entry !== undefined) {
+                  recorder.received[slot] = { ...entry, sha256 };
+                }
+              });
+            }, 0);
           }
           output.onFrame(senderId, frame);
         },
