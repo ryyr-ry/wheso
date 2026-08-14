@@ -345,6 +345,11 @@ export class ReceiverNode implements Party.Server {
     const userId = this.room.id.split("-")[2];
     if (meetingId !== null && userId !== undefined) {
       this.identity = { meetingId, userId, role };
+      // **identity が決まった直後に上流への接続を始める。**
+      //
+      // `onMessage` の認証後の `ensureUpstream` よりも早く始めることで、upstream の確立が
+      // 数ミリ秒早まる。`openNodeLink` は非同期で完了するため、ここで呼んでもブロックしない。
+      void this.ensureUpstream();
     }
     this.clients.add(sender.id);
     // **ここで ack の周期を始める。** 接続時のアラームは認証の猶予（5 秒）に合わせてあり、
