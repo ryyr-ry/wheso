@@ -384,6 +384,11 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
   }
 
   // 5. 再生した音声の取得時刻の集合。末尾を切る基準にも使う。
+  //
+  // WebCodecs の AudioDecoder は chunk.timestamp をそのまま AudioData.timestamp へ
+  // 渡すとは限らない（仕様上「codec may adjust」）。実測では Opus 復号器が 1 μs ずらす
+  // （AGENTS.md 5.4「型定義を信用しない」）。したがって厳密一致ではなく ±2 μs の許容で
+  // 引く。音声フレーム間隔は 20 ms（20000 μs）であるため、この許容が実損失を隠すことは無い。
   const playedByCapture = new Map<number, number>();
   for (const entry of run.playedAudio) {
     const existing = playedByCapture.get(entry.captureUs);
@@ -391,6 +396,24 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
       playedByCapture.set(entry.captureUs, entry.atMs);
     }
   }
+  const PLAYED_LOOKUP_TOLERANCE_US = 2;
+  const playedLookup = (captureUs: number): number | undefined => {
+    const exact = playedByCapture.get(captureUs);
+    if (exact !== undefined) {
+      return exact;
+    }
+    for (let d = 1; d <= PLAYED_LOOKUP_TOLERANCE_US; d++) {
+      const plus = playedByCapture.get(captureUs + d);
+      if (plus !== undefined) {
+        return plus;
+      }
+      const minus = playedByCapture.get(captureUs - d);
+      if (minus !== undefined) {
+        return minus;
+      }
+    }
+    return undefined;
+  };
   let lastPlayedCaptureUs = -1;
   let firstPlayedCaptureUs = -1;
   for (const captureUs of playedByCapture.keys()) {
@@ -434,7 +457,7 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
       droppedForNoAudio += 1;
       continue;
     }
-    if (entry.captureUs > lastPlayedCaptureUs) {
+    if (entry.captureUs > lastPlayedCaptureUs + PLAYED_LOOKUP_TOLERANCE_US) {
       // まだ経路に音声が残っている。切る。
       droppedForNoAudio += 1;
       continue;
@@ -475,7 +498,7 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     if (audioKey === undefined) {
       continue;
     }
-    const atMs = playedByCapture.get(audioKey);
+    const atMs = playedLookup(audioKey);
     if (atMs === undefined) {
       // 送ったのに再生されていない。**これは違反として残す**（音声は破棄禁止）。
       // デバッグ: なぜ再生されていないかを調べる。
