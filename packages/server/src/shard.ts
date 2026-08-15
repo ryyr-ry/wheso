@@ -157,6 +157,8 @@ export class ShardNode implements Party.Server {
     droppedBeforeHello: 0,
     alarms: 0,
     alarmErrors: 0,
+    audioBuffered: 0,
+    audioFlushed: 0,
   };
 
   private readonly transport: ShardTransport;
@@ -478,6 +480,7 @@ export class ShardNode implements Party.Server {
       buf.shift();
     }
     this.audioBuffer.set(participantId, buf);
+    this.counters = { ...this.counters, audioBuffered: this.counters.audioBuffered + 1 };
   }
 
   private flushAudioBuffer(participantId: number, connection: Party.Connection): void {
@@ -486,7 +489,7 @@ export class ShardNode implements Party.Server {
       return;
     }
     for (const bytes of buf) {
-      this.counters = { ...this.counters, binaryOut: this.counters.binaryOut + 1 };
+      this.counters = { ...this.counters, binaryOut: this.counters.binaryOut + 1, audioFlushed: this.counters.audioFlushed + 1 };
       connection.send(bytes);
     }
     this.audioBuffer.delete(participantId);
