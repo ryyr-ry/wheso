@@ -71,7 +71,6 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
    * 直近 2 枠の最小値を使い、過大補正（音声遅れ）を防ぐ。
    */
   let videoDecodeLatencyMs = 0;
-  let prevDecodeLatencyMs = 0;
   /**
    * `captureUs → decode開始時刻`（ミリ秒）。復号遅延の計測に使う。
    */
@@ -218,8 +217,11 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
               decodeStartByCapture.delete(stamp);
               const latency = options.now() - startedAt;
               if (latency > 0 && latency < 2000) {
-                videoDecodeLatencyMs = Math.min(latency, prevDecodeLatencyMs || latency);
-                prevDecodeLatencyMs = latency;
+                // 直近の計測値をそのまま使う。
+                // 補正は次枠に効くため、1 枠前の遅延が次枠の予測となる。
+                // 復号遅延は数フレームのスパンで滑らかに変化するため、
+                // 1 枠前の値は次枠の良く当たる予測である。
+                videoDecodeLatencyMs = latency;
               }
             }
           }
