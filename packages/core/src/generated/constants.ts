@@ -186,8 +186,7 @@ export const DELAY_TREND_RECOVER_DEN = 1;
 export const VIDEO_JITTER_MIN_FRAMES = 2;
 export const VIDEO_JITTER_MAX_FRAMES = 10;
 export const AUDIO_JITTER_MIN_PACKETS = 2;
-/** 音声ジッタバッファの最大深度（パケット数）。元は 8（160 ms）。復号遅延を含めて再生クロックの深度を確保するため 16（320 ms）へ拡張した。実環境のジッタは小さく（5-20 ms）、最小深度が 2 パケット（40 ms）のため本値は影響しない。高ジッタ環境（CI のヘッドレス Chrome 等）でのみ深度が拡張し、AV1 復号遅延を再生クロックで覆う。 */
-export const AUDIO_JITTER_MAX_PACKETS = 16;
+export const AUDIO_JITTER_MAX_PACKETS = 8;
 /** この範囲では補正しない（不感帯）。ITU-R BT.1359-0 の送出許容（音声先行 +22.5 ms）の内側に取る。F-043 */
 export const AV_SKEW_TOLERANCE_MS = 20;
 /** 音声が映像より先行してよい上限。ITU-R BT.1359-0 の +22.5 ms を整数へ切り捨てた値。許容は非対称であり、人は音声先行に厳しい。F-043、ADR-0028 */
