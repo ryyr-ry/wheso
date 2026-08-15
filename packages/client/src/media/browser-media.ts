@@ -227,9 +227,11 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
               decodeStartByCapture.delete(stamp);
               const latency = options.now() - startedAt;
               if (latency > 0 && latency < 2000) {
-                videoDecodeLatencyMs = videoDecodeLatencyMs === 0
-                  ? latency
-                  : Math.trunc(videoDecodeLatencyMs * 0.8 + latency * 0.2);
+                // 直近の最大値を使う。平均ではスパイクを覆えず skew が残る。
+                // 10 秒ごとに 90% に減衰させ、過去のスパイクが永続しないようにする。
+                videoDecodeLatencyMs = Math.trunc(
+                  Math.max(videoDecodeLatencyMs, latency) * 0.99,
+                );
               }
             }
           }
