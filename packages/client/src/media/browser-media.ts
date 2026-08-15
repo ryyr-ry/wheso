@@ -222,7 +222,8 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
                 if (decodeLatencySamples.length > 5) {
                   decodeLatencySamples.shift();
                 }
-                videoDecodeLatencyMs = Math.max(...decodeLatencySamples);
+                const sorted = [...decodeLatencySamples].sort((a, b) => a - b);
+                videoDecodeLatencyMs = sorted[Math.trunc(sorted.length / 2)] ?? 0;
               }
             }
           }
