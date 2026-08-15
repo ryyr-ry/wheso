@@ -68,8 +68,10 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
   const presentedUs = new Map<string, number>();
   /**
    * 直近の映像復号遅延（ミリ秒）。門の発火を presentAtMs から引いて早めに復号を始める。
+   * 直近 2 枠の最小値を使い、過大補正（音声遅れ）を防ぐ。
    */
   let videoDecodeLatencyMs = 0;
+  let prevDecodeLatencyMs = 0;
   /**
    * `captureUs → decode開始時刻`（ミリ秒）。復号遅延の計測に使う。
    */
@@ -216,9 +218,8 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
               decodeStartByCapture.delete(stamp);
               const latency = options.now() - startedAt;
               if (latency > 0 && latency < 2000) {
-                videoDecodeLatencyMs = videoDecodeLatencyMs === 0
-                  ? latency
-                  : Math.trunc(videoDecodeLatencyMs * 0.5 + latency * 0.5);
+                videoDecodeLatencyMs = Math.min(latency, prevDecodeLatencyMs || latency);
+                prevDecodeLatencyMs = latency;
               }
             }
           }
