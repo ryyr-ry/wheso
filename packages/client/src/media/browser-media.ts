@@ -67,9 +67,10 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
    */
   const presentedUs = new Map<string, number>();
   /**
-   * 直近の映像復号遅延（ミリ秒）。門の発火を presentAtMs から引いて早めに復号を始める。
-   * 初期値は 0 だが、最初の計測結果を即座に採用する。
+   * 直近の映像復号遅延の標本（ミリ秒）。直近 5 枠の最大値を次枠の補正に使う。
+   * 平均ではスパイクを覆えず、生値では振動するため、短期最大を使う。
    */
+  const decodeLatencySamples: number[] = [];
   let videoDecodeLatencyMs = 0;
   /**
    * `captureUs → decode開始時刻`（ミリ秒）。復号遅延の計測に使う。
@@ -217,7 +218,11 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
               decodeStartByCapture.delete(stamp);
               const latency = options.now() - startedAt;
               if (latency > 0 && latency < 2000) {
-                videoDecodeLatencyMs = latency;
+                decodeLatencySamples.push(latency);
+                if (decodeLatencySamples.length > 5) {
+                  decodeLatencySamples.shift();
+                }
+                videoDecodeLatencyMs = Math.max(...decodeLatencySamples);
               }
             }
           }
