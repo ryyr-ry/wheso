@@ -569,7 +569,8 @@ for (const profile of IMPAIRMENT_PROFILES) {
         ` / 下り 出 ${String(shapeStats.ingress.releasedBytes)}B` +
         ` 待 ${String(shapeStats.ingress.throttles)} 背圧 ${String(shapeStats.ingress.pauses)}）` +
         ` / 戻れない切断 ${built.record.closures?.length === 0 ? "なし" : (built.record.closures ?? []).join(", ")}` +
-        ` / 戻れた切断 ${built.transientClosures.length === 0 ? "なし" : built.transientClosures.join(", ")}\n`,
+        ` / 戻れた切断 ${built.transientClosures.length === 0 ? "なし" : built.transientClosures.join(", ")}\n` +
+        (built.d1Debug.length > 0 ? `    D-1 debug: ${built.d1Debug.join(" | ")}\n` : ""),
     );
 
     assert.ok(built.judgedSent > 0, "判定の対象となる送信がある");

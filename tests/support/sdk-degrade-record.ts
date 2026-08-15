@@ -232,6 +232,8 @@ export interface BuiltRecord {
   readonly chainBreaks: number;
   /** 戻れる閉鎖（設計どおりの再接続）。報告のみ。 */
   readonly transientClosures: readonly string[];
+  /** D-1 違反のデバッグ情報。各違反フレームの audioKey と playedByCapture の前後関係。 */
+  readonly d1Debug: readonly string[];
 }
 
 /**
@@ -467,6 +469,7 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
   }
 
   const playedAudio: DegradePlayedAudio[] = [];
+  const d1Debug: string[] = [];
   for (const frame of presentedVideo) {
     const audioKey = audioKeyByFrame.get(frame.frameIndex);
     if (audioKey === undefined) {
@@ -475,6 +478,19 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     const atMs = playedByCapture.get(audioKey);
     if (atMs === undefined) {
       // 送ったのに再生されていない。**これは違反として残す**（音声は破棄禁止）。
+      // デバッグ: なぜ再生されていないかを調べる。
+      const played = [...playedByCapture.keys()].sort((a, b) => a - b);
+      let before = -1;
+      let after = -1;
+      for (const us of played) {
+        if (us < audioKey) {
+          before = us;
+        } else if (us > audioKey) {
+          after = us;
+          break;
+        }
+      }
+      d1Debug.push(`f${String(frame.frameIndex)} key=${String(audioKey)} before=${String(before)}(${String(before > 0 ? audioKey - before : 0)}) after=${String(after)}(${String(after > 0 ? after - audioKey : 0)})`);
       continue;
     }
     playedAudio.push({ frameIndex: frame.frameIndex, atMs });
@@ -538,5 +554,6 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     droppedForNoAudio,
     chainBreaks,
     transientClosures: transient,
+    d1Debug,
   };
 }
