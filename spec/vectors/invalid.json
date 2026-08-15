@@ -30,14 +30,14 @@
   {
     "name": "payload-length-zero",
     "description": "payloadLength が 0",
-    "bytesHex": "a1010101000000010000000100000000000000000800000000000000",
+    "bytesHex": "a1010101000000010000000100000000000000000900000000000000",
     "expectedErrorCode": "E_WIRE_PAYLOAD_EMPTY",
     "expectedCloseCode": 4006
   },
   {
     "name": "truncated-payload",
     "description": "payloadLength がバッファ長を超える",
-    "bytesHex": "a10101010000000100000001000000000000000008000000000000ff12",
+    "bytesHex": "a10101010000000100000001000000000000000009000000000000ff12",
     "expectedErrorCode": "E_WIRE_LENGTH_MISMATCH",
     "expectedCloseCode": 4003
   },
@@ -58,7 +58,7 @@
   {
     "name": "spatial-id-out-of-range",
     "description": "spatialId が 4",
-    "bytesHex": "a101010100000001000000010000000000000000080400000000000112",
+    "bytesHex": "a101010100000001000000010000000000000000090400000000000112",
     "expectedErrorCode": "E_WIRE_FIELD_RANGE",
     "expectedCloseCode": 4003
   },

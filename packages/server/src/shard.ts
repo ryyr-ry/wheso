@@ -18,7 +18,9 @@ import type * as Party from "partykit/server";
 
 import { deriveMeetingSecret } from "@wheso/core/src/auth.ts";
 import { fnv1a32 } from "@wheso/core/src/naming.ts";
-import { ACK_INTERVAL_MS } from "@wheso/core/src/generated/constants.ts";
+import { ACK_INTERVAL_MS, AUDIO_BUNDLE_MS } from "@wheso/core/src/generated/constants.ts";
+import { CHANNEL_AUDIO, CHANNEL_SCREEN_AUDIO } from "@wheso/core/src/generated/wire-layout.ts";
+import { decodeMediaMessage } from "@wheso/core/src/wire.ts";
 import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
 
 /**
@@ -115,6 +117,18 @@ export class ShardNode implements Party.Server {
   private readonly peerIds = new Map<string, number>();
 
   /**
+   * 音声バッファ。受信ノードへの接続が確立する前に届いた音声メッセージを溜める。
+   *
+   * 音声は破棄禁止（wire-format.md 1.4）であり、`connectionFor` が `null` であっても
+   * 落としてはならない。受信ノードが接続した時点で `flushAudioBuffer` で一括送出する。
+   * 映像はバッファしない（破棄可能であり、古い映像を後で送っても意味がない）。
+   *
+   * 上限は1秒分（25メッセージ）。これを超える古い分から捨てる。バッファは参加者
+   * （受信ノード）ごとに持つ。
+   */
+  private readonly audioBuffer = new Map<number, Uint8Array[]>();
+
+  /**
    * 観測のための計数。判断には使わない。
    *
    * 媒体が届かないときに「受け取ったが転送しなかった」と「転送したが宛先が無かった」を
@@ -154,9 +168,19 @@ export class ShardNode implements Party.Server {
         // 媒体の宛先は購読者、すなわち**受信ノード**である。
         const connection = this.connectionFor(participantId, "receiver");
         if (connection === null) {
+          // **音声はバッファへ退避する。** 音声は破棄禁止であり、受信ノードへの接続が
+          // 確立する前に届いた分を落としてはならない（wire-format.md 1.4）。
+          // 映像はバッファしない（古い映像を後で送っても再生できない）。
+          const decoded = decodeMediaMessage(bytes);
+          if (decoded.ok && (decoded.value.channel === CHANNEL_AUDIO || decoded.value.channel === CHANNEL_SCREEN_AUDIO)) {
+            this.bufferAudio(participantId, bytes);
+            return;
+          }
           this.counters = { ...this.counters, outNoConnection: this.counters.outNoConnection + 1 };
           return;
         }
+        // 接続がある場合はバッファを先に吐く。古い音声が溜まっていれば先に送る。
+        this.flushAudioBuffer(participantId, connection);
         this.counters = { ...this.counters, binaryOut: this.counters.binaryOut + 1 };
         connection.send(bytes);
       },
@@ -446,6 +470,28 @@ export class ShardNode implements Party.Server {
    * 中継ノードは正しく転送を決めていたが、宛先の接続を `getConnection(String(id))` で
    * 探していたため常に見つからなかった）。
    */
+  private bufferAudio(participantId: number, bytes: Uint8Array): void {
+    const max = Math.ceil(1000 / AUDIO_BUNDLE_MS);
+    const buf = this.audioBuffer.get(participantId) ?? [];
+    buf.push(bytes);
+    while (buf.length > max) {
+      buf.shift();
+    }
+    this.audioBuffer.set(participantId, buf);
+  }
+
+  private flushAudioBuffer(participantId: number, connection: Party.Connection): void {
+    const buf = this.audioBuffer.get(participantId);
+    if (buf === undefined || buf.length === 0) {
+      return;
+    }
+    for (const bytes of buf) {
+      this.counters = { ...this.counters, binaryOut: this.counters.binaryOut + 1 };
+      connection.send(bytes);
+    }
+    this.audioBuffer.delete(participantId);
+  }
+
   private connectionFor(participantId: number, target: ShardTarget): Party.Connection | null {
     for (const [connectionId, id] of this.peerIds) {
       if (id !== participantId) {
