@@ -73,6 +73,15 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
    * 復号遅延が提示時刻に加算され、音声との skew が生む。
    */
   const videoPresentByCapture = new Map<number, number>();
+  /**
+   * `captureUs → decode開始時刻`（ミリ秒）。復号遅延の計測に使う。
+   */
+  const decodeStartByCapture = new Map<number, number>();
+  /**
+   * 直近の映像復号遅延（ミリ秒）。再生クロックの深度に加えて音声を遅らせ、
+   * 復号が終わってから映像と音声を同時に出す。
+   */
+  let videoDecodeLatencyMs = 0;
   const audio = createAudioSink(options.onAudioScheduled);
 
   const videoDecoderCtor = Reflect.get(globalThis, "VideoDecoder");
@@ -144,6 +153,7 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
       // AudioContext の時計で再生時刻へ合わせるため復号遅延が skew に混入しないが、
       // 映像は門の後に復号するため復号遅延ぶん遅れ、音声が先行する。
       videoPresentByCapture.set(input.captureTimestampUs, input.presentAtMs);
+      decodeStartByCapture.set(input.captureTimestampUs, options.now());
       // 待っている間に復号器が閉じることがある（失敗は非同期に届く）。閉じていたら
       // 作り直す。**閉じた実体へ渡し続けてはならない**（例外になり、以後何も出ない）。
       if (stateOf(entry.decoder) === "closed") {
@@ -168,6 +178,7 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
       // **音声は決して捨てない。** 復号器が無い環境でも呼び出しは失敗させない。
       audio.enqueue(input);
     },
+    videoDecodeLatencyMs: (): number => videoDecodeLatencyMs,
   };
 
   /** 復号器の状態を読む（`unconfigured` / `configured` / `closed`）。読めなければ空文字。 */
@@ -208,6 +219,19 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
           const presentAt = stamp !== undefined ? videoPresentByCapture.get(stamp) : undefined;
           if (stamp !== undefined) {
             videoPresentByCapture.delete(stamp);
+          }
+          // 復号遅延を計測する。次の音声の再生クロックの深度に加える。
+          if (stamp !== undefined) {
+            const startedAt = decodeStartByCapture.get(stamp);
+            if (startedAt !== undefined) {
+              decodeStartByCapture.delete(stamp);
+              const latency = options.now() - startedAt;
+              if (latency > 0 && latency < 2000) {
+                videoDecodeLatencyMs = videoDecodeLatencyMs === 0
+                  ? latency
+                  : Math.trunc(videoDecodeLatencyMs * 0.8 + latency * 0.2);
+              }
+            }
           }
           const scheduledPresent = presentAt ?? 0;
           gate.submit(senderId, scheduledPresent, () => {

@@ -407,6 +407,7 @@ async function joinParty(userId: string): Promise<Party_> {
           audioAtMs.push({ frameIndex: input.payload[0] ?? -1, atMs: Date.now() });
         });
       },
+      videoDecodeLatencyMs: (): number => 0,
     },
     capture,
   };

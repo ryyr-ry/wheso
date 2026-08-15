@@ -358,6 +358,7 @@ const NO_MEDIA = {
   closeDecoder: (): void => undefined,
   decodeVideo: (): void => undefined,
   enqueueAudio: (): void => undefined,
+        videoDecodeLatencyMs: (): number => 0,
 };
 
 /** タイマーを起こさない注入。参加の手順だけを見る試験で使う。 */
