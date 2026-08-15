@@ -21,14 +21,21 @@ import {
 import { decodeMediaMessage, wireErrorCloseCode } from "@wheso/core/src/wire.ts";
 import { videoProfileForSpatialId } from "@wheso/core/src/profiles.ts";
 import {
+  CHANNEL_AUDIO,
+  CHANNEL_SCREEN_AUDIO,
   CHANNEL_VIDEO,
   FLAG_KEY,
   MAX_TEMPORAL_ID,
 } from "@wheso/core/src/generated/wire-layout.ts";
-import { DELAY_TREND_WINDOW } from "@wheso/core/src/generated/constants.ts";
+import { AUDIO_BUNDLE_MS, DELAY_TREND_WINDOW } from "@wheso/core/src/generated/constants.ts";
 import { ERROR_DEFINITIONS } from "@wheso/core/src/generated/errors.ts";
 
-/**
+function isAudioChannel(ch: number): boolean {
+  return ch === CHANNEL_AUDIO || ch === CHANNEL_SCREEN_AUDIO;
+}
+
+
+ /**
  * 宛先の役割。
  *
  * **参加者 ID だけでは宛先が決まらない。** 1 人の参加者は送信ノード（`vs` / `as`）と
@@ -66,15 +73,29 @@ export interface ShardPeer {
   readonly isNode: boolean;
 }
 
+/** 購読確立前に届いた音声メッセージの退避先。`"${from}:${ch}"` を鍵とする。 */
+export type AudioRingBuffer = Map<string, Uint8Array[]>;
+
 export interface ShardHandlerState {
   readonly core: ShardState;
   /** 直近に転送したバイト列。forward コマンドの実体である。 */
   readonly pendingPayload: Uint8Array | null;
+  /**
+   * 購読が確立する前に届いた音声メッセージの退避先。
+   *
+   * 音声は破棄禁止（wire-format.md 1.4）であり、購読がまだ無いからといって落としてはならない。
+   * shard core は購読が無い音声に対して forward コマンドを出さない。そのため、購読が作られる
+   * までの間に届いた音声が永久に失われる。ここに退避し、購読が作られた瞬間に送出する。
+   *
+   * 映像は退避しない（古い映像を後で送っても再生できない）。
+   * 上限は1秒分（`Math.ceil(1000 / AUDIO_BUNDLE_MS)` 件）とし、超えた古い分から捨てる。
+   */
+  readonly audioRing: AudioRingBuffer;
 }
 
 /** 初期状態。 */
 export function createShardHandlerState(nowMs: number): ShardHandlerState {
-  return { core: initialState(nowMs), pendingPayload: null };
+  return { core: initialState(nowMs), pendingPayload: null, audioRing: new Map() };
 }
 
 /**
@@ -100,6 +121,7 @@ export function handleBinary(
 
   let core = state.core;
   let forwardedOnce = false;
+  let audioRing = state.audioRing;
   for (const unit of decoded.value.units) {
     const event: ShardEvent = {
       kind: "media",
@@ -115,10 +137,12 @@ export function handleBinary(
     };
     const result = step(core, event, nowMs);
     core = result.state;
+    let hadForward = false;
     for (const command of result.commands) {
       if (command.kind === "forward" && !forwardedOnce) {
         // 同一メッセージを複数ユニット分だけ重複送信しないため、最初の forward でのみ送る。
         forwardedOnce = true;
+        hadForward = true;
         for (const target of command.to) {
           transport.sendBinary(target, bytes);
         }
@@ -126,8 +150,29 @@ export function handleBinary(
       }
       applyNonForward(command, transport);
     }
+    // **音声で forward が無かった場合、購読がまだ無い。リングバッファへ退避する。**
+    //
+    // shard core は購読が存在しない送信者の音声に forward コマンドを出さない。
+    // そのまま見過ごすと、購読が作られるまでに届いた音声が永久に失われる。
+    // 音声は破棄禁止（wire-format.md 1.4）であるため、ここで退避し、
+    // 購読が作られた瞬間に `handleText` で送出する。
+    //
+    // 1 メッセージに複数ユニットが含まれることがある。最初のユニットで forward が
+    // 無ければ退避し、以降のユニットで forward があれば退避せずに送る（1 メッセージは
+    // 1 つの送信単位であるため、全体を送るか全体を退避するかのいずれか）。
+    if (!hadForward && !forwardedOnce && isAudioChannel(decoded.value.channel)) {
+      const key = `${String(decoded.value.senderId)}:${String(decoded.value.channel)}`;
+      const max = Math.ceil(1000 / AUDIO_BUNDLE_MS);
+      const buf = audioRing.get(key) ?? [];
+      buf.push(bytes);
+      while (buf.length > max) {
+        buf.shift();
+      }
+      audioRing = new Map(audioRing);
+      audioRing.set(key, buf);
+    }
   }
-  return { ...state, core };
+  return { ...state, core, audioRing };
 }
 
 /**
@@ -148,14 +193,36 @@ export function handleText(
   }
   const events = toEvents(parsed, peer.participantId, state.core);
   let core = state.core;
+  let audioRing = state.audioRing;
   for (const event of events) {
     const result = step(core, event, nowMs);
     core = result.state;
     for (const command of result.commands) {
       applyNonForward(command, transport);
     }
+    // **購読が作られた瞬間に、退避した音声を送出する。**
+    //
+    // `subscribe` イベントが `want: true` で処理されると、shard core に購読が作られる。
+    // それまでの間に届いた音声は `audioRing` に退避されている。これを即座に送出しないと、
+    // 購読者は古い音声を聞けない（音声は破棄禁止。wire-format.md 1.4）。
+    //
+    // `subscribe` イベント自体は `forward` コマンドを出さない。メディアの `forward` は
+    // 次の `handleBinary` で出される。しかし、退避した音声を次の `handleBinary` まで
+    // 待たせると、その間に新しい音声が届いたときに古い音声より後に送られてしまう。
+    // そのため、ここで即座に送出する。
+    if (event.kind === "subscribe" && event.want && isAudioChannel(event.ch)) {
+      const key = `${String(event.to)}:${String(event.ch)}`;
+      const buf = audioRing.get(key);
+      if (buf !== undefined && buf.length > 0) {
+        for (const bytes of buf) {
+          transport.sendBinary(peer.participantId, bytes);
+        }
+        audioRing = new Map(audioRing);
+        audioRing.delete(key);
+      }
+    }
   }
-  return { ...state, core };
+  return { ...state, core, audioRing };
 }
 
 /** 接続の確立と切断を入力イベントへ翻訳する。 */
