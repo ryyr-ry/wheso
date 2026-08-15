@@ -144,12 +144,7 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
       // 復号は非同期である。門を presentAtMs で待ってから復号を始めると、復号遅延
       // ぶんだけ映像が遅れ、音声との skew が生む。復号遅延を引いた時刻に門を発火させ、
       // 復号が presentAtMs に間に合うようにする。門が順序も保証する。
-      //
-      // 復号遅延がジッタ深度を超えると、門を過去へ飛ばして順序が崩れる。
-      // ジッタ深度は browser-media から見えないため、復号遅延の打ち消しは
-      // ジッタ深度の上限（AUDIO_JITTER_MAX_PACKETS × OPUS_FRAME_MS）に抑える。
-      const advanceMs = Math.min(videoDecodeLatencyMs, AUDIO_JITTER_MAX_PACKETS * OPUS_FRAME_MS);
-      const gateAtMs = input.presentAtMs - advanceMs;
+      const gateAtMs = input.presentAtMs - videoDecodeLatencyMs;
       decodeStartByCapture.set(input.captureTimestampUs, options.now());
       gate.submit(input.senderId, gateAtMs, () => {
         // 待っている間に復号器が閉じることがある（失敗は非同期に届く）。閉じていたら
