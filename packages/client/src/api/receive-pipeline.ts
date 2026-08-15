@@ -98,8 +98,6 @@ export interface PipelineDeps {
   readonly decodeVideo: (input: DecodeInput) => void;
   /** 音声を再生キューへ入れる。**音声は決して捨てない。** */
   readonly enqueueAudio: (input: DecodeInput) => void;
-  /** 直近の映像復号遅延（ミリ秒）。再生クロックの深度に加える。 */
-  readonly videoDecodeLatencyMs: () => number;
   /** 受信部屋へ制御メッセージを送る（`report` など）。 */
   readonly sendReceiveControl: (text: string) => void;
 }
@@ -309,7 +307,7 @@ function handleAudioUnit(
 
   // 音声のバッファ深度は到着間隔の p99 から決める（constants.md 7 節）。
   const jitter = jitterP99Ms(observation.arrivalGapsMs);
-  const depthMs = audioJitterPackets(jitter) * OPUS_FRAME_MS + deps.videoDecodeLatencyMs();
+  const depthMs = audioJitterPackets(jitter) * OPUS_FRAME_MS;
 
   const anchored = noteAudio(state.playout, senderId, captureUs, nowMs, depthMs);
   let next: PipelineState = { ...state, playout: anchored.state };

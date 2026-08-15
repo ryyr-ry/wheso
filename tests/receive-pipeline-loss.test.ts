@@ -45,7 +45,6 @@ function harness(): Harness {
         decoded.push(input);
       },
       enqueueAudio: (): void => undefined,
-        videoDecodeLatencyMs: (): number => 0,
       sendReceiveControl: (): void => undefined,
     },
   };

@@ -67,21 +67,13 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
    */
   const presentedUs = new Map<string, number>();
   /**
-   * `captureUs → presentAtMs`。復号器の非同期出力へ提示予定時刻を届ける。
-   *
-   * 復号は即座に開始し、復号器の出力時に門で待つ（ADR-0042）。門を復号の前に置くと
-   * 復号遅延が提示時刻に加算され、音声との skew が生む。
+   * 直近の映像復号遅延（ミリ秒）。門の発火を presentAtMs から引いて早めに復号を始める。
    */
-  const videoPresentByCapture = new Map<number, number>();
+  let videoDecodeLatencyMs = 0;
   /**
    * `captureUs → decode開始時刻`（ミリ秒）。復号遅延の計測に使う。
    */
   const decodeStartByCapture = new Map<number, number>();
-  /**
-   * 直近の映像復号遅延（ミリ秒）。再生クロックの深度に加えて音声を遅らせ、
-   * 復号が終わってから映像と音声を同時に出す。
-   */
-  let videoDecodeLatencyMs = 0;
   const audio = createAudioSink(options.onAudioScheduled);
 
   const videoDecoderCtor = Reflect.get(globalThis, "VideoDecoder");
@@ -147,38 +139,43 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
       if (chunk === null) {
         return;
       }
-      // **復号は即座に開始し、出力を門で待たせる**（ADR-0042）。
+      // **提示予定時刻から復号遅延を引いた時刻に復号を始める**（ADR-0042）。
       //
-      // 門を復号の前に置くと、復号遅延が提示時刻に加算される。音声は復号後に
-      // AudioContext の時計で再生時刻へ合わせるため復号遅延が skew に混入しないが、
-      // 映像は門の後に復号するため復号遅延ぶん遅れ、音声が先行する。
-      videoPresentByCapture.set(input.captureTimestampUs, input.presentAtMs);
+      // 復号は非同期である。門を presentAtMs で待ってから復号を始めると、復号遅延
+      // ぶんだけ映像が遅れ、音声との skew が生む。復号遅延を引いた時刻に門を発火させ、
+      // 復号が presentAtMs に間に合うようにする。門が順序も保証する。
+      const gateAtMs = input.presentAtMs - videoDecodeLatencyMs;
       decodeStartByCapture.set(input.captureTimestampUs, options.now());
-      // 待っている間に復号器が閉じることがある（失敗は非同期に届く）。閉じていたら
-      // 作り直す。**閉じた実体へ渡し続けてはならない**（例外になり、以後何も出ない）。
-      if (stateOf(entry.decoder) === "closed") {
-        // **差分では作り直さない。** 作り直した復号器はキーフレームからしか始められない
-        // ため、差分ごとに作ると実体を捨てて作るだけを繰り返す。失敗を伝えて要求させ、
-        // キーフレームが来たときに作り直す。
-        if (!input.key) {
-          options.onDecodeError(input.senderId, input.channel);
+      gate.submit(input.senderId, gateAtMs, () => {
+        // 待っている間に復号器が閉じることがある（失敗は非同期に届く）。閉じていたら
+        // 作り直す。**閉じた実体へ渡し続けてはならない**（例外になり、以後何も出ない）。
+        const current = videos.get(keyOf(input.senderId, input.channel));
+        if (current === undefined) {
           return;
         }
-        const rebuilt = createDecoder(input.senderId, input.channel);
-        if (rebuilt === null) {
+        if (stateOf(current.decoder) === "closed") {
+          // **差分では作り直さない。** 作り直した復号器はキーフレームからしか始められない
+          // ため、差分ごとに作ると実体を捨てて作るだけを繰り返す。失敗を伝えて要求させ、
+          // キーフレームが来たときに作り直す。
+          if (!input.key) {
+            options.onDecodeError(input.senderId, input.channel);
+            return;
+          }
+          const rebuilt = createDecoder(input.senderId, input.channel);
+          if (rebuilt === null) {
+            return;
+          }
+          callMethod(rebuilt.decoder, "decode", [chunk]);
           return;
         }
-        callMethod(rebuilt.decoder, "decode", [chunk]);
-        return;
-      }
-      callMethod(entry.decoder, "decode", [chunk]);
+        callMethod(current.decoder, "decode", [chunk]);
+      });
     },
 
     enqueueAudio: (input): void => {
       // **音声は決して捨てない。** 復号器が無い環境でも呼び出しは失敗させない。
       audio.enqueue(input);
     },
-    videoDecodeLatencyMs: (): number => videoDecodeLatencyMs,
   };
 
   /** 復号器の状態を読む（`unconfigured` / `configured` / `closed`）。読めなければ空文字。 */
@@ -212,36 +209,23 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
           if (stamp !== undefined) {
             presentedUs.set(key, stamp);
           }
-          // **提示予定時刻まで待ってから描画へ渡す**（ADR-0042）。
-          //
-          // 復号は即座に開始したため、復号遅延は既に経過している。門は出力を
-          // presentAtMs まで待たせ、復号遅延を skew に混入させない。
-          const presentAt = stamp !== undefined ? videoPresentByCapture.get(stamp) : undefined;
-          if (stamp !== undefined) {
-            videoPresentByCapture.delete(stamp);
-          }
-          // 復号遅延を計測する。次の音声の再生クロックの深度に加える。
+          // 復号遅延を計測する。次の枠の門の発火を早めるために使う。
           if (stamp !== undefined) {
             const startedAt = decodeStartByCapture.get(stamp);
             if (startedAt !== undefined) {
               decodeStartByCapture.delete(stamp);
               const latency = options.now() - startedAt;
               if (latency > 0 && latency < 2000) {
-                // 直近の最大値を使う。平均ではスパイクを覆えず skew が残る。
-                // 10 秒ごとに 90% に減衰させ、過去のスパイクが永続しないようにする。
                 videoDecodeLatencyMs = Math.trunc(
                   Math.max(videoDecodeLatencyMs, latency) * 0.99,
                 );
               }
             }
           }
-          const scheduledPresent = presentAt ?? 0;
-          gate.submit(senderId, scheduledPresent, () => {
-            options.onFrame(senderId, frame);
-            // **`VideoFrame` は明示的に閉じる。** 閉じないと復号器の資源が尽き、
-            // 数百枚で復号が止まる（WebCodecs の要件）。利用側は同期に使い終える。
-            closeFrame(frame);
-          });
+          options.onFrame(senderId, frame);
+          // **`VideoFrame` は明示的に閉じる。** 閉じないと復号器の資源が尽き、
+          // 数百枚で復号が止まる（WebCodecs の要件）。利用側は同期に使い終える。
+          closeFrame(frame);
         },
         error: (): void => {
           options.onDecodeError(senderId, channel);

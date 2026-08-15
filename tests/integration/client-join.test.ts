@@ -187,7 +187,6 @@ test("参加 URL から 5 個の部屋へ接続し helloAck で active になる
       closeDecoder: (): void => undefined,
       decodeVideo: (): void => undefined,
       enqueueAudio: (): void => undefined,
-        videoDecodeLatencyMs: (): number => 0,
     },
     // はしごは源から導出する（ADR-0026）。
     source: { width: 1920, height: 1080, framerate: 30 },

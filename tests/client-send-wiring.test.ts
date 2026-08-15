@@ -192,7 +192,6 @@ async function join(
         closeDecoder: (): void => undefined,
         decodeVideo: (): void => undefined,
         enqueueAudio: (): void => undefined,
-        videoDecodeLatencyMs: (): number => 0,
       },
       capture: capture.deps,
     },

@@ -557,7 +557,6 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
         recorder.audioIo.submitted += 1;
         base.media.enqueueAudio(input);
       },
-      videoDecodeLatencyMs: base.media.videoDecodeLatencyMs,
     },
     openSocket: (url, role) => {
       const socket = base.openSocket(url, role);

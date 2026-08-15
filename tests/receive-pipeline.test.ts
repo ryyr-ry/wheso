@@ -66,7 +66,6 @@ function recorder(clock: { ms: number }): { deps: PipelineDeps; log: Log } {
     enqueueAudio: (input): void => {
       log.audio.push(input);
     },
-    videoDecodeLatencyMs: (): number => 0,
     sendReceiveControl: (text): void => {
       log.control.push(text);
     },
