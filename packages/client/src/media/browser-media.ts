@@ -56,10 +56,8 @@ interface VideoEntry {
  * 投げると、能力の無い環境で参加そのものが失敗する。
  */
 export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDeps, "now" | "sendReceiveControl"> {
-  // 復号開始の門（復号遅延のぶんだけ早発火）。映像のみ。
-  const decodeGate = createPresentGate({ now: options.now, scheduleAt: options.scheduleAt });
-  // 出力保持の門（presentAtMs まで待つ）。映像のみ。復号開始の門とは独立。
-  const outputGate = createPresentGate({ now: options.now, scheduleAt: options.scheduleAt });
+  // 提示の門。映像だけに使う（音声は待たせない）。
+  const gate = createPresentGate({ now: options.now, scheduleAt: options.scheduleAt });
   const videos = new Map<string, VideoEntry>();
   /**
    * 復号器ごとに、**最後に渡した枠の取得時刻**（マイクロ秒）。
@@ -70,13 +68,9 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
   const presentedUs = new Map<string, number>();
   /**
    * 直近の映像復号遅延（ミリ秒）。門の発火を presentAtMs から引いて早めに復号を始める。
-   * 過補正は出力保持で安全なため、直近の最大値を使う。
+   * 直近 2 枠の最小値を使い、過大補正（音声遅れ）を防ぐ。
    */
   let videoDecodeLatencyMs = 0;
-  /**
-   * `captureUs → presentAtMs`。復号器の非同期出力へ提示予定時刻を届ける。
-   */
-  const videoPresentByCapture = new Map<number, number>();
   /**
    * `captureUs → decode開始時刻`（ミリ秒）。復号遅延の計測に使う。
    */
@@ -124,8 +118,7 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
 
     closeDecoder: (senderId, channel): void => {
       // 順序の記録も捨てる。残すと退出した相手の予定時刻に縛られる。
-      decodeGate.release(senderId);
-      outputGate.release(senderId);
+      gate.release(senderId);
       // **作り直し（ADR-0047）では消さない。** 消すと古い実体の枠を再び通してしまう。
       // ここは購読を捨てる経路であり、相手が入り直したときに取得時刻が戻り得る。
       presentedUs.delete(keyOf(senderId, channel));
@@ -154,8 +147,7 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
       // 復号が presentAtMs に間に合うようにする。門が順序も保証する。
       const gateAtMs = input.presentAtMs - videoDecodeLatencyMs;
       decodeStartByCapture.set(input.captureTimestampUs, options.now());
-      videoPresentByCapture.set(input.captureTimestampUs, input.presentAtMs);
-      decodeGate.submit(input.senderId, gateAtMs, () => {
+      gate.submit(input.senderId, gateAtMs, () => {
         // 待っている間に復号器が閉じることがある（失敗は非同期に届く）。閉じていたら
         // 作り直す。**閉じた実体へ渡し続けてはならない**（例外になり、以後何も出ない）。
         const current = videos.get(keyOf(input.senderId, input.channel));
@@ -218,35 +210,25 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
           if (stamp !== undefined) {
             presentedUs.set(key, stamp);
           }
-          // 復号遅延を計測する。過補正は出力保持で安全なため最大値を使う。
-          // また、提示予定時刻を取り出し、出力を presentAtMs まで保持する。
+          // 復号遅延を計測する。次の枠の門の発火を早めるために使う。
           if (stamp !== undefined) {
             const startedAt = decodeStartByCapture.get(stamp);
-            const presentAt = videoPresentByCapture.get(stamp);
             if (startedAt !== undefined) {
               decodeStartByCapture.delete(stamp);
               const latency = options.now() - startedAt;
               if (latency > 0 && latency < 2000) {
-                // 過補正は出力保持で安全なため最大値を追う。
-                // 0.99 の減衰で過去のスパイクが永続しないようにする。
-                videoDecodeLatencyMs = Math.trunc(Math.max(videoDecodeLatencyMs, latency) * 0.99);
+                // 直近の計測値をそのまま使う。
+                // 補正は次枠に効くため、1 枠前の遅延が次枠の予測となる。
+                // 復号遅延は数フレームのスパンで滑らかに変化するため、
+                // 1 枠前の値は次枠の良く当たる予測である。
+                videoDecodeLatencyMs = latency;
               }
             }
-            if (presentAt !== undefined) {
-              videoPresentByCapture.delete(stamp);
-            }
-            // **復号は早めに始まっているため、出力が presentAtMs より早い可能性がある。**
-            // 出力を presentAtMs まで保持し、音声との同時提示を保証する。
-            // 出力が presentAtMs より遅い場合は即座に出す（これ以上遅らせない）。
-            const scheduledPresent = presentAt ?? 0;
-            outputGate.submit(senderId, scheduledPresent, () => {
-              options.onFrame(senderId, frame);
-              closeFrame(frame);
-            });
-          } else {
-            options.onFrame(senderId, frame);
-            closeFrame(frame);
           }
+          options.onFrame(senderId, frame);
+          // **`VideoFrame` は明示的に閉じる。** 閉じないと復号器の資源が尽き、
+          // 数百枚で復号が止まる（WebCodecs の要件）。利用側は同期に使い終える。
+          closeFrame(frame);
         },
         error: (): void => {
           options.onDecodeError(senderId, channel);
