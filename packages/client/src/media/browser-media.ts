@@ -56,8 +56,10 @@ interface VideoEntry {
  * 投げると、能力の無い環境で参加そのものが失敗する。
  */
 export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDeps, "now" | "sendReceiveControl"> {
-  // 提示の門。映像だけに使う（音声は待たせない）。
-  const gate = createPresentGate({ now: options.now, scheduleAt: options.scheduleAt });
+  // 復号開始の門（復号遅延のぶんだけ早発火）。映像のみ。
+  const decodeGate = createPresentGate({ now: options.now, scheduleAt: options.scheduleAt });
+  // 出力保持の門（presentAtMs まで待つ）。映像のみ。復号開始の門とは独立。
+  const outputGate = createPresentGate({ now: options.now, scheduleAt: options.scheduleAt });
   const videos = new Map<string, VideoEntry>();
   /**
    * 復号器ごとに、**最後に渡した枠の取得時刻**（マイクロ秒）。
@@ -122,7 +124,8 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
 
     closeDecoder: (senderId, channel): void => {
       // 順序の記録も捨てる。残すと退出した相手の予定時刻に縛られる。
-      gate.release(senderId);
+      decodeGate.release(senderId);
+      outputGate.release(senderId);
       // **作り直し（ADR-0047）では消さない。** 消すと古い実体の枠を再び通してしまう。
       // ここは購読を捨てる経路であり、相手が入り直したときに取得時刻が戻り得る。
       presentedUs.delete(keyOf(senderId, channel));
@@ -152,7 +155,7 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
       const gateAtMs = input.presentAtMs - videoDecodeLatencyMs;
       decodeStartByCapture.set(input.captureTimestampUs, options.now());
       videoPresentByCapture.set(input.captureTimestampUs, input.presentAtMs);
-      gate.submit(input.senderId, gateAtMs, () => {
+      decodeGate.submit(input.senderId, gateAtMs, () => {
         // 待っている間に復号器が閉じることがある（失敗は非同期に届く）。閉じていたら
         // 作り直す。**閉じた実体へ渡し続けてはならない**（例外になり、以後何も出ない）。
         const current = videos.get(keyOf(input.senderId, input.channel));
@@ -236,7 +239,7 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
             // 出力を presentAtMs まで保持し、音声との同時提示を保証する。
             // 出力が presentAtMs より遅い場合は即座に出す（これ以上遅らせない）。
             const scheduledPresent = presentAt ?? 0;
-            gate.submit(senderId, scheduledPresent, () => {
+            outputGate.submit(senderId, scheduledPresent, () => {
               options.onFrame(senderId, frame);
               closeFrame(frame);
             });
