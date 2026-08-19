@@ -234,6 +234,22 @@ export interface BuiltRecord {
   readonly transientClosures: readonly string[];
   /** D-1 違反のデバッグ情報。各違反フレームの audioKey と playedByCapture の前後関係。 */
   readonly d1Debug: readonly string[];
+  /**
+   * 復号器へ投入されたが提示（`onFrame`）に現れなかった枠の数。
+   *
+   * 復号の失敗が 0 のとき、この差は**後戻りで捨てられた数**である（browser-media.ts の
+   * 出力の後戻りチェック）。B-1（欠落）の原因が「経路」「破棄の判断」「復号器」「後戻り」の
+   * どこにあるかを分ける（X-054: 数の並びを作ってから原因を言う）。
+   */
+  readonly decodeRegressions: number;
+  /**
+   * 復号器への投入順が取得時刻順と逆転した回数。
+   *
+   * 投入順は受信順である（TCP は順序を保つ）。取得時刻順と逆転するのは、提示の門が
+   * 発火時刻（`presentAtMs - 復号遅延`）で順序を保証するため、復号遅延の変動で
+   * 発火順が取得時刻順と入れ替わるときである。これが後戻りの源になる。
+   */
+  readonly decodeOrderInversions: number;
 }
 
 /**
@@ -386,9 +402,9 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
   // 5. 再生した音声の取得時刻の集合。末尾を切る基準にも使う。
   //
   // WebCodecs の AudioDecoder は chunk.timestamp をそのまま AudioData.timestamp へ
-  // 渡すとは限らない（仕様上「codec may adjust」）。実測では Opus 復号器が 1 μs ずらす
-  // （AGENTS.md 5.4「型定義を信用しない」）。したがって厳密一致ではなく ±2 μs の許容で
-  // 引く。音声フレーム間隔は 20 ms（20000 μs）であるため、この許容が実損失を隠すことは無い。
+  // 渡すとは限らない（仕様上「codec may adjust」）。実測では Opus 復号器が 1 μs ずらす。
+  // したがって厳密一致ではなく ±2 μs の許容で引く。音声フレーム間隔は 20 ms
+  // （20000 μs）であるため、この許容が実損失を隠すことは無い。
   const playedByCapture = new Map<number, number>();
   for (const entry of run.playedAudio) {
     const existing = playedByCapture.get(entry.captureUs);
@@ -554,6 +570,23 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     transient.push(text);
   }
 
+  // 7. 復号の後戻りと投入順の逆転（観測。B-1 の原因の切り分け）。
+  const receivedCaptures = new Set(run.received.map((entry) => entry.captureUs));
+  let decodeRegressions = 0;
+  for (const entry of run.decoded) {
+    if (!receivedCaptures.has(entry.captureUs)) {
+      decodeRegressions += 1;
+    }
+  }
+  let decodeOrderInversions = 0;
+  let previousCapture = -1;
+  for (const entry of run.decoded) {
+    if (previousCapture > 0 && entry.captureUs < previousCapture) {
+      decodeOrderInversions += 1;
+    }
+    previousCapture = entry.captureUs;
+  }
+
   return {
     record: {
       sent,
@@ -578,5 +611,7 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     chainBreaks,
     transientClosures: transient,
     d1Debug,
+    decodeRegressions,
+    decodeOrderInversions,
   };
 }

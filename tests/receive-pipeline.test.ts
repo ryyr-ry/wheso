@@ -353,12 +353,44 @@ test("期限を過ぎた映像は捨てる（遅らせて出さない）", () =>
   let state = createPipeline(4, clock.ms);
   // 音声で対応付けを確立する。
   state = handleMedia(state, mediaBytes({ channel: CHANNEL_AUDIO, captureUs: 0 }), deps);
-  // 取得時刻 0 の映像を、対応付けの目標から大きく遅れた局所時刻で受ける。
+  // まず範囲内のキーフレームで復号器を作る（差分の参照先を用意する）。
+  const clockAfter = state.playout.clocks[0];
+  assert.ok(clockAfter !== undefined);
+  clock.ms = clockAfter.anchorLocalMs;
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_VIDEO, captureUs: 0, key: true, seq: 1 }), deps);
+  assert.equal(log.decoded.length, 1, "キーフレームは復号される");
+  // 取得時刻 0 の**差分**を、対応付けの目標から大きく遅れた局所時刻で受ける。
   clock.ms += 5_000;
   const before = log.decoded.length;
-  state = handleMedia(state, mediaBytes({ channel: CHANNEL_VIDEO, captureUs: 0, key: true, seq: 2 }), deps);
-  assert.equal(log.decoded.length, before, "復号器へ渡さない");
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_VIDEO, captureUs: 0, key: false, seq: 2 }), deps);
+  assert.equal(log.decoded.length, before, "差分は復号器へ渡さない");
   assert.ok(state.discardedVideo > 0, "捨てた枚数を数える");
+});
+
+test("**期限を過ぎてもキーフレームは捨てない**（wire-format.md 1.4、ADR-0056）", () => {
+  // 写像が狂っている間、差分は捨てられてよい。しかしキーフレームまで捨てると、
+  // 参照連鎖の回復が永久に来ない。要求したキーフレームが届いても捨てられ、要求と
+  // 破棄の輪が回る（実測 N-0: 要求 9 回・復号器の失敗 11 回・生成 12 回）。
+  const clock = { ms: 1000 };
+  const { deps, log } = recorder(clock);
+  let state = createPipeline(4, clock.ms);
+  // 音声で対応付けを確立する。
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_AUDIO, captureUs: 0 }), deps);
+  const clockAfter = state.playout.clocks[0];
+  assert.ok(clockAfter !== undefined);
+  clock.ms = clockAfter.anchorLocalMs;
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_VIDEO, captureUs: 0, key: true, seq: 1 }), deps);
+  assert.equal(log.decoded.length, 1);
+  // 写像の上で 5 秒遅れた局所時刻へ進める。以降の映像は期限切れ（discard）になる。
+  clock.ms += 5_000;
+  // 期限切れの差分は捨てられる（規範どおり。ADR-0028 の原則 3）。
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_VIDEO, captureUs: 66_000, key: false, seq: 2 }), deps);
+  assert.equal(log.decoded.length, 1, "差分は捨てる");
+  assert.ok(state.discardedVideo > 0, "捨てた枚数を数える");
+  // 期限切れのキーフレームは渡る。参照連鎖の回復のためである（ADR-0056）。
+  clock.ms += 66;
+  state = handleMedia(state, mediaBytes({ channel: CHANNEL_VIDEO, captureUs: 132_000, key: true, seq: 3 }), deps);
+  assert.equal(log.decoded.length, 2, "キーフレームは捨てない（復号へ渡る）");
 });
 
 test("対応付けの範囲内の映像は復号される", () => {

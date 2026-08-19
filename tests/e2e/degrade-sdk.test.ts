@@ -562,6 +562,19 @@ for (const profile of IMPAIRMENT_PROFILES) {
         ` / 復号器（投入 ${String(receiver.decoderIo.submitted)}` +
         ` 出力 ${String(receiver.decoderIo.output)} 失敗 ${String(receiver.decoderIo.failed)}` +
         ` 生成 ${String(receiver.decoderIo.created)}）` +
+        // **「届いたのに出ない」の層を分ける観測。** 後戻り（browser-media の出力の
+        // 後戻りチェックで捨てた数）と、投入順の逆転（復号遅延の変動で門の発火順が
+        // 取得時刻順と入れ替わった回数）を出す。B-1 の欠落が「経路」「破棄」「復号器」
+        // 「後戻り」のどれかを分ける（X-054）。
+        ` / 後戻り ${String(built.decodeRegressions)} 投入逆転 ${String(built.decodeOrderInversions)}` +
+        // **要求がいつ起きたか**。購読確立の直後（暖機）なら除外されるが、定常で起きる
+        // 要求は連番の飛び（missed）か復号の失敗の後である。時刻を見ると原因の層が分かる。
+        ` / 要求時刻 ${(() => {
+          const first = receiver.run.keyframeRequestAtMs[0];
+          return first === undefined
+            ? "なし"
+            : receiver.run.keyframeRequestAtMs.map((at) => String(at - first)).join(",");
+        })()}` +
         // **整形器が本当に効いたかを毎回出す。** 待たせた回数が 0 なら制限は効いておらず、
         // その走行の劣化は「掛けたつもり」である（緑でも赤でも読み違える）。
         ` / 整形（上り 出 ${String(shapeStats.egress.releasedBytes)}B` +

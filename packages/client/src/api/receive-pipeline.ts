@@ -414,11 +414,21 @@ function handleVideoUnit(
     // 起きる。要求を出すと「遅れて届いたキーフレームも捨てる」を繰り返して**生きた
     // ままの停止**になる（実測: 段 E で連鎖切れ 513 件・要求 37 山・提示 71 枚）。
     // 参照の欠けた差分は `noteGap`（連番の飛び）と復号の失敗の側で拾う。
-    return {
-      ...next,
-      discardedVideo: next.discardedVideo + 1,
-      reporter: recordVideoDrop(next.reporter),
-    };
+    //
+    // **キーフレームは捨てない**（wire-format.md 1.4「KEY=1 のユニットは破棄しては
+    // ならない」）。写像が狂っている間にキーフレームまで捨てると、参照連鎖の回復が
+    // 永久に来ない。要求したキーフレームが届いても捨てられるため、要求と破棄の輪が
+    // 回り続ける（実測 N-0: 要求 9 回・復号器の失敗 11 回・生成 12 回。判定 A-2 が
+    // 「キーフレームを提示していないのに delta を提示した」を量産した）。
+    // 1 枚のずれは次のフレームから回復する（ADR-0028 の原則 3 はキーフレームを例外と
+    // する。ADR-0056）。
+    if ((unit.flags & FLAG_KEY) === 0) {
+      return {
+        ...next,
+        discardedVideo: next.discardedVideo + 1,
+        reporter: recordVideoDrop(next.reporter),
+      };
+    }
   }
   if (presentation.decision === "hold") {
     // まだ早い。復号はするが提示は端が待つ。ここでは数えるだけにする。
