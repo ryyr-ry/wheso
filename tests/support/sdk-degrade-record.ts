@@ -97,6 +97,14 @@ export interface ObservedRun {
    * これより後に送ったものは、記録を取る時点でまだ経路にあるため判定しない。
    */
   readonly windowClosedAtMs: number;
+  /**
+   * 暖機で切り落とした復号の記録にキーフレームが含まれていたか。
+   *
+   * `trimWarmup` が計算して返す。判定 A-2 の参照の基点を正しく置くために使う
+   * （切られたキーフレームで復号器は既に初期化済みであり、窓の中のキーフレームが
+   * 復号器へ渡っていなくても参照は有効）。
+   */
+  readonly trimmedDecodedKey?: boolean;
 }
 
 /**
@@ -171,6 +179,16 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
     list: readonly T[],
   ): readonly T[] =>
     keep(list).filter((entry) => run.windowClosedAtMs <= 0 || entry.atMs <= run.windowClosedAtMs);
+  // **切られた復号にキーフレームが含まれていたかを記録する。**
+  //
+  // 暖機で切った期間に復号器へ渡ったキーフレームがあれば、復号器は既に初期化済みであり、
+  // 窓の中のキーフレームが復号器へ渡っていなくても（購読確立前に送られた等）、
+  // その後の delta の参照は有効である。判定 A-2 が「キーフレームを提示していないのに
+  // delta を提示した」と誤読しないための基点である（実測: N-4 で frameIndex 24〜39 が
+  // 偽の A-2 になった。sent にキーフレームが有るのに復号器へ渡っていなかった）。
+  const trimmedDecodedKey = run.decoded.some(
+    (entry) => entry.captureUs < videoBoundaryUs && entry.isKey,
+  );
   return {
     ...run,
     sentVideo: inWindow(run.sentVideo),
@@ -183,6 +201,7 @@ export function trimWarmup(run: ObservedRun): ObservedRun {
     audioArrivedAtMs: run.audioArrivedAtMs.filter((_at, i) => run.audioArrivedCaptureUs[i] !== undefined && run.audioArrivedCaptureUs[i] >= videoBoundaryUs),
     keyframeRequestAtMs:
       firstPresentedReceivedAtMs < 0 ? run.keyframeRequestAtMs : run.keyframeRequestAtMs.filter((at) => at >= firstPresentedReceivedAtMs),
+    trimmedDecodedKey,
   };
 }
 
@@ -604,6 +623,7 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
       closures: fatal,
       arrived: arrivedIndexes,
       decodedIndexes,
+      sawKeyBeforeWindow: run.trimmedDecodedKey === true,
     },
     switches,
     judgedSent: sent.length,

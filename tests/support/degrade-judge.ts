@@ -83,6 +83,14 @@ export interface DegradeRecord {
    * あり、依存構造の違反ではない。
    */
   readonly decodedIndexes?: readonly number[];
+  /**
+   * 暖機の切り落としより前の復号にキーフレームが含まれていたか（判定 A-2 の基点）。
+   *
+   * 真なら、復号器は既にキーフレームで初期化されており、窓の中のキーフレームが
+   * 復号器へ渡っていなくても、その後の delta の参照は有効である。`judgeDependencies`
+   * の初期 `sawKey` を真で始めるために使う。
+   */
+  readonly sawKeyBeforeWindow?: boolean;
 }
 
 export interface Violation {
@@ -470,8 +478,13 @@ export function judgeDependencies(record: DegradeRecord): readonly Violation[] {
   // 25〜44 が A-2）。このとき `sent` にキーフレームが存在しない。キーフレームは
   // warmup より前に届いて復号に渡されているため、残った delta フレームの参照は
   // 有効である。`sawKey = false` で始めると「参照が無い」A-2 違反を量産する。
+  //
+  // **暖機で切った復号にキーフレームが含まれるときも同じである。** sent にキーフレーム
+  // が有るのに復号器へ渡っていない場合でも（購読確立前に送られた等）、復号器は暖機前に
+  // 別のキーフレームで初期化済みであり、参照は有効である（実測: N-4 で frameIndex
+  // 24〜39 が偽の A-2 になった）。
   const hasKeyInSent = record.sent.some((entry) => entry.isKey);
-  let sawKey = !hasKeyInSent;
+  let sawKey = !hasKeyInSent || record.sawKeyBeforeWindow === true;
   // 送出の順（frameIndex の昇順）で見る。提示の順序の異常は A-3 が見る。
   for (const meta of [...record.sent].sort((a, b) => a.frameIndex - b.frameIndex)) {
     const presented = presentedIndexes.has(meta.frameIndex);

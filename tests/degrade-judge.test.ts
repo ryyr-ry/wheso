@@ -200,6 +200,23 @@ test("A-2: 健全な記録では違反が無い", () => {
   assert.deepEqual(judgeDependencies({ ...base, received: topOnly }), []);
 });
 
+test("**A-2: 暖機で切った復号にキーフレームがあれば参照の基点を置く**", () => {
+  // sent にキーフレームが有るのに復号器へ渡っていない記録（購読確立前に送られた等）。
+  // 暖機の前に別のキーフレームで復号器が初期化済みなら、参照は有効である。
+  const base = healthyRecord(10);
+  const keyOnlyMissing = {
+    ...base,
+    // キーフレーム（frameIndex 1）を復号器へ渡していないことにする。
+    decodedIndexes: base.received
+      .filter((entry) => !(base.sent.find((s) => s.frameIndex === entry.frameIndex)?.isKey ?? false))
+      .map((entry) => entry.frameIndex),
+  };
+  // 基点が無いと「キーフレームを提示していないのに delta を提示した」が量産される。
+  assert.ok(judgeDependencies(keyOnlyMissing).length > 0, "基点が無ければ違反である");
+  // 暖機で切った復号にキーフレームが含まれていれば違反にならない。
+  assert.deepEqual(judgeDependencies({ ...keyOnlyMissing, sawKeyBeforeWindow: true }), []);
+});
+
 test("**A-1 の完全形: 同じ段を受けた購読者は同じ画素を得る**", () => {
   const base = healthyRecord(10);
   const same = { label: "健全", record: base };
