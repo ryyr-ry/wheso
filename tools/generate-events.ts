@@ -855,18 +855,41 @@ export function generateShardEvents(seed: bigint, steps: number): Result<readonl
           maxTemporalId: 7,
         },
       });
+      // 音声の購読も張る。無いと音声は選別転送の段階で落ち、停止中の音声が
+      // 「通る」のか「止まっている」のかを判別できなくなる。
+      t += 2;
+      events.push({
+        t,
+        event: {
+          kind: "subscribe",
+          from: stalled,
+          to: target,
+          ch: CHANNEL_AUDIO,
+          want: true,
+          maxSpatialId: 0,
+          maxTemporalId: 0,
+        },
+      });
       // 媒体を渡して未確認を作る。ack は返さない。
       t += 5;
       pushMedia(target, CHANNEL_VIDEO, 0, 0, true, 4000, FLAG_KEY | FLAG_END_OF_FRAME);
+      t += 5;
+      pushMedia(target, CHANNEL_AUDIO, 0, 0, false, 160, FLAG_END_OF_FRAME);
       // 時限の手前では停止しない。
       t += 100;
       events.push({ t, event: { kind: "timer" } });
-      // 時限を越えると停止し、切断が出る。
-      t += 6000;
+      // 時限を越えると停止する。ACK_TIMEOUT_MS（f30da4b で 10000 に延長）より長く進める。
+      t += ACK_TIMEOUT_MS + 500;
       events.push({ t, event: { kind: "timer" } });
-      // 停止した購読へはもう渡らない。
+      // 停止した購読へは映像は渡らない。
       t += 5;
       pushMedia(target, CHANNEL_VIDEO, 0, 0, true, 4000, FLAG_KEY | FLAG_END_OF_FRAME);
+      // 停止した購読へも音声は渡る（音声は破棄禁止。b440126）。
+      // 音声をここで流さないと、stalled でも音声を通す道がトレースで覆われない。
+      t += 5;
+      pushMedia(target, CHANNEL_AUDIO, 0, 0, false, 160, FLAG_END_OF_FRAME);
+      t += 5;
+      pushMedia(target, CHANNEL_AUDIO, 0, 0, false, 160, FLAG_END_OF_FRAME | FLAG_ACTIVE_SPEAKER);
     }
   }
 

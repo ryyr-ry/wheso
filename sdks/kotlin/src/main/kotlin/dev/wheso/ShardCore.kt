@@ -298,7 +298,15 @@ private data class SubscriptionDecision(
 private fun decideForSubscription(
     state: ShardState, sub: Subscription, event: ShardEvent.Media, priority: Long?, t: Long,
 ): SubscriptionDecision {
-    if (sub.stalled) return SubscriptionDecision(sub, false, null, false)
+    if (sub.stalled) {
+        // 音声は接続が停止していても通す（音声は破棄禁止）。
+        // stalled は「ACK_TIMEOUT_MS の間 ack が届かない」状態であり、接続が切れたと判断した
+        // ものである。しかし音声を落とすと、復帰しても stalled が解除されない限り音声が
+        // 届かない。映像は stalled の間落としてよい（接続が切れた相手へ映像を送り続けると
+        // ノードの予算を食う）。音声だけは通すことで、接続が復帰したときに音声が即座に戻る。
+        if (isAudioChannel(event.ch)) return forwardDecision(state, sub, event)
+        return SubscriptionDecision(sub, false, null, false)
+    }
 
     // 音声の選別転送（ADR-0024、ADR-0029 の 2）。
     // 本数は購読者ごとに決める。帯域が細い購読者へ多数の音声を送ると映像の余地が無くなる。

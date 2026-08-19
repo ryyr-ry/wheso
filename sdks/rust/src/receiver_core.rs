@@ -624,10 +624,31 @@ fn crosses_audio_only(state: &ReceiverState) -> bool {
 /// メディアの転送。要求 tier を超えるユニットは転送しない。
 fn handle_media(state: &ReceiverState, input: MediaInput) -> ReceiverStepResult {
     let stream = match find_stream(state, input.from, input.ch) {
-        None => return ReceiverStepResult { state: state.clone(), commands: Vec::new() },
+        None => {
+            // 音声は購読が未確立でも転送する（音声は破棄禁止）。
+            // 音声と映像は別の部屋を通り、購読の確立も別である。音声の購読が遅れて確立する
+            // 間に届いた音声がここで消えるのを防ぐ。映像は落として正しい（購読していない
+            // 送信者の映像を復号器へ渡すと参照が壊れる）。音声は段を持たず参照連鎖の制約が
+            // 無い。ack 位置も記録する。ack 位置が記録されれば中継の送信窓が進み、
+            // stalled になりにくい。
+if is_audio(input.ch) {
+                return ReceiverStepResult {
+                    state: mark_received(state, &input),
+                    commands: vec![ReceiverCommand::Forward { to: vec![RECEIVER_SELF_ID] }],
+                };
+            }
+            return ReceiverStepResult { state: state.clone(), commands: Vec::new() };
+        }
         Some(stream) => stream,
     };
     if stream.phase != StreamPhase::Subscribed {
+        // 上と同じく、購読が未確立でも音声は転送する（音声は破棄禁止）。
+        if is_audio(input.ch) {
+            return ReceiverStepResult {
+                state: mark_received(state, &input),
+                commands: vec![ReceiverCommand::Forward { to: vec![RECEIVER_SELF_ID] }],
+            };
+        }
         return ReceiverStepResult { state: state.clone(), commands: Vec::new() };
     }
     if input.sid > stream.spatial_id || input.tid > stream.temporal_id {

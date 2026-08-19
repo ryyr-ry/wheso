@@ -513,6 +513,17 @@ private fun handleReport(state: ReceiverState, delayUs: List<Long>, t: Long): Re
 private fun handleMedia(state: ReceiverState, event: ReceiverEvent.Media): ReceiverStepResult {
     val stream = findStream(state, event.from, event.ch)
     if (stream == null || stream.phase != StreamPhase.SUBSCRIBED) {
+        // 音声は購読が未確立でも転送する（音声は破棄禁止）。
+        // 音声と映像は別の部屋を通り、購読の確立も別である。音声の購読が遅れて確立する間に
+        // 届いた音声がここで消えるのを防ぐ。映像は落として正しい（購読していない送信者の
+        // 映像を復号器へ渡すと参照が壊れる）。音声は段を持たず参照連鎖の制約が無い。
+        // ack 位置も記録する。ack 位置が記録されれば中継の送信窓が進み、stalled になりにくい。
+        if (isAudio(event.ch)) {
+            return ReceiverStepResult(
+                markReceived(state, event),
+                listOf(ReceiverCommand.Forward(listOf(RECEIVER_SELF_ID))),
+            )
+        }
         return ReceiverStepResult(state, emptyList())
     }
     if (event.sid > stream.spatialId || event.tid > stream.temporalId) {

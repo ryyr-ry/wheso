@@ -727,6 +727,14 @@ inline SubscriptionDecision decide_for_subscription(const State& state, const Su
                                                     std::int64_t t) {
   // 1. ack が途絶えている → 渡さない
   if (sub.stalled) {
+    // 音声は接続が停止していても通す（音声は破棄禁止）。
+    // stalled は「ACK_TIMEOUT_MS の間 ack が届かない」状態であり、接続が切れたと判断した
+    // ものである。しかし音声を落とすと、復帰しても stalled が解除されない限り音声が
+    // 届かない。映像は stalled の間落としてよい（接続が切れた相手へ映像を送り続けると
+    // ノードの予算を食う）。音声だけは通すことで、接続が復帰したときに音声が即座に戻る。
+    if (is_audio_channel(event.ch)) {
+      return forward_decision(state, sub, event);
+    }
     return SubscriptionDecision{sub, false, -1, false};
   }
 

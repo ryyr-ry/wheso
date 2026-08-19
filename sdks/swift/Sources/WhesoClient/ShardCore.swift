@@ -394,6 +394,15 @@ private func decideForSubscription(
 ) -> SubscriptionDecision {
     // 1. ack が途絶えている
     if sub.stalled {
+        // 音声は接続が停止していても通す（音声は破棄禁止）。
+        // stalled は「ACK_TIMEOUT_MS の間 ack が届かない」状態であり、接続が切れたと
+        // 判断したものである。しかし音声を落とすと、復帰しても stalled が解除されない
+        // 限り音声が届かない。映像は stalled の間落としてよい（接続が切れた相手へ
+        // 映像を送り続けるとノードの予算を食う）。音声だけは通すことで、接続が復帰した
+        // ときに音声が即座に戻る。
+        if isAudioChannel(ch) {
+            return forwardDecision(state, sub: sub, ch: ch, seq: seq)
+        }
         return SubscriptionDecision(subscription: sub, forward: false, dropPriority: nil, requestKeyframe: false)
     }
 

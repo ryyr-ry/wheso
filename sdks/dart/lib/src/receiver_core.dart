@@ -860,6 +860,17 @@ bool _crossesAudioOnly(ReceiverState state) {
 ReceiverStepResult _handleMedia(ReceiverState state, MediaEvent event) {
   final stream = _findStream(state, event.from, event.ch);
   if (stream == null || stream.phase != StreamPhase.subscribed) {
+    // 音声は購読が未確立でも転送する（音声は破棄禁止）。
+    // 音声と映像は別の部屋を通り、購読の確立も別である。音声の購読が遅れて確立する間に
+    // 届いた音声がここで消えるのを防ぐ。映像は落として正しい（購読していない送信者の
+    // 映像を復号器へ渡すと参照が壊れる）。音声は段を持たず参照連鎖の制約が無い。
+    // ack 位置も記録する。ack 位置が記録されれば中継の送信窓が進み、stalled になりにくい。
+    if (_isAudio(event.ch)) {
+      return ReceiverStepResult(
+        state: _markReceived(state, event),
+        commands: <ReceiverCommand>[const ForwardCommand(to: <int>[receiverSelfId])],
+      );
+    }
     return ReceiverStepResult(state: state, commands: <ReceiverCommand>[]);
   }
   if (event.sid > stream.spatialId || event.tid > stream.temporalId) {

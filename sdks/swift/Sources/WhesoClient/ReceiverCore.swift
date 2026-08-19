@@ -678,16 +678,27 @@ private func handleMedia(
     _ state: WhesoReceiverState,
     from: Int64, ch: Int64, sid: Int64, tid: Int64, seq: Int64
 ) -> WhesoReceiverStepResult {
-    guard let stream = findStream(state, from, ch), stream.phase == .subscribed else {
-        return WhesoReceiverStepResult(state: state, commands: [])
+    if let stream = findStream(state, from, ch), stream.phase == .subscribed {
+        if sid > stream.spatialId || tid > stream.temporalId {
+            return WhesoReceiverStepResult(state: state, commands: [.drop(priority: 1, count: 1)])
+        }
+        return WhesoReceiverStepResult(
+            state: markReceived(state, from: from, ch: ch, sid: sid, seq: seq),
+            commands: [.forward(to: [whesoReceiverSelfId])]
+        )
     }
-    if sid > stream.spatialId || tid > stream.temporalId {
-        return WhesoReceiverStepResult(state: state, commands: [.drop(priority: 1, count: 1)])
+    // 音声は購読が未確立でも転送する（音声は破棄禁止）。
+    // 音声と映像は別の部屋を通り、購読の確立も別である。音声の購読が遅れて確立する間に
+    // 届いた音声がここで消えるのを防ぐ。映像は落として正しい（購読していない送信者の
+    // 映像を復号器へ渡すと参照が壊れる）。音声は段を持たず参照連鎖の制約が無い。
+    // ack 位置も記録する。ack 位置が記録されれば中継の送信窓が進み、stalled になりにくい。
+    if isReceiverAudio(ch) {
+        return WhesoReceiverStepResult(
+            state: markReceived(state, from: from, ch: ch, sid: sid, seq: seq),
+            commands: [.forward(to: [whesoReceiverSelfId])]
+        )
     }
-    return WhesoReceiverStepResult(
-        state: markReceived(state, from: from, ch: ch, sid: sid, seq: seq),
-        commands: [.forward(to: [whesoReceiverSelfId])]
-    )
+    return WhesoReceiverStepResult(state: state, commands: [])
 }
 
 /// 受信した位置を更新する。後戻りする値では更新しない。
