@@ -301,6 +301,19 @@ export interface BuiltRecord {
     /** p99（ミリ秒。整数）。 */
     readonly p99Ms: number;
   };
+  /**
+   * 送信側で対にした「映像と音声の取得時刻の差」（ミリ秒）の要約（観測）。
+   *
+   * 対は nearestAudio（最近傍）で作るため、正しく作られていれば ±半フレーム
+   * （15 fps なら ±33 ms）に収まる。これが収まっていなければ、ずれは
+   * **送信側の対の取り違え**であり、受信側の同期の問題ではない（X-054:
+   * 数の並びを作ってから原因を言う）。
+   */
+  readonly pairGap: {
+    readonly count: number;
+    readonly medianMs: number;
+    readonly maxMs: number;
+  };
 }
 
 /**
@@ -660,6 +673,23 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     p99Ms: sortedSkews.length === 0 ? 0 : sortedSkews[rankOf(99)] ?? 0,
   };
 
+  // 送信側で対にした「映像と音声の取得時刻の差」（観測）。対が正しければ
+  // ±半フレームに収まる。収まっていなければずれは送信側の対にあり、
+  // 受信側の同期の問題ではない（X-054）。
+  const pairGapsMs: number[] = [];
+  for (const unit of run.sentVideo) {
+    const key = nearestAudio(run.sentAudio, unit.captureUs);
+    if (key !== null && Math.abs(key - unit.captureUs) <= audioPairWindowUs) {
+      pairGapsMs.push(Math.trunc((unit.captureUs - key) / 1000));
+    }
+  }
+  const sortedGaps = [...pairGapsMs].sort((a, b) => a - b);
+  const pairGap = {
+    count: sortedGaps.length,
+    medianMs: sortedGaps.length === 0 ? 0 : sortedGaps[Math.trunc(sortedGaps.length / 2)] ?? 0,
+    maxMs: sortedGaps.length === 0 ? 0 : sortedGaps[sortedGaps.length - 1] ?? 0,
+  };
+
   return {
     record: {
       sent,
@@ -689,5 +719,6 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     decodeOrderInversions,
     decoderFailures: run.decoderFailures ?? 0,
     d1Summary,
+    pairGap,
   };
 }

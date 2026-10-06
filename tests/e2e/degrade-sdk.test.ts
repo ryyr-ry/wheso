@@ -585,6 +585,10 @@ for (const profile of IMPAIRMENT_PROFILES) {
         // 割合を見ることで、ずれが「一部の外れ値」か「全体の偏り」かが分かる。
         ` / D-1分布 対 ${String(built.d1Summary.pairs)} 中央 ${String(built.d1Summary.medianMs)}ms` +
         ` p99 ${String(built.d1Summary.p99Ms)}ms 帯外 ${String(built.d1Summary.outOfBand)}` +
+        // **送信側の対の時間差。** 正しく対になっていれば ±半フレームに収まる。
+        // 収まっていなければ、ずれは送信側の対（A/V の取り違え）であり、受信側の
+        // 同期の問題ではない（X-054: 数の並びを作ってから原因を言う）。
+        ` / 対の差 中央 ${String(built.pairGap.medianMs)}ms 最大 ${String(built.pairGap.maxMs)}ms（${String(built.pairGap.count)} 組）` +
         // **復号遅延の分布。** D-1 のずれがこれを超えていたら、原因は同期の判断では
         // なく復号が遅いことである（門は直近の遅延で発火を早めるが、変動には追えない）。
         ` / 復号遅延 中央 ${String(receiver.decodeLatency.medianMs)}ms` +
