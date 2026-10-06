@@ -180,6 +180,13 @@ test("**参照連鎖が切れた回数を数える**（判定 E-1 の許容の�
   assert.equal(buildDegradeRecord({ ...run, arrived: arrived2 }).chainBreaks, 0, "破棄可能は数えない");
 });
 
+test("**復号器の失敗回数は判定 E-1 の許容に渡る**（ADR-0047）", () => {
+  const run = baseRun(10);
+  assert.equal(buildDegradeRecord(run).decoderFailures, 0, "失敗が無ければ 0");
+  const built = buildDegradeRecord({ ...run, decoderFailures: 4 });
+  assert.equal(built.decoderFailures, 4, "観測の失敗回数が判定の許容へ渡る");
+});
+
 test("**暖機は内容で切る**（提示できた最初のフレームより前を捨てる）", () => {
   const run = baseRun(10);
   // 最初の 3 枚は経路が整う前で、届かず提示もされなかったことにする。

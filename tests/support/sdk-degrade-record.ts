@@ -105,6 +105,14 @@ export interface ObservedRun {
    * 復号器へ渡っていなくても参照は有効）。
    */
   readonly trimmedDecodedKey?: boolean;
+  /**
+   * 復号器の失敗の回数（実物の復号器の error を包んだ観測）。
+   *
+   * 復号の失敗は参照連鎖の切断が復号器へ届いた実測である（ADR-0047）。失敗後の
+   * キーフレーム要求は規範どおりの挙動であるため、判定 E-1 の許容にこの回数を加える。
+   * `merge` が受信側の `decoderIo.failed` から渡す。無ければ許容は従来どおり。
+   */
+  readonly decoderFailures?: number;
 }
 
 /**
@@ -269,6 +277,13 @@ export interface BuiltRecord {
    * 発火順が取得時刻順と入れ替わるときである。これが後戻りの源になる。
    */
   readonly decodeOrderInversions: number;
+  /**
+   * 復号器の失敗の回数（`ObservedRun.decoderFailures` の写し）。
+   *
+   * 判定 E-1 の許容（参照連鎖の切断による要求）に加える。復号の失敗は切断が復号器へ
+   * 届いた実測であり（ADR-0047）、失敗後の要求は規範どおりである。
+   */
+  readonly decoderFailures: number;
 }
 
 /**
@@ -633,5 +648,6 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     d1Debug,
     decodeRegressions,
     decodeOrderInversions,
+    decoderFailures: run.decoderFailures ?? 0,
   };
 }

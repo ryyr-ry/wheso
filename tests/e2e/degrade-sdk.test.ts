@@ -355,6 +355,7 @@ function merge(sender: ParticipantView, receiver: ParticipantView): ObservedRun 
     sentVideo: sender.run.sentVideo,
     sentAudio: sender.run.sentAudio,
     lastSentAtMs: sender.run.lastSentAtMs,
+    decoderFailures: receiver.decoderIo.failed,
     // **窓は早く閉じた側で閉じる。**
     //
     // 参加者はそれぞれ別のブラウザで、起こす順に少しずれて始まる。したがって窓を閉じる
@@ -595,11 +596,13 @@ for (const profile of IMPAIRMENT_PROFILES) {
       requireComplete: profile.id === "N-0",
       // 段を上げた回数だけキーフレーム要求を許す（受入条件 4.5 の例外）。
       // 遮断のある段は復帰のたびにも許される。
-      // 段を上げた回数、遮断からの復帰、**参照連鎖が切れた回数**だけ許す
-      // （受入条件 4.5 の例外と規範 1.4。ADR-0046）。連鎖が切れたら要求するのが規範である。
+      // 段を上げた回数、遮断からの復帰、**参照連鎖が切れた回数**、**復号器の失敗の回数**だけ
+      // 許す（受入条件 4.5 の例外と規範 1.4。ADR-0046）。連鎖が切れたら要求するのが規範であり、
+      // 復号の失敗は切断が復号器へ届いた実測である（ADR-0047）。失敗後の要求は規範どおりである。
       allowedKeyframeRequests:
         built.switches.filter((entry) => entry.up).length +
         built.chainBreaks +
+        built.decoderFailures +
         (profile.outage === undefined ? 0 : Math.trunc(seconds / profile.outage.everySec) + 1),
     });
     assert.deepEqual(
