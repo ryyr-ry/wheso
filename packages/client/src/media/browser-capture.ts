@@ -117,9 +117,25 @@ interface VideoEncoderEntry {
 export function browserCaptureDeps(): CaptureDeps {
   const videoEncoders = new Map<number, VideoEncoderEntry>();
   let output: CaptureOutput | null = null;
-  // 映像と音声で別の原点を 1 つのエポックへ揃える（F-052）。
-  const videoClock = makeEpochClock();
-  const audioClock = makeEpochClock();
+  /**
+   * 映像と音声に**共通の原点**（F-052、ADR-0057）。
+   *
+   * A/V 同期に必要なのは「映像と音声の相対的な取得時刻」であり、絶対時刻の正確さでは
+   * ない。原点を 1 つの clock に集約すれば、相対関係の誤差は「両トラックの開始時刻の
+   * ずれ」だけになる。チャネルごとに独立の原点を作ると、「最初のフレームの読み出しの
+   * 待ち時間」（映像のフレームは生成から読み出しまで数十〜数百ミリ秒溜まり得る。
+   * Chromium の偽カメラでは実測で中央 300 ms 超）がそのまま原点差となり、
+   * 受信側の A/V 同期が壊れる（実測: 段 D の N-0 で音声が先行する中央
+   * 318〜464 ms。復号遅延の中央 70 ms では説明できない残りであった）。
+   *
+   * clock は「timestamp の差」だけを使う。読み出しの実時刻は原点の作成に 1 度だけ
+   * 使う（両チャネルで同時に観測しているわけではないため、トラック開始のずれの
+   * ぶんの誤差は残る。それは数ミリ秒〜数十ミリ秒であり、読み出しの待ち時間より
+   * 1 桁小さい）。
+   */
+  const sharedClock = makeEpochClock();
+  const videoClock = sharedClock;
+  const audioClock = sharedClock;
   /**
    * 符号化前のフレームの `timestamp` → エポック換算した取得時刻（マイクロ秒）。
    *
@@ -128,11 +144,7 @@ export function browserCaptureDeps(): CaptureDeps {
    * `VideoEncoder` の出力は非同期であり、最初のフレーム（キーフレーム）の符号化には
    * 数百ミリ秒かかる（AV1）。符号化の出力時点で原点を作ると、そこには「最初の
    * フレームの符号化遅延」が丸ごと入り、2 枚目以降の換算値は実際の取得時刻より
-   * **符号化遅延ぶん未来**へずれる。音声の符号化は数十ミリ秒で済むため、映像の
-   * 換算時刻だけが未来へずれ、受信側では映像がそれだけ遅く提示される。これは
-   * 「音声が先行する」ずれとして観測され、規範の許容（22 ms）を超える
-   * （実測: 段 D の N-0 で p99 107〜462 ms。AV1 の最初のキーフレームの符号化遅延に
-   * 一致する大きさであった）。読み出しの時点で換算を作れば符号化遅延は入らない。
+   * **符号化遅延ぶん未来**へずれる。読み出しの時点で換算を作れば符号化遅延は入らない。
    *
    * 同一 timestamp からは複数の符号化器（simulcast の段）が別々の時刻に出すため、
    * 値は写像（timestamp → 換算値）で渡す。直近のものだけ残せば十分である
