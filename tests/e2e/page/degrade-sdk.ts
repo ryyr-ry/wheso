@@ -184,6 +184,13 @@ export interface SdkDegradeParticipant {
     readonly failed: number;
     readonly messages: readonly string[];
   };
+  /** 復号遅延の分布（D-1 の原因の切り分け。X-054）。 */
+  readonly decodeLatency: {
+    readonly count: number;
+    readonly medianMs: number;
+    readonly p99Ms: number;
+    readonly maxMs: number;
+  };
   /** この参加者のページで観測した閉鎖の理由。 */
   readonly closeNotes: readonly CloseNote[];
   /** この参加者のページの記録（誤りの通知など）。 */
@@ -237,6 +244,13 @@ interface CloseNote {
 }
 
 const closeNotes: CloseNote[] = [];
+
+/**
+ * 復号遅延の標本（ミリ秒）。D-1 の原因の切り分けに使う（X-054）。
+ * 提示の門は「presentAtMs − 直近の復号遅延」で発火するため、予測が外れた
+ * ぶんがそのまま A/V のずれになる。遅い環境ではどの同期機構も許容を満たせない。
+ */
+const decodeLatencies: number[] = [];
 
 /**
  * 実際の復号器の出入り（観測）。
@@ -370,6 +384,20 @@ let hashContext: OffscreenCanvasRenderingContext2D | null = null;
  * 取得時刻は源のものであり全員に共通であるから、取得時刻から決める。4 枚に 1 枚で足りる
  * （1 枚でも違えば転送か復号が壊れている）。
  */
+/**
+ * 標本の順位（整数演算のみ。`jitterP99Ms` と同じ式）。
+ * 空の列には 0 を返す。
+ */
+function percentile(samples: readonly number[], percent: number): number {
+  if (samples.length === 0) {
+    return 0;
+  }
+  const sorted = [...samples].sort((a, b) => a - b);
+  const index = Math.trunc((percent * sorted.length + 99) / 100) - 1;
+  const clamped = index < 0 ? 0 : index >= sorted.length ? sorted.length - 1 : index;
+  return sorted[clamped] ?? 0;
+}
+
 function shouldHash(captureUs: number): boolean {
   // **4 枚に 1 枚だけ照合する。** 画素の読み戻しは高価であり、毎枚行うと頁の主筋が
   // 詰まる（実測: 音声の再生が 875 ms 途切れた）。選ぶ基準は取得時刻であるから、
@@ -454,6 +482,13 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
           void senderId;
           recorder.audioIo.played += 1;
           recorder.playedAudio.push({ captureUs, atMs });
+        },
+        // **復号遅延の標本（D-1 の原因の切り分け）。** 分布を出すことで、ずれが
+        // 「同期の判断の誤り」か「復号が遅い環境」かを分ける（X-054）。
+        onDecodeLatency: (latencyMs): void => {
+          if (decodeLatencies.length < 2000) {
+            decodeLatencies.push(latencyMs);
+          }
         },
         onFrame: (senderId, frame): void => {
           const timestamp = Reflect.get(Object(frame), "timestamp");
@@ -734,6 +769,14 @@ function snapshot(joined: Joined): SdkDegradeParticipant {
     encodedAudioCount: recorder.encodedAudioCount,
     decoderEvents: { ...recorder.decoderEvents },
     decoderIo: { ...decoderIo, messages: [...decoderMessages] },
+    // 復号遅延の分布（p50 / p99 / 最大。ミリ秒）。D-1 の残りのずれがここを
+    // 超えていたら、ずれの原因は同期ではなく復号が遅いことである。
+    decodeLatency: {
+      count: decodeLatencies.length,
+      medianMs: percentile(decodeLatencies, 50),
+      p99Ms: percentile(decodeLatencies, 99),
+      maxMs: decodeLatencies.length === 0 ? 0 : Math.max(...decodeLatencies),
+    },
     audioIo: { ...joined.recorder.audioIo },
     audioArrived: recorder.audioArrived,
     audioArrivedCaptureUs: [...recorder.audioArrivedCaptureUs],
@@ -765,6 +808,7 @@ const EMPTY: SdkDegradeParticipant = {
   encodedAudioCount: 0,
   decoderEvents: { configure: 0, reset: 0, close: 0, error: 0 },
   decoderIo: { created: 0, configured: 0, submitted: 0, output: 0, failed: 0, messages: [] },
+  decodeLatency: { count: 0, medianMs: 0, p99Ms: 0, maxMs: 0 },
   audioIo: { submitted: 0, played: 0 },
   audioArrived: 0,
   audioArrivedCaptureUs: [],

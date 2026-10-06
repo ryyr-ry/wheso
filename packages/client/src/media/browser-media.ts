@@ -39,6 +39,15 @@ export interface BrowserMediaOptions {
    * 報じた。SDK 自身の観測は 129 ms であった）。振る舞いは変えない。
    */
   readonly onAudioScheduled: (senderId: number, captureUs: number, atMs: number) => void;
+  /**
+   * 映像 1 枚の復号遅延（ミリ秒）を伝える観測（D-1 の原因の切り分け）。
+   *
+   * 提示の門は「presentAtMs − 直近の復号遅延」で発火する（ADR-0042 の gate-early）。
+   * 予測が当たらなかったぶんはそのまま A/V のずれになる。遅延の分布（p50 / p99）を
+   * 走行ごとに出すことで、「ずれが同期の判断の誤りか、復号が遅い環境か」を分けられる
+   * （X-054: 数の並びを作ってから原因を言う）。振る舞いは変えない。
+   */
+  readonly onDecodeLatency?: ((latencyMs: number) => void) | undefined;
 }
 
 /** 復号器 1 個ぶんの記録。 */
@@ -222,6 +231,10 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
                 // 復号遅延は数フレームのスパンで滑らかに変化するため、
                 // 1 枠前の値は次枠の良く当たる予測である。
                 videoDecodeLatencyMs = latency;
+                // 観測へ伝える（振る舞いは変えない）。
+                if (options.onDecodeLatency !== undefined) {
+                  options.onDecodeLatency(latency);
+                }
               }
             }
           }

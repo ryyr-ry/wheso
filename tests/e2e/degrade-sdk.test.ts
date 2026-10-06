@@ -218,6 +218,13 @@ interface ParticipantView {
     readonly output: number;
     readonly failed: number;
   };
+  /** 復号遅延の分布（D-1 の原因の切り分け。X-054）。 */
+  readonly decodeLatency: {
+    readonly count: number;
+    readonly medianMs: number;
+    readonly p99Ms: number;
+    readonly maxMs: number;
+  };
   readonly uplinkBps: number;
   readonly downlinkBps: number;
   readonly participantCount: number;
@@ -298,6 +305,12 @@ function readParticipant(value: unknown): ParticipantView {
       submitted: num(asRecord(record["decoderIo"])["submitted"]),
       output: num(asRecord(record["decoderIo"])["output"]),
       failed: num(asRecord(record["decoderIo"])["failed"]),
+    },
+    decodeLatency: {
+      count: num(asRecord(record["decodeLatency"])["count"]),
+      medianMs: num(asRecord(record["decodeLatency"])["medianMs"]),
+      p99Ms: num(asRecord(record["decodeLatency"])["p99Ms"]),
+      maxMs: num(asRecord(record["decodeLatency"])["maxMs"]),
     },
     uplinkBps: num(record["uplinkBps"]),
     downlinkBps: num(record["downlinkBps"]),
@@ -572,6 +585,10 @@ for (const profile of IMPAIRMENT_PROFILES) {
         // 割合を見ることで、ずれが「一部の外れ値」か「全体の偏り」かが分かる。
         ` / D-1分布 対 ${String(built.d1Summary.pairs)} 中央 ${String(built.d1Summary.medianMs)}ms` +
         ` p99 ${String(built.d1Summary.p99Ms)}ms 帯外 ${String(built.d1Summary.outOfBand)}` +
+        // **復号遅延の分布。** D-1 のずれがこれを超えていたら、原因は同期の判断では
+        // なく復号が遅いことである（門は直近の遅延で発火を早めるが、変動には追えない）。
+        ` / 復号遅延 中央 ${String(receiver.decodeLatency.medianMs)}ms` +
+        ` p99 ${String(receiver.decodeLatency.p99Ms)}ms 最大 ${String(receiver.decodeLatency.maxMs)}ms` +
         // **要求がいつ起きたか**。購読確立の直後（暖機）なら除外されるが、定常で起きる
         // 要求は連番の飛び（missed）か復号の失敗の後である。時刻を見ると原因の層が分かる。
         ` / 要求時刻 ${(() => {

@@ -125,6 +125,14 @@ export interface FrameOutput {
    * しかなく、外から観測できないため、ここで出す。
    */
   readonly onAudioScheduled: (senderId: number, captureUs: number, atMs: number) => void;
+  /**
+   * 映像 1 枚の復号遅延（ミリ秒）。**観測のみ**で振る舞いは変えない。
+   *
+   * D-1（A/V 同期）の残りのずれは「提示の門の発火予測（直近の復号遅延）が
+   * 外れたぶん」であり、復号が遅い環境ではどの同期機構も許容を満たせない。
+   * 分布を出すことで「同期の判断の誤り」と「復号が遅い環境」を分ける。
+   */
+  readonly onDecodeLatency?: ((latencyMs: number) => void) | undefined;
   /** 受け皿の寸法が変わった。受信部屋へ申告する。 */
   readonly onDisplaySize: (participantId: string, width: number, height: number) => void;
 }
@@ -327,6 +335,7 @@ export function browserDeps(capability: DeviceCapability, source: SourceSpec): J
       onFrame: (senderId, frame) => bound?.onFrame(senderId, frame),
       onDecodeError: (senderId, channel) => bound?.onDecodeError(senderId, channel),
       onAudioScheduled: (senderId, captureUs, atMs) => bound?.onAudioScheduled(senderId, captureUs, atMs),
+      onDecodeLatency: (latencyMs) => bound?.onDecodeLatency?.(latencyMs),
     }),
     capture: browserCaptureDeps(),
     createSink: (participantId) =>
