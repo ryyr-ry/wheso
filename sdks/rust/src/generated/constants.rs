@@ -130,6 +130,7 @@ pub const AV_SKEW_AUDIO_LEAD_MAX_MS: i64 = 22;
 pub const AV_SKEW_AUDIO_LAG_MAX_MS: i64 = 30;
 pub const AV_DRIFT_STEP_US: i64 = 20;
 pub const AV_RESYNC_GAP_MS: i64 = 1000;
+pub const AV_LAG_REFINE_STREAK: i64 = 10;
 
 // timeouts
 pub const NODE_CONNECT_TIMEOUT_MS: i64 = 5000;

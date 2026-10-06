@@ -130,6 +130,7 @@ public enum WhesoConstants {
     public static let AV_SKEW_AUDIO_LAG_MAX_MS: Int64 = 30
     public static let AV_DRIFT_STEP_US: Int64 = 20
     public static let AV_RESYNC_GAP_MS: Int64 = 1000
+    public static let AV_LAG_REFINE_STREAK: Int64 = 10
 
     // timeouts
     public static let NODE_CONNECT_TIMEOUT_MS: Int64 = 5000

@@ -197,6 +197,8 @@ export const AV_SKEW_AUDIO_LAG_MAX_MS = 30;
 export const AV_DRIFT_STEP_US = 20;
 /** これを超える欠落は不連続として扱い、対応付けを作り直す。映像のジッタバッファの最大深度（VIDEO_JITTER_MAX_FRAMES 10 / 60 fps = 167 ms）の 6 倍を超える欠落は、回線の揺れでは説明できない。ADR-0028 */
 export const AV_RESYNC_GAP_MS = 1000;
+/** 音声の到着が写像の位置より遅れた観測の連続回数の閾値（ADR-0057）。VIDEO_JITTER_MAX_FRAMES と同じ 10。一時的な停滞はジッタバッファの深さを超えて続かないため、10 標本（20 ms × 10 = 200 ms）を超える遅れは恒常的と読む。ADR-0057 */
+export const AV_LAG_REFINE_STREAK = 10;
 
 /* timeouts */
 /** DO 間接続の実測 438ms の 10 倍以上。根拠 F-016 */

@@ -637,7 +637,16 @@ test("SDK 経由 N-8: 劣化した購読者が健全な購読者を壊さない"
   const healthyBase = `http://127.0.0.1:${String(bridgeA.port)}`;
   const impairedBase = `http://127.0.0.1:${String(bridgeB.port)}`;
   // 劣化させるのは受信者 B のポートだけである。送信者と受信者 A には何も掛けない。
-  const driver = driveProfile("N-6", seconds, bridgeB);
+  //
+  // **遮断（N-5）で劣化させる。** かつては N-6（50→1 Mbps への帯域降下）を使ったが、
+  // 器の映像は 360p15 の 1 段（約 250 kbps）であり、1 Mbps には 4 倍の余裕があるため
+  // **劣化の影響が一切現れない**（実測 2 回とも「届 = 判定対象・切替 0」で
+  // 「劣化側に劣化の影響が現れている」の検証に落ちた）。遮断は帯域に関係なく
+  // 経路を止めるため、1 段のはしごでも確実に影響が出る。N-8 の主目的は
+  // 「劣化した 1 人が健全な他者を壊さないこと」であり、劣化の形は問わない
+  // （受入条件 3.2 の N-8 の定義は「N-1 から N-7 を別々に適用」であり、
+  // どのプロファイルで隔離を試すかは実装の裁量である）。
+  const driver = driveProfile("N-5", seconds, bridgeB);
   let views: readonly ParticipantView[];
   try {
     views = await runParticipants(
@@ -714,7 +723,9 @@ test("SDK 経由 N-8: 劣化した購読者が健全な購読者を壊さない"
     maxGapMs: IMPAIRMENT_MAX_GAP_MS,
     requireComplete: false,
     allowedKeyframeRequests:
-      healthyBuilt.switches.filter((entry) => entry.up).length + healthyBuilt.chainBreaks,
+      healthyBuilt.switches.filter((entry) => entry.up).length +
+      healthyBuilt.chainBreaks +
+      healthyBuilt.decoderFailures,
   });
   assert.deepEqual(
     violations.map((entry) => `${entry.judgement}: ${entry.detail}`),

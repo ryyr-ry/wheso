@@ -11,11 +11,11 @@
  * チャネルごとに最初のフレームで差を求め、以後はそれを足す。こうすると
  * **フレーム間の間隔は符号化器の時刻のまま保たれ**、原点だけがエポックに揃う。
  */
-function makeEpochClock(): (timestampUs: number) => number {
+function makeEpochClock(): (timestampUs: number, arrivalMs: number) => number {
   let offsetUs: number | null = null;
-  return (timestampUs: number): number => {
+  return (timestampUs: number, arrivalMs: number): number => {
     if (offsetUs === null) {
-      offsetUs = Date.now() * 1000 - timestampUs;
+      offsetUs = arrivalMs * 1000 - timestampUs;
     }
     return timestampUs + offsetUs;
   };
@@ -120,6 +120,29 @@ export function browserCaptureDeps(): CaptureDeps {
   // 映像と音声で別の原点を 1 つのエポックへ揃える（F-052）。
   const videoClock = makeEpochClock();
   const audioClock = makeEpochClock();
+  /**
+   * 符号化前のフレームの `timestamp` → エポック換算した取得時刻（マイクロ秒）。
+   *
+   * **原点は「取得の読み出し」で測る。符号化の出力で測ってはならない。**
+   *
+   * `VideoEncoder` の出力は非同期であり、最初のフレーム（キーフレーム）の符号化には
+   * 数百ミリ秒かかる（AV1）。符号化の出力時点で原点を作ると、そこには「最初の
+   * フレームの符号化遅延」が丸ごと入り、2 枚目以降の換算値は実際の取得時刻より
+   * **符号化遅延ぶん未来**へずれる。音声の符号化は数十ミリ秒で済むため、映像の
+   * 換算時刻だけが未来へずれ、受信側では映像がそれだけ遅く提示される。これは
+   * 「音声が先行する」ずれとして観測され、規範の許容（22 ms）を超える
+   * （実測: 段 D の N-0 で p99 107〜462 ms。AV1 の最初のキーフレームの符号化遅延に
+   * 一致する大きさであった）。読み出しの時点で換算を作れば符号化遅延は入らない。
+   *
+   * 同一 timestamp からは複数の符号化器（simulcast の段）が別々の時刻に出すため、
+   * 値は写像（timestamp → 換算値）で渡す。直近のものだけ残せば十分である
+   * （符号化器の出力は遅れても 1 秒以内に届く。上限を超えた古い側から捨てる）。
+   */
+  const videoCaptureUs = new Map<number, number>();
+  const VIDEO_CAPTURE_MAP_LIMIT = 64;
+  /** 音声の「符号化前の timestamp → 換算した取得時刻」。映像と同じ理由で要る。 */
+  const audioCaptureUs = new Map<number, number>();
+  const AUDIO_CAPTURE_MAP_LIMIT = 64;
   let audioEncoder: unknown = null;
   let videoEnabled = true;
   let audioEnabled = true;
@@ -151,12 +174,15 @@ export function browserCaptureDeps(): CaptureDeps {
     // **`{...chunk}` で読んではならない。** 分配は自分自身の列挙可能な欄しか写さないため、
     // プロトタイプ上のゲッター（`type`）が失われ、キーフレームの判定が常に false になる。
     const type = typeof chunk === "object" && chunk !== null ? Reflect.get(chunk, "type") : undefined;
+    // 取得時刻は「読み出し」で換算した値を使う。符号化の出力時刻ではない
+    //（`videoCaptureUs` の注記。符号化遅延が入ると A/V 同期が壊れる）。
+    const mapped = timestamp === null ? undefined : videoCaptureUs.get(timestamp);
     output.onVideo({
       spatialId,
       temporalId: temporalIdFrom(metadata),
       temporalLayers: entry.temporalLayers,
       isKey: type === "key",
-      captureTimestampUs: BigInt(videoClock(timestamp ?? 0)),
+      captureTimestampUs: BigInt(mapped ?? timestamp ?? 0),
       payload,
     });
   }
@@ -311,8 +337,10 @@ export function browserCaptureDeps(): CaptureDeps {
               return;
             }
             const timestamp = readNumber(chunk, "timestamp");
+            // 取得時刻は「読み出し」で換算した値を使う（`audioCaptureUs` の注記）。
+            const mapped = timestamp === null ? undefined : audioCaptureUs.get(timestamp);
             output.onAudio({
-              captureTimestampUs: BigInt(audioClock(timestamp ?? 0)),
+              captureTimestampUs: BigInt(mapped ?? timestamp ?? 0),
               // DTX の判定は符号化器の出力の大きさでは決められない。無音の印は
               // 取得側が付けるべきものであり、ここでは常に false とする。
               silent: false,
@@ -399,6 +427,13 @@ export function browserCaptureDeps(): CaptureDeps {
       closeFrame(frame);
       return;
     }
+    // **取得時刻はこの瞬間に換算する。** 符号化の出力は非同期であり、出力の側で
+    // 原点を作ると「最初のフレームの符号化遅延」（AV1 のキーフレームで数百 ms）が
+    // 換算値に入り、A/V 同期が壊れる（`videoCaptureUs` の注記）。
+    const timestamp = readNumber(frame, "timestamp");
+    if (timestamp !== null) {
+      rememberCapture(videoCaptureUs, timestamp, videoClock(timestamp, Date.now()), VIDEO_CAPTURE_MAP_LIMIT);
+    }
     for (const entry of videoEncoders.values()) {
       if (!dueForRung(entry.spatialId, entry.framerate)) {
         continue;
@@ -434,8 +469,25 @@ export function browserCaptureDeps(): CaptureDeps {
       closeFrame(data);
       return;
     }
+    // 映像と同じ理由で、取得時刻はこの瞬間に換算する（`audioCaptureUs` の注記）。
+    const timestamp = readNumber(data, "timestamp");
+    if (timestamp !== null) {
+      rememberCapture(audioCaptureUs, timestamp, audioClock(timestamp, Date.now()), AUDIO_CAPTURE_MAP_LIMIT);
+    }
     callMethod(audioEncoder, "encode", [data]);
     closeFrame(data);
+  }
+
+  /** 「符号化前の timestamp → 換算した取得時刻」を覚える。上限を超えた古い側から捨てる。 */
+  function rememberCapture(map: Map<number, number>, timestamp: number, captureUs: number, limit: number): void {
+    map.set(timestamp, captureUs);
+    while (map.size > limit) {
+      const oldest = map.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      map.delete(oldest.value);
+    }
   }
 
   /**

@@ -331,6 +331,11 @@
     "AV_RESYNC_GAP_MS": {
       "value": 1000,
       "derivation": "これを超える欠落は不連続として扱い、対応付けを作り直す。映像のジッタバッファの最大深度（VIDEO_JITTER_MAX_FRAMES 10 / 60 fps = 167 ms）の 6 倍を超える欠落は、回線の揺れでは説明できない。ADR-0028"
+    },
+    "AV_LAG_REFINE_STREAK": {
+      "value": 10,
+      "derivation": "音声の到着が写像の位置より遅れた観測の連続回数の閾値（ADR-0057）。VIDEO_JITTER_MAX_FRAMES と同じ 10。一時的な停滞はジッタバッファの深さを超えて続かないため、10 標本（20 ms × 10 = 200 ms）を超える遅れは恒常的と読む",
+      "adr": "ADR-0057"
     }
   },
   "timeouts": {

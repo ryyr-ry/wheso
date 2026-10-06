@@ -129,6 +129,7 @@ const int AV_SKEW_AUDIO_LEAD_MAX_MS = 22;
 const int AV_SKEW_AUDIO_LAG_MAX_MS = 30;
 const int AV_DRIFT_STEP_US = 20;
 const int AV_RESYNC_GAP_MS = 1000;
+const int AV_LAG_REFINE_STREAK = 10;
 
 // timeouts
 const int NODE_CONNECT_TIMEOUT_MS = 5000;

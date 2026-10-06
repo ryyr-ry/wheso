@@ -132,6 +132,13 @@ export async function buildNodeHello(
  *   3. `nodeHello` を送る
  *   4. `nodeHelloAck` を受けたら媒体の送出を許す
  *
+ * **`nodeHelloAck` にも時限を切る。** `socket()` の確立だけに時限を付けると、
+ * Ack が来ない接続が「確立済み」として残り、呼び出し側は二度とやり直さない
+ * ため、**その部屋の媒体が永久に上流へ流れない**（実測: 段 D の N-7 で
+ * ワイヤへ出た映像 1,320 枚に対し受信側への到着が 59 枚。`binaryIn` は増えるが
+ * `binaryOut` が 0 のまま 60 秒間一度も回復しなかった。CPU contention 下で
+ * `nodeHelloAck` が 5 秒以内に返らないとこの形になる）。
+ *
  * 失敗は Result で返す。例外を投げない。
  */
 export async function openNodeLink(options: OpenNodeLinkOptions): Promise<Result<NodeLink, NodeLinkError>> {
@@ -222,6 +229,43 @@ export async function openNodeLink(options: OpenNodeLinkOptions): Promise<Result
     // `socket()` は確立済みの WebSocket を返すことがある（F-016 の実測ではその形だった）。
     // その場合 `open` 事象は発火しないため、ここで送る。
     socket.send(hello.value);
+  }
+
+  // **`nodeHelloAck` が時限内に来なければ失敗として返す。**
+  //
+  // ok を返してしまうと、呼び出し側は「接続がある」と見なして二度と張り直さない。
+  // Ack が来ない状態では媒体は受け付けてもらえず（`droppedBeforeHello`）、制御だけが
+  // 届く。制御（subscribe）が届いても媒体が 1 件も流れないため、利用者には
+  // 「参加はできているのに映像だけ出ない」状態が**永久に**続く（実測: N-7 で
+  // 受信が 59/1,186 のまま回復しなかった）。
+  const acknowledged = await Promise.race([
+    new Promise<boolean>((resolve) => {
+      const watch = setInterval((): void => {
+        if (ready) {
+          clearInterval(watch);
+          resolve(true);
+        }
+      }, 10);
+      // 時限側が先に勝った場合の interval の後始末。放置すると timer が残り、
+      // isolate の記憶と CPU を食う（アラームの刻みが遅れる）。
+      setTimeout((): void => {
+        if (!ready) {
+          clearInterval(watch);
+        }
+      }, NODE_CONNECT_TIMEOUT_MS + 100);
+    }),
+    new Promise<null>((resolve) => {
+      setTimeout(() => resolve(null), NODE_CONNECT_TIMEOUT_MS);
+    }),
+  ]);
+  if (acknowledged === null) {
+    // 閉じないと `close` が呼び出し側へ伝わり、張り直しの起点になる。
+    try {
+      socket.close();
+    } catch {
+      // 既に閉じている場合がある。閉じた事象で onClose は既に伝わっている。
+    }
+    return err({ code: "E_NODE_LINK", detail: "nodeHelloAck が時限内に来なかった" });
   }
 
   return ok({

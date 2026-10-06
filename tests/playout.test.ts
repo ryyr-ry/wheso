@@ -27,9 +27,11 @@ import {
 } from "../packages/core/src/playout.ts";
 import {
   AV_DRIFT_STEP_US,
+  AV_LAG_REFINE_STREAK,
   AV_RESYNC_GAP_MS,
   AV_SKEW_AUDIO_LAG_MAX_MS,
   AV_SKEW_AUDIO_LEAD_MAX_MS,
+  AV_SKEW_TOLERANCE_MS,
 } from "../packages/core/src/generated/constants.ts";
 
 const SENDER = 7;
@@ -145,6 +147,54 @@ test("再接続と予備接続への切替は明示的に不連続とする", ()
   const rebuilt = noteAudio(state, SENDER, us(500), 2000, DEPTH);
   assert.equal(rebuilt.established, true);
   assert.equal(decidePresent(rebuilt.state, SENDER, us(500), 2000 + DEPTH).decision, "present");
+});
+
+test("**恒常的な到着の遅れへは寄せ直す**（ADR-0057。anchor を遅らせる）", () => {
+  // 到着が一様に遅い世界: 音声は 20 ms ごとに来るが、写像の位置より
+  // 常に 100 ms 遅れて届く。AV_LAG_REFINE_STREAK 標本続いたら寄せ直す。
+  let state = anchored();
+  const lagMs = 100;
+  for (let i = 1; i <= AV_LAG_REFINE_STREAK - 1; i += 1) {
+    // captureUs は 20ms ずつ進む。到着は mapped + lag。
+    const capture = us(i * 20);
+    const noted = noteAudio(state, SENDER, capture, 1000 + i * 20 + DEPTH - 20 + lagMs, DEPTH);
+    assert.equal(noted.established, false, `標本 ${String(i)} ではまだ動かさない`);
+    state = noted.state;
+  }
+  const before = state.clocks.find((clock) => clock.senderId === SENDER);
+  assert.ok(before !== undefined);
+  const capture = us(AV_LAG_REFINE_STREAK * 20);
+  const refined = noteAudio(
+    state,
+    SENDER,
+    capture,
+    1000 + AV_LAG_REFINE_STREAK * 20 + DEPTH - 20 + lagMs,
+    DEPTH,
+  );
+  assert.equal(refined.established, false, "寄せ直しは不連続として数えない");
+  const after = refined.state.clocks.find((clock) => clock.senderId === SENDER);
+  assert.ok(after !== undefined);
+  assert.ok(after.anchorLocalMs > before.anchorLocalMs, "anchor を遅らせる方向へ動く");
+  // 寄せ直しの後、同じ到着ペースなら遅れは消えている。
+  const mapped = mapToLocalMs(after, capture);
+  assert.ok(
+    1000 + AV_LAG_REFINE_STREAK * 20 + DEPTH + lagMs - mapped <= AV_SKEW_TOLERANCE_MS,
+    `寄せ直しの後、遅れは許容の内側に入る（実際 ${String(mapped)}）`,
+  );
+});
+
+test("一時的な停滞では anchor を動かさない（ADR-0057 の不感帯）", () => {
+  let state = anchored();
+  // 遅れが閾値より 1 標本で切れる（9 個遅れて 1 個許容内の周期）。
+  for (let i = 1; i <= AV_LAG_REFINE_STREAK * 2; i += 1) {
+    const capture = us(i * 20);
+    const lagging = i % AV_LAG_REFINE_STREAK !== 0;
+    const at = 1000 + i * 20 + DEPTH - 20 + (lagging ? 100 : 0);
+    state = noteAudio(state, SENDER, capture, at, DEPTH).state;
+  }
+  const after = state.clocks.find((clock) => clock.senderId === SENDER);
+  assert.ok(after !== undefined);
+  assert.equal(after.anchorLocalMs, 1000 + DEPTH, "anchor は一度も動いていない");
 });
 
 test("送信者の退出で記録が消える", () => {

@@ -134,6 +134,7 @@ inline constexpr std::int64_t AV_SKEW_AUDIO_LEAD_MAX_MS = 22;
 inline constexpr std::int64_t AV_SKEW_AUDIO_LAG_MAX_MS = 30;
 inline constexpr std::int64_t AV_DRIFT_STEP_US = 20;
 inline constexpr std::int64_t AV_RESYNC_GAP_MS = 1000;
+inline constexpr std::int64_t AV_LAG_REFINE_STREAK = 10;
 
 // timeouts
 inline constexpr std::int64_t NODE_CONNECT_TIMEOUT_MS = 5000;

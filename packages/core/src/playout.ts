@@ -22,6 +22,7 @@
 
 import {
   AV_DRIFT_STEP_US,
+  AV_LAG_REFINE_STREAK,
   AV_RESYNC_GAP_MS,
   AV_SKEW_AUDIO_LAG_MAX_MS,
   AV_SKEW_AUDIO_LEAD_MAX_MS,
@@ -40,6 +41,17 @@ const US_PER_MS = 1000;
  *
  * `anchor` はストリームの開始時と不連続の直後にだけ決める。以後は**局所の単調時計**で
  * 進むため、音声が届かなくても写像は進む。
+ *
+ * **恒常的な到着の遅れへは寄せ直す（ADR-0057）。**
+ *
+ * `lagStreak` は「この送信者の音声が、写像の再生位置より遅れて到着した」観測の
+ * 連続回数である。遅れが続く環境（実行機の負荷が高く到着が一様に遅い場合）では、
+ * 音声の再生位置が写像から離れて「現在」に張り付き、映像だけが写像どおりの
+ * 未来に提示され続けるため、**ずれが開き続ける**（実測: 段 D の N-0 で
+ * p99 462 ms。音声の到着間隔が一様に 100 ms 化した走行）。
+ * `lagStreak` が `AV_LAG_REFINE_STREAK` を超えたら、anchor を遅れているぶん
+ * だけ**遅らせる**方向へ寄せ直す。寄せた直後の映像は余分に捨てる（fps の低下
+ * として出る。キーフレームは捨てない。ADR-0056）。
  */
 export interface SenderClock {
   readonly senderId: number;
@@ -65,6 +77,11 @@ export interface SenderClock {
   readonly lastAudioLocalMs: number;
   /** 不連続で対応付けを作り直した回数。SLI として数える（ADR-0028 の帰結）。 */
   readonly resyncCount: number;
+  /**
+   * 音声の到着が写像の位置より遅れた観測の連続回数（ADR-0057）。
+   * 0 で切れる。寄せ直しの後に 0 に戻す。
+   */
+  readonly lagStreak: number;
 }
 
 export interface PlayoutState {
@@ -128,6 +145,7 @@ export function noteAudio(
         lastAudioCaptureUs: captureUs,
         lastAudioLocalMs: localNowMs,
         resyncCount: 0,
+        lagStreak: 0,
       }),
       established: true,
     };
@@ -155,8 +173,43 @@ export function noteAudio(
         lastAudioCaptureUs: captureUs,
         lastAudioLocalMs: localNowMs,
         resyncCount: existing.resyncCount + 1,
+        lagStreak: 0,
       }),
       established: true,
+    };
+  }
+
+  // **恒常的な到着の遅れへ寄せ直す（ADR-0057）。**
+  //
+  // 遅れ = localNow − M(capture)。この値が許容を超えて**続く**とき、音声の実際の
+  // 再生位置は写像から離れて「現在」に張り付く（スケジューラは過去の予約を
+  // 現在へ切り捨てる）。映像は写像どおりの未来に提示し続けるため、ずれは
+  // 開きっぱなしになる。寄せ直しは anchor を遅れているぶんだけ**遅らせる**。
+  // 方向が悪化するように見えるが、合わせる相手は「音声の実際の位置」であり
+  // （ADR-0028 の原則 1）、遅れが恒常的である以上、写像を保つ理由が無い。
+  //
+  // **1 標本では動かさない。** 一時的な停滞（数十ミリ秒の揺れ）で動かすと、
+  // 揚�れるたびに anchor が前後し、映像の提示が乱れる。連続回数の閾値は
+  // ジッタバッファの深さ（`VIDEO_JITTER_MAX_FRAMES` 標本）とする。
+  // 一時的な停滞はこの長さを超えて続かない。
+  const mappedMs = mapToLocalMs(existing, captureUs);
+  const lagMs = localNowMs - mappedMs;
+  const lagging = lagMs > AV_SKEW_TOLERANCE_MS;
+  const lagStreak = lagging ? existing.lagStreak + 1 : 0;
+  if (lagStreak >= AV_LAG_REFINE_STREAK) {
+    // anchor を遅れているぶんだけ遅らせる。取得時刻の基準はこの標本に
+    // 付け替える（両者を同時に動かすと写像の傾きが保たれない）。
+    return {
+      state: replace(state, {
+        ...existing,
+        anchorCaptureUs: captureUs,
+        anchorLocalMs: localNowMs + jitterDepthMs,
+        driftCorrectionUs: 0,
+        lastAudioCaptureUs: captureUs,
+        lastAudioLocalMs: localNowMs,
+        lagStreak: 0,
+      }),
+      established: false,
     };
   }
 
@@ -165,6 +218,7 @@ export function noteAudio(
       ...existing,
       lastAudioCaptureUs: captureUs,
       lastAudioLocalMs: localNowMs,
+      lagStreak,
     }),
     established: false,
   };

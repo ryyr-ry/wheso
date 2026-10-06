@@ -198,12 +198,26 @@ export function judgeContinuity(record: DegradeRecord, maxGapMs: number): readon
  * 依存構造が壊れた状態で描画したか、単発の欠落が起きたことを意味する。
  */
 /**
- * 判定 B-2: 落ちたフレームは破棄可能なものだけである。
+ * 判定 B-2: 捨てられたフレームは「破棄優先順位どおり」である。
  *
- * 破棄が許されるのは次の 2 つである。
- *   1. 最上位の時間層（時間スケーラビリティの上の層）
- *   2. 最上位の空間層（購読の上限が下がれば転送されない）
- * キーフレームと基底層が落ちていれば、依存構造が壊れた状態で描画したことを意味する。
+ * 規範（acceptance.md 4.2）は B-2 を次のとおり定める。
+ *
+ *   捨てられたフレームは全て DISCARDABLE=1 であるか、または同一 spatialId の
+ *   次のキーフレームまで連続して捨てられている。**単発の非 DISCARDABLE
+ *   フレーム欠落があれば不合格。**
+ *
+ * つまり非 DISCARDABLE の欠落も「次の KEY までの連続した山」であれば規範が
+ * 認める（wire-format.md 1.4 の連鎖。上流は順位 4・5 を捨てた後、次の KEY まで
+ * 捨て続け、キーフレームを要求する）。違反は次の 2 つだけである。
+ *
+ *   1. 山の途中（次の KEY が届く前）に非 KEY のフレームが**届いている**
+ *      → 連鎖を切ったまま渡した。復号器は参照の無いフレームを受け取る。
+ *   2. 山の後に KEY が一度も届かない → 参照連鎖の回復が永久に来ない。
+ *
+ * 以前の実装は「非破棄層の欠落をすべて違反に数えた」。これは規範より厳しく、
+ * 遮断（N-5）や帯域降下（N-2・N-6）で規範どおりに動く実装を違反と読んでいた
+ * （実測: N-3 で 465 件・N-7 で数百件の B-2 が並び、真の欠陥が見えなかった）。
+ * 判定は**空間層ごと**に行う（simulcast の段は独立した連番空間である）。
  */
 export function judgeDrops(record: DegradeRecord): readonly Violation[] {
   // 転送の欠落を見る。復号できたかは別の問題であり、混ぜると原因の層を取り違える。
@@ -217,26 +231,51 @@ export function judgeDrops(record: DegradeRecord): readonly Violation[] {
   const spatialIds = record.sent.map((entry) => entry.spatialId ?? 0);
   const highestSpatial = spatialIds.length === 0 ? 0 : Math.max(...spatialIds);
   const violations: Violation[] = [];
-  for (const entry of record.sent) {
-    if (arrived.has(entry.frameIndex)) {
-      continue;
+  for (const spatialId of new Set(spatialIds)) {
+    // この空間層の送信列（送った順）。判定は層ごとに行う。
+    const lane = record.sent.filter((entry) => (entry.spatialId ?? 0) === spatialId);
+    /** 山の途中である（次の KEY が届くまで、非破棄の欠落を違反にしない）。 */
+    let inGap = false;
+    let gapStart = -1;
+    for (const entry of lane) {
+      const isKey = entry.isKey;
+      if (arrived.has(entry.frameIndex)) {
+        if (inGap) {
+          if (!isKey) {
+            // 山の途中に非 KEY が届いた。連鎖が切れている。
+            violations.push({
+              judgement: "B-2",
+              detail:
+                `破棄できない層のフレーム ${String(gapStart)} が落ちた後、次のキーフレームより前に` +
+                ` ${String(entry.frameIndex)} が届いている（連鎖が切れている。空間層 ${String(spatialId)}）`,
+            });
+          }
+          // KEY が届いたなら連鎖どおりに回復している。違反にしない。
+          inGap = false;
+        }
+        continue;
+      }
+      // このフレームは届いていない。
+      const spatialOfEntry = entry.spatialId ?? 0;
+      // 最上位の空間層は購読の上限が下がれば転送されない。これは破棄として正しい。
+      if (spatialOfEntry >= highestSpatial && highestSpatial > 0) {
+        continue;
+      }
+      if (isKey || entry.temporalId < highestTemporal) {
+        // 非破棄の欠落。山を始める（山の中なら続ける）。
+        if (!inGap) {
+          inGap = true;
+          gapStart = entry.frameIndex;
+        }
+      }
     }
-    const spatialId = entry.spatialId ?? 0;
-    // 最上位の空間層は購読の上限が下がれば転送されない。これは破棄として正しい。
-    if (spatialId >= highestSpatial && highestSpatial > 0) {
-      continue;
-    }
-    if (entry.isKey) {
+    if (inGap) {
+      // 山のまま終わった。回復が来ていない。
       violations.push({
         judgement: "B-2",
-        detail: `キーフレーム ${String(entry.frameIndex)} が落ちた（空間層 ${String(spatialId)}）`,
-      });
-      continue;
-    }
-    if (entry.temporalId < highestTemporal) {
-      violations.push({
-        judgement: "B-2",
-        detail: `破棄できない層のフレーム ${String(entry.frameIndex)} が落ちた（空間層 ${String(spatialId)} / 時間層 ${String(entry.temporalId)}）`,
+        detail:
+          `破棄できない層のフレーム ${String(gapStart)} が落ちたまま、次のキーフレームが一度も` +
+          `届いていない（空間層 ${String(spatialId)}。回復していない）`,
       });
     }
   }

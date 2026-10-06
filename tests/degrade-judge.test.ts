@@ -252,6 +252,38 @@ test("B-2: 最上位の時間層の欠落は許す", () => {
   assert.deepEqual(violations, []);
 });
 
+test("B-2: 非破棄の欠落が次の KEY まで続く山なら規範が認める（acceptance.md 4.2）", () => {
+  // 規範は「同一 spatialId の次のキーフレームまで連続して捨てられている」ことを
+  // 合格と定める（wire-format.md 1.4 の連鎖）。遮断（N-5）や帯域降下（N-2・N-6）で
+  // 規範どおりに動く実装を違反に数えてはならない。
+  const base = healthyRecord(30);
+  // frameIndex 3〜9（非 KEY が続く区間）を山として落とし、frameIndex 10 を
+  // キーフレームとして届けて回復させる。
+  const keyAt = base.sent.findIndex((entry) => entry.frameIndex === 10);
+  assert.ok(keyAt !== undefined && keyAt >= 0);
+  const baseWithKey = {
+    ...base,
+    sent: base.sent.map((entry, index) => (index === keyAt ? { ...entry, isKey: true } : entry)),
+    received: base.received.map((entry, index) => (index === keyAt ? { ...entry, isKey: true } : entry)),
+  };
+  const dropped = new Set([3, 4, 5, 6, 7, 8, 9]);
+  const received = baseWithKey.received.filter((entry) => !dropped.has(entry.frameIndex));
+  const violations = judgeDrops({ ...baseWithKey, received });
+  assert.deepEqual(violations, []);
+});
+
+test("B-2: 山の途中で非 KEY が届いたら連鎖切れとして検出する", () => {
+  const base = healthyRecord(30);
+  // 3〜5 を落とし、4 の次（5 が落ちた位置の後）に非 KEY が届く。
+  // 3,4,5 を落として 6 が届く（非 KEY）→ 連鎖が切れている。
+  const dropped = new Set([3, 4, 5]);
+  const received = base.received.filter((entry) => !dropped.has(entry.frameIndex));
+  const violations = judgeDrops({ ...base, received });
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0]?.judgement, "B-2");
+  assert.ok(violations[0]?.detail.includes("連鎖"));
+});
+
 test("B-2: 基底層の欠落を検出する", () => {
   const base = healthyRecord(30);
   // 時間層 0（基底層）のうち 1 枚を落とす。依存構造が壊れるため違反である。

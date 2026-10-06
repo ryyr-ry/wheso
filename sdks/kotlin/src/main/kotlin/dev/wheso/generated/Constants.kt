@@ -130,6 +130,7 @@ public val AV_SKEW_AUDIO_LEAD_MAX_MS: Long = 22L
 public val AV_SKEW_AUDIO_LAG_MAX_MS: Long = 30L
 public val AV_DRIFT_STEP_US: Long = 20L
 public val AV_RESYNC_GAP_MS: Long = 1000L
+public val AV_LAG_REFINE_STREAK: Long = 10L
 
 // timeouts
 public val NODE_CONNECT_TIMEOUT_MS: Long = 5000L
