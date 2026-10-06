@@ -25,6 +25,8 @@ import type {
 import { ERROR_DEFINITIONS } from "../../packages/core/src/generated/errors.ts";
 import {
   AV_RESYNC_GAP_MS,
+  AV_SKEW_AUDIO_LAG_MAX_MS,
+  AV_SKEW_AUDIO_LEAD_MAX_MS,
   KEYFRAME_REQUEST_MIN_INTERVAL_MS,
 } from "../../packages/core/src/generated/constants.ts";
 
@@ -284,6 +286,21 @@ export interface BuiltRecord {
    * 届いた実測であり（ADR-0047）、失敗後の要求は規範どおりである。
    */
   readonly decoderFailures: number;
+  /**
+   * D-1 の実測分布の要約（観測）。skew = 提示 − 再生。正なら音声が先行。
+   *
+   * 違反の有無だけでは「どちら側に・どれだけの厚みで」ずれているか分からない。
+   * 許容の外の割合と p50 を出すことで、修正の効果を走行ごとに比べられる。
+   */
+  readonly d1Summary: {
+    readonly pairs: number;
+    /** 許容（先行 22 / 遅れ 30）の外にある対の数。 */
+    readonly outOfBand: number;
+    /** p50（ミリ秒。整数）。 */
+    readonly medianMs: number;
+    /** p99（ミリ秒。整数）。 */
+    readonly p99Ms: number;
+  };
 }
 
 /**
@@ -543,6 +560,14 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
 
   const playedAudio: DegradePlayedAudio[] = [];
   const d1Debug: string[] = [];
+  /**
+   * D-1 の実測分布（観測。skew = 提示 − 再生。正なら音声が先行）。
+   *
+   * 違反の有無だけでは「どちら側に・どれだけの厚みで」ずれているか分からない。
+   * 許容の外の対の割合と中央値を出すことで、修正の効果を走行ごとに比べられる
+   * （ADR-0057 の実測でもこの値を使う）。
+   */
+  const skewSamples: number[] = [];
   for (const frame of presentedVideo) {
     const audioKey = audioKeyByFrame.get(frame.frameIndex);
     if (audioKey === undefined) {
@@ -566,6 +591,7 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
       d1Debug.push(`f${String(frame.frameIndex)} key=${String(audioKey)} before=${String(before)}(${String(before > 0 ? audioKey - before : 0)}) after=${String(after)}(${String(after > 0 ? after - audioKey : 0)})`);
       continue;
     }
+    skewSamples.push(frame.atMs - atMs);
     playedAudio.push({ frameIndex: frame.frameIndex, atMs });
   }
 
@@ -621,6 +647,19 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     previousCapture = entry.captureUs;
   }
 
+  // D-1 の分布の要約（観測）。整数演算のみで p50 / p99 を求める。
+  const sortedSkews = [...skewSamples].sort((a, b) => a - b);
+  const rankOf = (percent: number): number => {
+    const index = Math.trunc((percent * sortedSkews.length + 99) / 100) - 1;
+    return index < 0 ? 0 : index >= sortedSkews.length ? sortedSkews.length - 1 : index;
+  };
+  const d1Summary = {
+    pairs: sortedSkews.length,
+    outOfBand: sortedSkews.filter((skew) => skew > AV_SKEW_AUDIO_LEAD_MAX_MS || -skew > AV_SKEW_AUDIO_LAG_MAX_MS).length,
+    medianMs: sortedSkews.length === 0 ? 0 : sortedSkews[Math.trunc(sortedSkews.length / 2)] ?? 0,
+    p99Ms: sortedSkews.length === 0 ? 0 : sortedSkews[rankOf(99)] ?? 0,
+  };
+
   return {
     record: {
       sent,
@@ -649,5 +688,6 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     decodeRegressions,
     decodeOrderInversions,
     decoderFailures: run.decoderFailures ?? 0,
+    d1Summary,
   };
 }

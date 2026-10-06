@@ -568,6 +568,10 @@ for (const profile of IMPAIRMENT_PROFILES) {
         // 取得時刻順と入れ替わった回数）を出す。B-1 の欠落が「経路」「破棄」「復号器」
         // 「後戻り」のどれかを分ける（X-054）。
         ` / 後戻り ${String(built.decodeRegressions)} 投入逆転 ${String(built.decodeOrderInversions)}` +
+        // **D-1 の実測分布（ADR-0057 の効果を走行ごとに比べる）。** 中央値と許容の外の
+        // 割合を見ることで、ずれが「一部の外れ値」か「全体の偏り」かが分かる。
+        ` / D-1分布 対 ${String(built.d1Summary.pairs)} 中央 ${String(built.d1Summary.medianMs)}ms` +
+        ` p99 ${String(built.d1Summary.p99Ms)}ms 帯外 ${String(built.d1Summary.outOfBand)}` +
         // **要求がいつ起きたか**。購読確立の直後（暖機）なら除外されるが、定常で起きる
         // 要求は連番の飛び（missed）か復号の失敗の後である。時刻を見ると原因の層が分かる。
         ` / 要求時刻 ${(() => {
