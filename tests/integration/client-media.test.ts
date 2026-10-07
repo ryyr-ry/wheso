@@ -547,16 +547,24 @@ test("実データが SDK 経由で 5 ノードを通り、1 バイトも変わ�
    * **枚数で切らずに「復号できた」で切る。** 1 枚目のキーフレームが購読の登録より前に
    * 送られて捨てられると、復号器はキーフレームを待ち続ける。復号側の要求
    * （`takeKeyframeRequest`）に応じ、応じても届かない場合に備えて定期的にも key を送る。
+   *
+   * **上限は時間である**（30 秒）。枚数で切ると、購読の登録が `nodeHelloAck` の時限
+   * （`NODE_CONNECT_TIMEOUT_MS` = 5 秒）より遅れた走行で暖機が尽きた後に**送るものが
+   * 無くなり**、復号が 1 枚も増えないまま判定の猶予を使い切る（実測: run 37565339373
+   * で A/V 同期の「20 組そろう」が 60 秒で不成立。同じ試験の別のケースで起き得る）。
    */
-  for (let index = 0; index < 90 && b.decoded.length === 0; index += 1) {
+  const warmupDeadline = Date.now() + 30_000;
+  let warmupIndex = 0;
+  while (b.decoded.length === 0 && Date.now() < warmupDeadline) {
     output.onVideo({
       spatialId: 0,
       temporalId: 0,
       temporalLayers: 3,
-      isKey: index % 8 === 0 || a.takeKeyframeRequest(),
+      isKey: warmupIndex % 8 === 0 || a.takeKeyframeRequest(),
       captureTimestampUs: BigInt(Date.now()) * 1000n,
       payload: new Uint8Array([0xaa, 0xbb, 0xcc]),
     });
+    warmupIndex += 1;
     await new Promise((resolve) => setTimeout(resolve, VIDEO_FRAME_INTERVAL_MS));
   }
   await waitFor(() => b.decoded.length > 0, 30_000, "暖機の映像が届く");
@@ -753,18 +761,23 @@ test("**A/V 同期が規範の許容に収まる**（判定 D-1 に実測を与�
   assert.ok(output !== null, "A の取得の出力が繋がっている");
 
   // 暖機。経路が整うまでの数枚は捨てられる（NodeLink が受理前の媒体を捨てる）。
-  // **復号できるまで送り続ける。** 枚数で切ると、1 枚目のキーフレームが購読の登録より
-  // 前に捨てられた場合に復号器がキーフレームを待ち続けて先へ進めない。
-  // 暖機の番号は 200 以上であり、判定からは除かれる。
-  for (let index = 0; index < 48 && b.decoded.length === 0; index += 1) {
+  // **復号できるまで送り続ける。** 枚数で切ると、購読の登録が `nodeHelloAck` の時限
+  //（`NODE_CONNECT_TIMEOUT_MS` = 5 秒）より遅れた走行で、暖機が枚数の上限で尽きた
+  // 後に**送るものが無くなり**、復号が 1 枚も増えないまま判定の猶予を使い切る
+  //（実測: 公開 CI run 37565339373 で「20 組そろう」が 60 秒で不成立）。
+  // 上限は**時間**であり、判定の番号（200 以上）は変えない。
+  const warmupDeadline = Date.now() + 30_000;
+  let warmupIndex = 0;
+  while (b.decoded.length === 0 && Date.now() < warmupDeadline) {
     output.onVideo({
       spatialId: 0,
       temporalId: 0,
       temporalLayers: 3,
-      isKey: index % 8 === 0 || a.takeKeyframeRequest(),
+      isKey: warmupIndex % 8 === 0 || a.takeKeyframeRequest(),
       captureTimestampUs: BigInt(Date.now()) * 1000n,
-      payload: new Uint8Array([200 + (index % 50), 0xee]),
+      payload: new Uint8Array([200 + (warmupIndex % 50), 0xee]),
     });
+    warmupIndex += 1;
     await new Promise((resolve) => setTimeout(resolve, VIDEO_FRAME_INTERVAL_MS));
   }
   await waitFor(() => b.decoded.length > 0, 30_000, "暖機の映像が届く");
@@ -772,7 +785,9 @@ test("**A/V 同期が規範の許容に収まる**（判定 D-1 に実測を与�
   // **音声の経路が整うまで待つ。** 音声と映像は別の部屋（`ar` と `vr`）を通り、
   // 購読の確立も別である。映像が先に整い、音声がまだ届いていない間に送った映像は
   // 「対応する音声が無い」となり D-1 の偽の違反になる。音声の最初の 1 件が届くまで待つ。
-  for (let index = 0; index < 24 && b.audioIn.length === 0; index += 1) {
+  // **上限は映像と同じく時間である**（枚数で切ると上の映像と同じ形で送るものが尽きる）。
+  const audioWarmupDeadline = Date.now() + 30_000;
+  while (b.audioIn.length === 0 && Date.now() < audioWarmupDeadline) {
     output.onAudio({
       captureTimestampUs: BigInt(Date.now()) * 1000n,
       silent: false,
