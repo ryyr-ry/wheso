@@ -26,12 +26,14 @@ import {
   type PlayoutState,
 } from "../packages/core/src/playout.ts";
 import {
+  AUDIO_JITTER_MAX_PACKETS,
   AV_DRIFT_STEP_US,
   AV_LAG_REFINE_STREAK,
   AV_RESYNC_GAP_MS,
   AV_SKEW_AUDIO_LAG_MAX_MS,
   AV_SKEW_AUDIO_LEAD_MAX_MS,
   AV_SKEW_TOLERANCE_MS,
+  OPUS_FRAME_MS,
 } from "../packages/core/src/generated/constants.ts";
 
 const SENDER = 7;
@@ -181,6 +183,61 @@ test("**恒常的な到着の遅れへは寄せ直す**（ADR-0057。anchor を�
     1000 + AV_LAG_REFINE_STREAK * 20 + DEPTH + lagMs - mapped <= AV_SKEW_TOLERANCE_MS,
     `寄せ直しの後、遅れは許容の内側に入る（実際 ${String(mapped)}）`,
   );
+});
+
+test("**溜まった音声の明け（M の未来）へも寄せ直す**（ADR-0057。両向き・非対称）", () => {
+  // 遮断の明け: 1 秒ぶんの音声が一気に届き、最初の標本で不連続の作り直しが
+  // 起きる。以後は「capture の刻み（40 ms 束ね）」より速い間隔で到着するため、
+  // M はどんどん未来へ出る。予約上限（160 ms）を超えて続いたら anchor を
+  // 「現在の位置」へ寄せ直し、以後の M は予約の帯に戻る。
+  let state = anchored();
+  // 1 秒の欠落の後、最初の標本で作り直し（localGap > AV_RESYNC_GAP_MS）。
+  state = noteAudio(state, SENDER, us(20 + 1020), 1000 + 20 + 1200, DEPTH).state;
+  // 以後は 40 ms 刻みの capture が 10 ms 間隔で届く（溜まった分の消化）。
+  let refinedCount = 0;
+  const leadLimitMs = AUDIO_JITTER_MAX_PACKETS * OPUS_FRAME_MS;
+  for (let i = 1; i <= AV_LAG_REFINE_STREAK * 3; i += 1) {
+    const capture = us(20 + 1020 + i * 40);
+    const nowMs = 1000 + 20 + 1200 + i * 10;
+    const before = state.clocks.find((clock) => clock.senderId === SENDER);
+    assert.ok(before !== undefined);
+    const result = noteAudio(state, SENDER, capture, nowMs, DEPTH);
+    state = result.state;
+    const after = state.clocks.find((clock) => clock.senderId === SENDER);
+    assert.ok(after !== undefined);
+    if (after.lagStreak === 0 && before.lagStreak === AV_LAG_REFINE_STREAK - 1) {
+      refinedCount += 1;
+    }
+  }
+  // 消化の間（M が予約上限を超えて開く）、閾値のたびに寄せ直しが起きている。
+  assert.ok(refinedCount >= 1, `閾値の標本で寄せ直す（実際 ${String(refinedCount)} 回）`);
+  // 寄せ直しの後、最後の標本の先行は予約の帯を超えていない。
+  const last = state.clocks.find((clock) => clock.senderId === SENDER);
+  assert.ok(last !== undefined);
+  const lastCapture = us(20 + 1020 + AV_LAG_REFINE_STREAK * 3 * 40);
+  const lastNow = 1000 + 20 + 1200 + AV_LAG_REFINE_STREAK * 3 * 10;
+  const lastLag = lastNow - mapToLocalMs(last, lastCapture);
+  assert.ok(
+    -lastLag <= leadLimitMs + AV_SKEW_TOLERANCE_MS,
+    `寄せ直しの後、M の先行は予約上限の内側に戻る（実際 lag=${String(lastLag)}）`,
+  );
+});
+
+test("正常な未来（ジッタ深度ぶんの予約）では anchor を動かさない（ADR-0057 の不感帯）", () => {
+  // anchor は「現在 + 深度」に置く。深度が tolerance を超えていても、M が
+  // 予約上限の内側にある限り実発音は M どおりである（ずれではない）。
+  let state = anchored();
+  const originalAnchor = state.clocks.find((clock) => clock.senderId === SENDER)?.anchorLocalMs;
+  // 遅れ・先行のどちらの帯にも入らない到着が続く。
+  for (let i = 1; i <= AV_LAG_REFINE_STREAK * 3; i += 1) {
+    const capture = us(20 + i * 20);
+    const nowMs = 1000 + i * 20;
+    state = noteAudio(state, SENDER, capture, nowMs, DEPTH).state;
+  }
+  const after = state.clocks.find((clock) => clock.senderId === SENDER);
+  assert.ok(after !== undefined);
+  assert.equal(after.anchorLocalMs, originalAnchor, "anchor は一度も動いていない");
+  assert.equal(after.lagStreak, 0);
 });
 
 test("一時的な停滞では anchor を動かさない（ADR-0057 の不感帯）", () => {

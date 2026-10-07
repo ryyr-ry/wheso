@@ -21,12 +21,14 @@
  */
 
 import {
+  AUDIO_JITTER_MAX_PACKETS,
   AV_DRIFT_STEP_US,
   AV_LAG_REFINE_STREAK,
   AV_RESYNC_GAP_MS,
   AV_SKEW_AUDIO_LAG_MAX_MS,
   AV_SKEW_AUDIO_LEAD_MAX_MS,
   AV_SKEW_TOLERANCE_MS,
+  OPUS_FRAME_MS,
 } from "./generated/constants.ts";
 
 /** マイクロ秒からミリ秒への換算。整数除算のみを使う。 */
@@ -179,25 +181,42 @@ export function noteAudio(
     };
   }
 
-  // **恒常的な到着の遅れへ寄せ直す（ADR-0057）。**
+  // **恒常的な「音声の実際の位置」へのずれへ寄せ直す（ADR-0057）。両向き・非対称。**
   //
-  // 遅れ = localNow − M(capture)。この値が許容を超えて**続く**とき、音声の実際の
-  // 再生位置は写像から離れて「現在」に張り付く（スケジューラは過去の予約を
-  // 現在へ切り捨てる）。映像は写像どおりの未来に提示し続けるため、ずれは
-  // 開きっぱなしになる。寄せ直しは anchor を遅れているぶんだけ**遅らせる**。
-  // 方向が悪化するように見えるが、合わせる相手は「音声の実際の位置」であり
-  // （ADR-0028 の原則 1）、遅れが恒常的である以上、写像を保つ理由が無い。
+  // ずれ = localNow − M(capture)。音声は M に予約されるため、M の位置と
+  // スケジューラが予約できる範囲の関係が判断の基準である。閾値は非対称である。
+  //
+  //   遅れ（正）: M が現在より `AV_SKEW_TOLERANCE_MS` 以上過去。
+  //   スケジューラは過去の予約を現在へ切り捨てるため、実発音は M から離れて
+  //   「現在」に張り付く（遅れて鳴る）。映像は写像どおりの未来に提示し続ける
+  //   ため、ずれは開きっぱなしになる。
+  //
+  //   先行（負）: M が現在より「予約上限」を超えて未来。上限は
+  //   `AUDIO_JITTER_MAX_PACKETS × OPUS_FRAME_MS`（スケジューラの予約上限と同じ
+  //   値）である。超えると予約は現在へ切り捨てられ、実発音は M から離れて
+  //   「現在」に張り付く（早く鳴る）。遮断や帯域降下の明けに、溜まっていた
+  //   過去の取得時刻の音声が一気に届くと、最初の標本の作り直しで anchor が
+  //   「溜まっていた量」ぶん未来を出す写像を作り、この状態が続く（実測:
+  //   音声の実発音が理論より中央 1.5 秒「早い」走行。D-1 は音声が先行）。
+  //
+  // どちらも「音声の実際の位置に映像を合わせる」（ADR-0028 の原則 1）ために
+  // anchor を寄せることで解消する。方向はずれの符号に従う。
+  //
+  // **正常な未来（遅れ・先行のどちらでも無い帯）では動かさない。**
+  // anchor は「現在 + ジッタ深度」に置く（ADR-0028 の 2）。深度ぶんの未来は
+  // 予約の正常な位置であり、ずれではない。深度が `AV_SKEW_TOLERANCE_MS` を
+  // 超えていても、M が予約上限の内側にある限り実発音は M どおりである。
   //
   // **1 標本では動かさない。** 一時的な停滞（数十ミリ秒の揺れ）で動かすと、
-  // 揚�れるたびに anchor が前後し、映像の提示が乱れる。連続回数の閾値は
-  // ジッタバッファの深さ（`VIDEO_JITTER_MAX_FRAMES` 標本）とする。
-  // 一時的な停滞はこの長さを超えて続かない。
+  // 揺れるたびに anchor が前後し、映像の提示が乱れる。連続回数の閾値は
+  // ジッタバッファの深さ（`AV_LAG_REFINE_STREAK` 標本）とする。
   const mappedMs = mapToLocalMs(existing, captureUs);
   const lagMs = localNowMs - mappedMs;
-  const lagging = lagMs > AV_SKEW_TOLERANCE_MS;
-  const lagStreak = lagging ? existing.lagStreak + 1 : 0;
+  const leadLimitMs = AUDIO_JITTER_MAX_PACKETS * OPUS_FRAME_MS;
+  const offMap = lagMs > AV_SKEW_TOLERANCE_MS || -lagMs > leadLimitMs;
+  const lagStreak = offMap ? existing.lagStreak + 1 : 0;
   if (lagStreak >= AV_LAG_REFINE_STREAK) {
-    // anchor を遅れているぶんだけ遅らせる。取得時刻の基準はこの標本に
+    // anchor をこの標本の実際の位置へ付け替える。取得時刻の基準もこの標本に
     // 付け替える（両者を同時に動かすと写像の傾きが保たれない）。
     return {
       state: replace(state, {
