@@ -66,6 +66,8 @@ export interface ObservedDecoded {
 export interface ObservedPlayedAudio {
   readonly captureUs: number;
   readonly atMs: number;
+  /** 理論上の再生時刻（`DecodeInput.presentAtMs`）。観測。無ければ undefined。 */
+  readonly presentAtMs?: number | undefined;
 }
 
 export interface ObservedArrived {
@@ -324,6 +326,18 @@ export interface BuiltRecord {
    * （X-054: 数の並びを作ってから原因を言う）。
    */
   readonly presentDelay: {
+    readonly count: number;
+    readonly medianMs: number;
+    readonly p99Ms: number;
+  };
+  /**
+   * 音声の「理論上の再生時刻（`DecodeInput.presentAtMs`）と実際に鳴った時刻
+   * （`onAudioScheduled`）の差」（ミリ秒）の要約（観測）。正なら実発音が理論より遅い。
+   *
+   * 映像の提示差（`presentDelay`）と並べることで、D-1 のずれが音声と映像の
+   * どちらに由来するかを 1 発で分ける（X-054: 数の並びを作ってから原因を言う）。
+   */
+  readonly audioDelay: {
     readonly count: number;
     readonly medianMs: number;
     readonly p99Ms: number;
@@ -732,6 +746,26 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     p99Ms: sortedDelays.length === 0 ? 0 : sortedDelays[delayRank(99)] ?? 0,
   };
 
+  // 音声の「理論上の再生時刻と実際に鳴った時刻の差」（観測）。enqueueAudio の
+  // presentAtMs と onAudioScheduled の atMs の差。映像の提示差と並べることで、
+  // D-1 のずれが音声と映像のどちらに由来するかを分ける（X-054）。
+  const audioDelaysMs: number[] = [];
+  for (const entry of run.playedAudio) {
+    if (entry.presentAtMs !== undefined) {
+      audioDelaysMs.push(entry.atMs - entry.presentAtMs);
+    }
+  }
+  const sortedAudioDelays = [...audioDelaysMs].sort((a, b) => a - b);
+  const audioDelayRank = (percent: number): number => {
+    const index = Math.trunc((percent * sortedAudioDelays.length + 99) / 100) - 1;
+    return index < 0 ? 0 : index >= sortedAudioDelays.length ? sortedAudioDelays.length - 1 : index;
+  };
+  const audioDelay = {
+    count: sortedAudioDelays.length,
+    medianMs: sortedAudioDelays.length === 0 ? 0 : sortedAudioDelays[Math.trunc(sortedAudioDelays.length / 2)] ?? 0,
+    p99Ms: sortedAudioDelays.length === 0 ? 0 : sortedAudioDelays[audioDelayRank(99)] ?? 0,
+  };
+
   return {
     record: {
       sent,
@@ -763,5 +797,6 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     d1Summary,
     pairGap,
     presentDelay,
+    audioDelay,
   };
 }

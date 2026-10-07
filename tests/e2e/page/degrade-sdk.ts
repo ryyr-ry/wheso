@@ -86,6 +86,14 @@ interface DecodedVideo {
 interface PlayedAudio {
   readonly captureUs: number;
   readonly atMs: number;
+  /**
+   * この音声の理論上の再生時刻（`DecodeInput.presentAtMs`。観測）。
+   *
+   * `atMs`（実際に鳴る時刻）との差が「音声側のずれ」の本体である。
+   * 映像の提示差（`presentDelay`）と並べることで、D-1 のずれが音声と
+   * 映像のどちらに由来するかを 1 発で分ける（X-054）。
+   */
+  readonly presentAtMs?: number | undefined;
 }
 
 /** 閉鎖 1 件。**コードを数として持つ**（戻れる閉鎖と戻れない閉鎖を判定側が分ける）。 */
@@ -251,6 +259,17 @@ const closeNotes: CloseNote[] = [];
  * ぶんがそのまま A/V のずれになる。遅い環境ではどの同期機構も許容を満たせない。
  */
 const decodeLatencies: number[] = [];
+
+/**
+ * 音声の「captureUs → 理論上の再生時刻（`DecodeInput.presentAtMs`）」。
+ *
+ * `enqueueAudio` の wrap で登録し、`onAudioScheduled` で消す。理論と実際の差
+ * （`presentAtMs` − `atMs`）が「音声側のずれ」の本体である。映像の提示差
+ * （`presentDelay`）と並べることで、D-1 のずれが音声と映像のどちらに由来するかを
+ * 1 発で分ける（X-054: 数の並びを作ってから原因を言う）。上限を超えた古い側から捨てる。
+ */
+const audioPlannedByCapture = new Map<number, number>();
+const AUDIO_PLANNED_LIMIT = 512;
 
 /**
  * 実際の復号器の出入り（観測）。
@@ -481,7 +500,13 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
         onAudioScheduled: (senderId, captureUs, atMs): void => {
           void senderId;
           recorder.audioIo.played += 1;
-          recorder.playedAudio.push({ captureUs, atMs });
+          // 理論値（`DecodeInput.presentAtMs`）を対に残す。実際に鳴った時刻との差が
+          // 「音声側のずれ」の本体である（X-054）。詳細は `PlayedAudio.presentAtMs`。
+          const planned = audioPlannedByCapture.get(captureUs);
+          if (planned !== undefined) {
+            audioPlannedByCapture.delete(captureUs);
+          }
+          recorder.playedAudio.push({ captureUs, atMs, presentAtMs: planned });
         },
         // **復号遅延の標本（D-1 の原因の切り分け）。** 分布を出すことで、ずれが
         // 「同期の判断の誤り」か「復号が遅い環境」かを分ける（X-054）。
@@ -590,6 +615,16 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
         // **時刻はここでは記録しない**（`onAudioScheduled` が実際に鳴る時刻を出す）。
         // 数だけ数える。鳴った数との差が「音声を落とした量」である（音声は破棄禁止）。
         recorder.audioIo.submitted += 1;
+        // 理論値を登録する（`onAudioScheduled` で対にして消す）。詳細は
+        // `audioPlannedByCapture` の注記。
+        audioPlannedByCapture.set(input.captureTimestampUs, input.presentAtMs);
+        while (audioPlannedByCapture.size > AUDIO_PLANNED_LIMIT) {
+          const oldest = audioPlannedByCapture.keys().next();
+          if (oldest.done === true) {
+            break;
+          }
+          audioPlannedByCapture.delete(oldest.value);
+        }
         base.media.enqueueAudio(input);
       },
     },
