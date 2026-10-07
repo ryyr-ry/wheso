@@ -43,6 +43,19 @@ export function createPresentGate(deps: PresentGateDeps): PresentGate {
     submit: (senderId, presentAtMs, run): void => {
       const now = deps.now();
       const previous = lastAtMs.get(senderId);
+      // **予定が過去の枠は順序に加えず直ちに渡す**（ADR-0058）。
+      //
+      // 従来は過去の予定も「前回より後」へ並べ替え、未来の予約の後ろへ 1 ms 刻みで
+      // 押し出していた。保持の用途では、過去の予定を待たせる理由が無い（これ以上
+      // 待たせると A/V のずれが伸びるのみである。ADR-0028 の原則 3）。提示の順序
+      // （frameIndex の単調性。受入条件 A-3）は、過去の枠どうしが「出力順 =
+      // 取得時刻順」で前進することで保たれる。未来の予約を過去の枠が追い越す
+      // 状況は対応付けを作り直した直後だけであり、そのときの過去の枠の取得時刻は
+      // 未来の枠より後であるため、提示の列は単調のままである。
+      if (presentAtMs <= now) {
+        run();
+        return;
+      }
       // 前回より後にする。同時刻なら順序が保たれないため 1 ミリ秒だけ後ろへ置く。
       const ordered = previous === undefined || presentAtMs > previous ? presentAtMs : previous + 1;
       const waitMs = ordered - now;
@@ -65,10 +78,6 @@ export function createPresentGate(deps: PresentGateDeps): PresentGate {
         return;
       }
       lastAtMs.set(senderId, ordered);
-      if (waitMs <= 0) {
-        run();
-        return;
-      }
       deps.scheduleAt(ordered, run);
     },
     release: (senderId): void => {

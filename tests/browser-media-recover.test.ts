@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 
 import { browserMediaDeps } from "../packages/client/src/media/browser-media.ts";
 import { CHANNEL_VIDEO } from "../packages/core/src/generated/wire-layout.ts";
+import { VIDEO_JITTER_MAX_FRAMES } from "../packages/core/src/generated/constants.ts";
 
 /** 偽の塊から取得時刻を読む（`EncodedVideoChunk` の `timestamp` に相当）。 */
 function chunkTimestampOf(chunk: unknown): number {
@@ -267,6 +268,104 @@ test("閉じた復号器の初期化は作り直しになる", () => {
     first.fail();
     h.deps.resetDecoder(7, CHANNEL_VIDEO, 0);
     assert.equal(h.fakes.instances.length, 2, "閉じていたら作り直す");
+  } finally {
+    removeFakes();
+  }
+});
+
+test("**出力は提示予定時刻まで保持し、過去の予定は直ちに開放する**（ADR-0058）", () => {
+  installFakes();
+  const frames: number[] = [];
+  const pending: (() => void)[] = [];
+  try {
+    const deps = browserMediaDeps({
+      now: (): number => 1000,
+      scheduleAt: (_atMs, fire): (() => void) => {
+        pending.push(fire);
+        return (): void => undefined;
+      },
+      onFrame: (senderId): void => {
+        frames.push(senderId);
+      },
+      onDecodeError: (): void => undefined,
+      onAudioScheduled: (): void => undefined,
+    });
+    deps.configureDecoder(7, CHANNEL_VIDEO, 0);
+
+    // 予定が未来（presentAtMs 2000 > now 1000）の枠: 保持し、まだ出さない。
+    deps.decodeVideo({ ...input(true, 1000), presentAtMs: 2000 });
+    assert.equal(frames.length, 0, "予定が未来の間は保持する");
+
+    // 予定が過去（presentAtMs 500 <= now 1000）の枠: 直ちに開放する。
+    deps.decodeVideo({ ...input(false, 2000), presentAtMs: 500 });
+    assert.equal(frames.length, 1, "予定が過去の枠は直ちに出す");
+
+    // 予約の発火で保持していた枠が出る。
+    const fire = pending[0];
+    assert.ok(fire !== undefined, "予約が 1 つある");
+    fire();
+    assert.equal(frames.length, 2, "予定時刻に開放する");
+  } finally {
+    removeFakes();
+  }
+});
+
+test("**保持の上限を超えたら古い側から開放する**（VideoFrame の資源を守る）", () => {
+  installFakes();
+  const frames: number[] = [];
+  const pending: (() => void)[] = [];
+  try {
+    const deps = browserMediaDeps({
+      now: (): number => 1000,
+      scheduleAt: (_atMs, fire): (() => void) => {
+        pending.push(fire);
+        return (): void => undefined;
+      },
+      onFrame: (senderId): void => {
+        frames.push(senderId);
+      },
+      onDecodeError: (): void => undefined,
+      onAudioScheduled: (): void => undefined,
+    });
+    deps.configureDecoder(7, CHANNEL_VIDEO, 0);
+    // 上限 + 2 枚の未来の予定を投入する。上限を超えた分は古い側から出る。
+    for (let index = 0; index <= VIDEO_JITTER_MAX_FRAMES + 1; index += 1) {
+      deps.decodeVideo({ ...input(false, (index + 1) * 66_000), presentAtMs: 5000 + index });
+    }
+    assert.equal(
+      frames.length,
+      2,
+      `上限を超えたぶんだけ古い側から開放する（実際 ${String(frames.length)} 枚）`,
+    );
+  } finally {
+    removeFakes();
+  }
+});
+
+test("**closeDecoder は保持している出力をすべて開放する**（退出で資源を漏らさない）", () => {
+  installFakes();
+  const frames: number[] = [];
+  try {
+    const deps = browserMediaDeps({
+      now: (): number => 1000,
+      scheduleAt: (_atMs, fire): (() => void) => {
+        void fire;
+        return (): void => undefined;
+      },
+      onFrame: (senderId): void => {
+        frames.push(senderId);
+      },
+      onDecodeError: (): void => undefined,
+      onAudioScheduled: (): void => undefined,
+    });
+    deps.configureDecoder(7, CHANNEL_VIDEO, 0);
+    // 2 枚を保持させる（予定は未来）。
+    deps.decodeVideo({ ...input(true, 1000), presentAtMs: 2000 });
+    deps.decodeVideo({ ...input(false, 66_000), presentAtMs: 2100 });
+    assert.equal(frames.length, 0, "保持している");
+    // 購読を捨てる。保持していた枠はすべて出て資源が閉じる。
+    deps.closeDecoder(7, CHANNEL_VIDEO);
+    assert.equal(frames.length, 2, "保持していた枠をすべて開放する");
   } finally {
     removeFakes();
   }
