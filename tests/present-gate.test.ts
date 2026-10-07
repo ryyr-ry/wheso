@@ -118,13 +118,15 @@ test("予定が遠すぎるとき、先行が無ければ直ちに渡す（映�
   assert.equal(c.pending.length, 0, "予約しない");
 });
 
-test("解放すると順序の記録が消える", () => {
+test("解放すると保持中の枠をすべて出し、記録が消える", () => {
   const c = clock(1000);
   const gate = createPresentGate(c.deps);
   const order: number[] = [];
   gate.submit(1, 1100, () => order.push(1));
   gate.release(1);
-  // 解放後は前回の時刻に縛られない。
+  // 解放は保持中の枠をすべて出す（資源を閉じる責務は run の側にある）。
+  assert.deepEqual(order, [1], "保持中の枠を出す");
+  // 解放後は前回の予定に縛られない。
   gate.submit(1, 1000, () => order.push(2));
-  assert.deepEqual(order, [2], "直ちに渡る");
+  assert.deepEqual(order, [1, 2], "直ちに渡る");
 });

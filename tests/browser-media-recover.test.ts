@@ -276,10 +276,11 @@ test("閉じた復号器の初期化は作り直しになる", () => {
 test("**出力は提示予定時刻まで保持し、開放は順序に沿って行う**（ADR-0058）", () => {
   installFakes();
   const frames: number[] = [];
+  let nowMs = 1000;
   const pending: (() => void)[] = [];
   try {
     const deps = browserMediaDeps({
-      now: (): number => 1000,
+      now: (): number => nowMs,
       scheduleAt: (_atMs, fire): (() => void) => {
         pending.push(fire);
         return (): void => undefined;
@@ -296,18 +297,19 @@ test("**出力は提示予定時刻まで保持し、開放は順序に沿って
     deps.decodeVideo({ ...input(true, 1000), presentAtMs: 2000 });
     assert.equal(frames.length, 0, "予定が未来の間は保持する");
 
-    // 予定が過去（presentAtMs 500）の枠: 順序に加えられ、予約される。
+    // 予定が過去（presentAtMs 500）の枠: 順序に加えられ、先頭の予約に続く。
     // 直ちに出すと未来の予約（2000）より先になり、受け取りの列が逆行する
     // （受入条件 A-3。実測: 「157 の次に 152」）。
     deps.decodeVideo({ ...input(false, 2000), presentAtMs: 500 });
     assert.equal(frames.length, 0, "過去の予定も順序に沿って待つ");
 
-    // 予約を時刻順に発火すると、両方とも開放される。
-    assert.equal(pending.length, 2, "予約が 2 つある");
+    // 時刻が先頭の予定（2000）へ進み、予約の発火で順に開放される。
+    assert.ok(pending.length >= 1, "先頭の予約がある");
+    nowMs = 2000;
     for (const fire of [...pending]) {
       fire();
     }
-    assert.equal(frames.length, 2, "発火で開放する");
+    assert.equal(frames.length, 2, "予定時刻に開放する");
   } finally {
     removeFakes();
   }
@@ -316,12 +318,12 @@ test("**出力は提示予定時刻まで保持し、開放は順序に沿って
 test("**保持の上限を超えたら古い側から開放する**（VideoFrame の資源を守る）", () => {
   installFakes();
   const frames: number[] = [];
-  const pending: (() => void)[] = [];
   try {
     const deps = browserMediaDeps({
       now: (): number => 1000,
       scheduleAt: (_atMs, fire): (() => void) => {
-        pending.push(fire);
+        // 予約は作るが発火しない（時刻が進まないため）。保持だけを観察する。
+        void fire;
         return (): void => undefined;
       },
       onFrame: (senderId): void => {
@@ -331,9 +333,10 @@ test("**保持の上限を超えたら古い側から開放する**（VideoFrame
       onAudioScheduled: (): void => undefined,
     });
     deps.configureDecoder(7, CHANNEL_VIDEO, 0);
-    // 上限 + 2 枚の未来の予定を投入する。上限を超えた分は古い側から出る。
+    // 上限 + 2 枚の未来の予定を投入する。上限を超えた分は先頭（古い側）から出る。
+    // 順序を守るため先頭から出すので、逆行は起きない。
     for (let index = 0; index <= VIDEO_JITTER_MAX_FRAMES + 1; index += 1) {
-      deps.decodeVideo({ ...input(false, (index + 1) * 66_000), presentAtMs: 5000 + index });
+      deps.decodeVideo({ ...input(false, (index + 1) * 66_000), presentAtMs: 1200 + index });
     }
     assert.equal(
       frames.length,

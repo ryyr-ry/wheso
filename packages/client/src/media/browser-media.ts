@@ -13,7 +13,7 @@
  * 型で守れない部分は実行時に検査する（型定義を信用しない。AGENTS 5.4 の 3）。
  */
 
-import { A_VOICE, AUDIO_JITTER_MAX_PACKETS, OPUS_FRAME_MS, VIDEO_JITTER_MAX_FRAMES } from "@wheso/core/src/generated/constants.ts";
+import { A_VOICE, AUDIO_JITTER_MAX_PACKETS, OPUS_FRAME_MS } from "@wheso/core/src/generated/constants.ts";
 import type { DecodeInput, PipelineDeps } from "../api/receive-pipeline.ts";
 import { createPresentGate } from "../sync/present-gate.ts";
 
@@ -89,14 +89,6 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
    * 提示側はこの門 1 系統だけが時刻を扱う。
    */
   const presentByCapture = new Map<number, number>();
-  /**
-   * 保持している出力の枠（`captureUs → VideoFrame`）。
-   *
-   * 上限は `VIDEO_JITTER_MAX_FRAMES` 枚。提示予定が過去の枠は即時に開放するため、
-   * 保持はジッタ深度ぶんしか溜まらない。上限を超えた古い側から開放する
-   * （`closeFrame` を必ず呼ぶ。閉じないと復号器の資源が尽きる）。
-   */
-  const heldFrames = new Map<number, unknown>();
   const audio = createAudioSink(options.onAudioScheduled);
 
   const videoDecoderCtor = Reflect.get(globalThis, "VideoDecoder");
@@ -107,56 +99,18 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
   }
 
   /**
-   * 復号済みの出力を提示予定時刻へ置く。過去の予定は直ちに開放する。
+   * 復号済みの出力を門へ渡す。門が入庫順に提示予定時刻まで保持する（ADR-0058）。
    *
-   * 開放では `onFrame` を呼んでから `closeFrame` する（利用側は同期に使い終える）。
-   * 順序は門が保証する（送信者ごとに前へ進む。同時刻は 1 ms ずつ並べる）。
-   * 保持枠が上限を超えたら、登録が最も古い枠から開放する（防衛）。
+   * 保持の上限（順序・時刻・枚数）は門が 1 箇所で扱う。二重管理を置かない。
    */
   function holdOrPresent(senderId: number, captureUs: number, frame: unknown): void {
     const presentAt = presentByCapture.get(captureUs) ?? 0;
     presentByCapture.delete(captureUs);
-    heldFrames.set(captureUs, frame);
-    // 上限を超えた古い側から開放する。登録順 = 出力順 = 取得時刻順である。
-    while (heldFrames.size > VIDEO_JITTER_MAX_FRAMES) {
-      const oldest = heldFrames.keys().next();
-      if (oldest.done === true) {
-        break;
-      }
-      const oldestCapture = oldest.value;
-      releaseNow(oldestCapture);
-    }
     gate.submit(senderId, presentAt, () => {
-      releaseNow(captureUs);
+      options.onFrame(senderId, frame);
+      closeFrame(frame);
     });
   }
-
-  /** 保持している枠を直ちに開放する（二重開放は `get` で防ぐ）。 */
-  function releaseNow(captureUs: number): void {
-    const frame = heldFrames.get(captureUs);
-    if (frame === undefined) {
-      return;
-    }
-    heldFrames.delete(captureUs);
-    onFrameWithSender(frame);
-    closeFrame(frame);
-  }
-
-  /** 開放のときに onFrame へ渡す送信者を枠から引く（保持の値に送信者を持たせない）。 */
-  function onFrameWithSender(frame: unknown): void {
-    // 保持するのは 1 つの復号器（送信者 × チャネル）の出力だけであるため、
-    // 開放のたびに現在の復号器の送信者を使う。復号器が既に閉じられている
-    // 場合（退出）も onFrame は呼ぶ（資源を閉じる責務はここにある）。
-    const sender = currentSenderId;
-    if (sender !== null) {
-      options.onFrame(sender, frame);
-      return;
-    }
-    options.onFrame(0, frame);
-  }
-
-  /** 現在開放の対象にしている送信者（最後に decode した相手）。 */
-  let currentSenderId: number | null = null;
 
   return {
     configureDecoder: (senderId, channel, spatialId): void => {
@@ -191,12 +145,9 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
     },
 
     closeDecoder: (senderId, channel): void => {
-      // **保持している出力もすべて開放する。** 相手が退出するのに保持し続けると
-      // 資源が漏れる（`VideoFrame` は閉じるまで GPU メモリを掴む）。
-      for (const captureUs of [...heldFrames.keys()]) {
-        currentSenderId = senderId;
-        releaseNow(captureUs);
-      }
+      // **門の保持中の枠をすべて出す。** 相手が退出するのに保持し続けると資源が漏れる
+      // （`VideoFrame` は閉じるまで GPU メモリを掴む）。門の `release` は保持中の枠の
+      // `run` を順に呼ぶため、`onFrame` と `closeFrame` の両方が必ず走る。
       presentByCapture.clear();
       gate.release(senderId);
       // **作り直し（ADR-0047）では消さない。** 消すと古い実体の枠を再び通してしまう。
@@ -220,7 +171,6 @@ export function browserMediaDeps(options: BrowserMediaOptions): Omit<PipelineDep
       if (chunk === null) {
         return;
       }
-      currentSenderId = input.senderId;
       // **復号は即座に始める。出力は提示予定時刻まで保持する**（ADR-0058）。
       //
       // 従来の「発火を復号遅延ぶん早める」は予測誤差を A/V のずれに直に出していた。
