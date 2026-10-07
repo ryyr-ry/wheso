@@ -314,6 +314,20 @@ export interface BuiltRecord {
     readonly medianMs: number;
     readonly maxMs: number;
   };
+  /**
+   * 映像の「理論上の提示時刻（`DecodeInput.presentAtMs`）と実際の提示時刻
+   * （`onFrame`）の差」（ミリ秒）の要約（観測）。
+   *
+   * この差が 0 に近ければ映像は写像どおりに提示されており、D-1 のずれの
+   * 本体は**音声側が早い**ことである。差が大きければ、ずれの本体は
+   * 映像の発火待ちと復号（`present-gate` + `VideoDecoder`）にある
+   * （X-054: 数の並びを作ってから原因を言う）。
+   */
+  readonly presentDelay: {
+    readonly count: number;
+    readonly medianMs: number;
+    readonly p99Ms: number;
+  };
 }
 
 /**
@@ -690,6 +704,34 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     maxMs: sortedGaps.length === 0 ? 0 : sortedGaps[sortedGaps.length - 1] ?? 0,
   };
 
+  // 映像の「理論上の提示時刻と実際の提示時刻の差」（観測）。decodeVideo へ渡す
+  // 時点の presentAtMs（写像の予定）と onFrame の実測を captureUs で対にする。
+  // 差が 0 に近ければ映像は予定どおりであり、D-1 のずれの本体は音声側にある。
+  const presentedAtByCapture = new Map<number, number>();
+  for (const entry of run.received) {
+    if (!presentedAtByCapture.has(entry.captureUs)) {
+      presentedAtByCapture.set(entry.captureUs, entry.atMs);
+    }
+  }
+  const presentDelaysMs: number[] = [];
+  for (const entry of run.decoded) {
+    const at = presentedAtByCapture.get(entry.captureUs);
+    const planned = entry.presentAtMs;
+    if (at !== undefined && planned !== undefined) {
+      presentDelaysMs.push(at - planned);
+    }
+  }
+  const sortedDelays = [...presentDelaysMs].sort((a, b) => a - b);
+  const delayRank = (percent: number): number => {
+    const index = Math.trunc((percent * sortedDelays.length + 99) / 100) - 1;
+    return index < 0 ? 0 : index >= sortedDelays.length ? sortedDelays.length - 1 : index;
+  };
+  const presentDelay = {
+    count: sortedDelays.length,
+    medianMs: sortedDelays.length === 0 ? 0 : sortedDelays[Math.trunc(sortedDelays.length / 2)] ?? 0,
+    p99Ms: sortedDelays.length === 0 ? 0 : sortedDelays[delayRank(99)] ?? 0,
+  };
+
   return {
     record: {
       sent,
@@ -720,5 +762,6 @@ export function buildDegradeRecord(rawRun: ObservedRun, audioPairWindowUs = 100_
     decoderFailures: run.decoderFailures ?? 0,
     d1Summary,
     pairGap,
+    presentDelay,
   };
 }

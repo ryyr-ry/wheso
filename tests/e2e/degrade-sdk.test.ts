@@ -589,6 +589,9 @@ for (const profile of IMPAIRMENT_PROFILES) {
         // 収まっていなければ、ずれは送信側の対（A/V の取り違え）であり、受信側の
         // 同期の問題ではない（X-054: 数の並びを作ってから原因を言う）。
         ` / 対の差 中央 ${String(built.pairGap.medianMs)}ms 最大 ${String(built.pairGap.maxMs)}ms（${String(built.pairGap.count)} 組）` +
+        // **映像の予定と実際の提示の差。** 0 に近ければ映像は写像どおりで、ずれの本体は
+        // 音声側（早期の予約）にある。大きければ発火待ちと復号が本体である。
+        ` / 提示差 中央 ${String(built.presentDelay.medianMs)}ms p99 ${String(built.presentDelay.p99Ms)}ms（${String(built.presentDelay.count)} 枚）` +
         // **復号遅延の分布。** D-1 のずれがこれを超えていたら、原因は同期の判断では
         // なく復号が遅いことである（門は直近の遅延で発火を早めるが、変動には追えない）。
         ` / 復号遅延 中央 ${String(receiver.decodeLatency.medianMs)}ms` +
