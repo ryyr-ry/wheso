@@ -269,7 +269,32 @@ const decodeLatencies: number[] = [];
  * 1 発で分ける（X-054: 数の並びを作ってから原因を言う）。上限を超えた古い側から捨てる。
  */
 const audioPlannedByCapture = new Map<number, number>();
-const AUDIO_PLANNED_LIMIT = 512;
+const AUDIO_PLANNED_LIMIT = 4096;
+
+/**
+ * 理論値を ±2 µs の許容で取り出して消す（`playedLookup` と同じ許容。
+ * `AudioDecoder` が出力の timestamp を 1 µs ずらすため）。
+ */
+function takeAudioPlanned(captureUs: number): number | undefined {
+  const exact = audioPlannedByCapture.get(captureUs);
+  if (exact !== undefined) {
+    audioPlannedByCapture.delete(captureUs);
+    return exact;
+  }
+  for (let d = 1; d <= 2; d += 1) {
+    const plus = audioPlannedByCapture.get(captureUs + d);
+    if (plus !== undefined) {
+      audioPlannedByCapture.delete(captureUs + d);
+      return plus;
+    }
+    const minus = audioPlannedByCapture.get(captureUs - d);
+    if (minus !== undefined) {
+      audioPlannedByCapture.delete(captureUs - d);
+      return minus;
+    }
+  }
+  return undefined;
+}
 
 /**
  * 実際の復号器の出入り（観測）。
@@ -502,10 +527,13 @@ function observe(base: JoinDeps, recorder: Recorder): JoinDeps {
           recorder.audioIo.played += 1;
           // 理論値（`DecodeInput.presentAtMs`）を対に残す。実際に鳴った時刻との差が
           // 「音声側のずれ」の本体である（X-054）。詳細は `PlayedAudio.presentAtMs`。
-          const planned = audioPlannedByCapture.get(captureUs);
-          if (planned !== undefined) {
-            audioPlannedByCapture.delete(captureUs);
-          }
+          //
+          // **取り出しには ±2 µs の許容が要る。** `AudioDecoder` は出力の
+          // `AudioData.timestamp` を「codec may adjust」のまま振り直し得る
+          // （実測では Opus 復号器が 1 µs ずらす）。厳密一致の鍵では 3,000 件の
+          // 再生に対して 18 件しか対にならず、分布が偶然の標本になる
+          // （sdk-degrade-record の `playedLookup` と同じ許容）。
+          const planned = takeAudioPlanned(captureUs);
           recorder.playedAudio.push({ captureUs, atMs, presentAtMs: planned });
         },
         // **復号遅延の標本（D-1 の原因の切り分け）。** 分布を出すことで、ずれが
