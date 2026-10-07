@@ -21,14 +21,12 @@
  */
 
 import {
-  AUDIO_JITTER_MAX_PACKETS,
   AV_DRIFT_STEP_US,
   AV_LAG_REFINE_STREAK,
   AV_RESYNC_GAP_MS,
   AV_SKEW_AUDIO_LAG_MAX_MS,
   AV_SKEW_AUDIO_LEAD_MAX_MS,
   AV_SKEW_TOLERANCE_MS,
-  OPUS_FRAME_MS,
 } from "./generated/constants.ts";
 
 /** マイクロ秒からミリ秒への換算。整数除算のみを使う。 */
@@ -191,28 +189,30 @@ export function noteAudio(
   //   「現在」に張り付く（遅れて鳴る）。映像は写像どおりの未来に提示し続ける
   //   ため、ずれは開きっぱなしになる。
   //
-  //   先行（負）: M が現在より「予約上限」を超えて未来。上限は
-  //   `AUDIO_JITTER_MAX_PACKETS × OPUS_FRAME_MS`（スケジューラの予約上限と同じ
-  //   値）である。超えると予約は現在へ切り捨てられ、実発音は M から離れて
-  //   「現在」に張り付く（早く鳴る）。遮断や帯域降下の明けに、溜まっていた
-  //   過去の取得時刻の音声が一気に届くと、最初の標本の作り直しで anchor が
-  //   「溜まっていた量」ぶん未来を出す写像を作り、この状態が続く（実測:
-  //   音声の実発音が理論より中央 1.5 秒「早い」走行。D-1 は音声が先行）。
+  //   先行（負）: M が現在より「この送信者のジッタ深度 + 許容」を超えて未来。
+  //   深度はその送信者の到着間隔の p99 から決まる「正常な予約の先」であり、
+  //   それを超える未来は「anchor が実際の到着ペースから離れた」兆候である。
+  //   スケジューラの予約上限（`AUDIO_JITTER_MAX_PACKETS × OPUS_FRAME_MS`）を
+  //   超える分は現在へ切り捨てられ、実発音は M から離れて「現在」に張り付く
+  //   （早く鳴る）。遮断や帯域降下の明けに、溜まっていた過去の取得時刻の音声が
+  //   一気に届くと、最初の標本の作り直しで anchor が「溜まっていた量」ぶん未来を
+  //   出す写像を作り、この状態が続く（実測: 音声の実発音が理論より中央 1.5 秒
+  //   「早い」走行。D-1 は音声が先行）。
   //
-  // どちらも「音声の実際の位置に映像を合わせる」（ADR-0028 の原則 1）ために
-  // anchor を寄せることで解消する。方向はずれの符号に従う。
-  //
-  // **正常な未来（遅れ・先行のどちらでも無い帯）では動かさない。**
-  // anchor は「現在 + ジッタ深度」に置く（ADR-0028 の 2）。深度ぶんの未来は
-  // 予約の正常な位置であり、ずれではない。深度が `AV_SKEW_TOLERANCE_MS` を
-  // 超えていても、M が予約上限の内側にある限り実発音は M どおりである。
+  //   **閾値を「深度」に置く理由（2026-10-07 の実測）**: 予約上限（160 ms）を
+  //   閾値に使うと、先行は 160 ms まで開いてから 10 標本（200 ms）かけて寄る。
+  //   寄った直後また 160 ms まで開くため、平均の先行が「閾値の半分」に張り付く
+  //   （実測: 音声差の中央 −156〜−174 ms）。深度はその送信者の到着の揺れぶん
+  //   「未来に置いてよい量」であり、深度 + 許容を閾値にすれば振幅はその分だけ
+  //   縮む。一時的な揺れで this 閾値を超えることは、揺れの p99 から決まる
+  //   深度に「さらに許容」を載せた値であるため稀である。
   //
   // **1 標本では動かさない。** 一時的な停滞（数十ミリ秒の揺れ）で動かすと、
   // 揺れるたびに anchor が前後し、映像の提示が乱れる。連続回数の閾値は
   // ジッタバッファの深さ（`AV_LAG_REFINE_STREAK` 標本）とする。
   const mappedMs = mapToLocalMs(existing, captureUs);
   const lagMs = localNowMs - mappedMs;
-  const leadLimitMs = AUDIO_JITTER_MAX_PACKETS * OPUS_FRAME_MS;
+  const leadLimitMs = jitterDepthMs + AV_SKEW_TOLERANCE_MS;
   const offMap = lagMs > AV_SKEW_TOLERANCE_MS || -lagMs > leadLimitMs;
   const lagStreak = offMap ? existing.lagStreak + 1 : 0;
   if (lagStreak >= AV_LAG_REFINE_STREAK) {

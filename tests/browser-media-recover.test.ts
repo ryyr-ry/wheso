@@ -273,7 +273,7 @@ test("閉じた復号器の初期化は作り直しになる", () => {
   }
 });
 
-test("**出力は提示予定時刻まで保持し、過去の予定は直ちに開放する**（ADR-0058）", () => {
+test("**出力は提示予定時刻まで保持し、開放は順序に沿って行う**（ADR-0058）", () => {
   installFakes();
   const frames: number[] = [];
   const pending: (() => void)[] = [];
@@ -296,15 +296,18 @@ test("**出力は提示予定時刻まで保持し、過去の予定は直ちに
     deps.decodeVideo({ ...input(true, 1000), presentAtMs: 2000 });
     assert.equal(frames.length, 0, "予定が未来の間は保持する");
 
-    // 予定が過去（presentAtMs 500 <= now 1000）の枠: 直ちに開放する。
+    // 予定が過去（presentAtMs 500）の枠: 順序に加えられ、予約される。
+    // 直ちに出すと未来の予約（2000）より先になり、受け取りの列が逆行する
+    // （受入条件 A-3。実測: 「157 の次に 152」）。
     deps.decodeVideo({ ...input(false, 2000), presentAtMs: 500 });
-    assert.equal(frames.length, 1, "予定が過去の枠は直ちに出す");
+    assert.equal(frames.length, 0, "過去の予定も順序に沿って待つ");
 
-    // 予約の発火で保持していた枠が出る。
-    const fire = pending[0];
-    assert.ok(fire !== undefined, "予約が 1 つある");
-    fire();
-    assert.equal(frames.length, 2, "予定時刻に開放する");
+    // 予約を時刻順に発火すると、両方とも開放される。
+    assert.equal(pending.length, 2, "予約が 2 つある");
+    for (const fire of [...pending]) {
+      fire();
+    }
+    assert.equal(frames.length, 2, "発火で開放する");
   } finally {
     removeFakes();
   }

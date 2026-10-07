@@ -26,14 +26,12 @@ import {
   type PlayoutState,
 } from "../packages/core/src/playout.ts";
 import {
-  AUDIO_JITTER_MAX_PACKETS,
   AV_DRIFT_STEP_US,
   AV_LAG_REFINE_STREAK,
   AV_RESYNC_GAP_MS,
   AV_SKEW_AUDIO_LAG_MAX_MS,
   AV_SKEW_AUDIO_LEAD_MAX_MS,
   AV_SKEW_TOLERANCE_MS,
-  OPUS_FRAME_MS,
 } from "../packages/core/src/generated/constants.ts";
 
 const SENDER = 7;
@@ -188,14 +186,14 @@ test("**恒常的な到着の遅れへは寄せ直す**（ADR-0057。anchor を�
 test("**溜まった音声の明け（M の未来）へも寄せ直す**（ADR-0057。両向き・非対称）", () => {
   // 遮断の明け: 1 秒ぶんの音声が一気に届き、最初の標本で不連続の作り直しが
   // 起きる。以後は「capture の刻み（40 ms 束ね）」より速い間隔で到着するため、
-  // M はどんどん未来へ出る。予約上限（160 ms）を超えて続いたら anchor を
-  // 「現在の位置」へ寄せ直し、以後の M は予約の帯に戻る。
+  // M はどんどん未来へ出る。先行の閾値（深度 + 許容）を超えて続いたら anchor を
+  // 「現在の位置」へ寄せ直し、以後の M は閾値の帯に戻る。
   let state = anchored();
   // 1 秒の欠落の後、最初の標本で作り直し（localGap > AV_RESYNC_GAP_MS）。
   state = noteAudio(state, SENDER, us(20 + 1020), 1000 + 20 + 1200, DEPTH).state;
   // 以後は 40 ms 刻みの capture が 10 ms 間隔で届く（溜まった分の消化）。
   let refinedCount = 0;
-  const leadLimitMs = AUDIO_JITTER_MAX_PACKETS * OPUS_FRAME_MS;
+  const leadLimitMs = DEPTH + AV_SKEW_TOLERANCE_MS;
   for (let i = 1; i <= AV_LAG_REFINE_STREAK * 3; i += 1) {
     const capture = us(20 + 1020 + i * 40);
     const nowMs = 1000 + 20 + 1200 + i * 10;
@@ -209,9 +207,9 @@ test("**溜まった音声の明け（M の未来）へも寄せ直す**（ADR-0
       refinedCount += 1;
     }
   }
-  // 消化の間（M が予約上限を超えて開く）、閾値のたびに寄せ直しが起きている。
+  // 消化の間（M が先行の閾値を超えて開く）、閾値のたびに寄せ直しが起きている。
   assert.ok(refinedCount >= 1, `閾値の標本で寄せ直す（実際 ${String(refinedCount)} 回）`);
-  // 寄せ直しの後、最後の標本の先行は予約の帯を超えていない。
+  // 寄せ直しの後、最後の標本の先行は閾値の帯を超えていない。
   const last = state.clocks.find((clock) => clock.senderId === SENDER);
   assert.ok(last !== undefined);
   const lastCapture = us(20 + 1020 + AV_LAG_REFINE_STREAK * 3 * 40);
@@ -219,7 +217,7 @@ test("**溜まった音声の明け（M の未来）へも寄せ直す**（ADR-0
   const lastLag = lastNow - mapToLocalMs(last, lastCapture);
   assert.ok(
     -lastLag <= leadLimitMs + AV_SKEW_TOLERANCE_MS,
-    `寄せ直しの後、M の先行は予約上限の内側に戻る（実際 lag=${String(lastLag)}）`,
+    `寄せ直しの後、M の先行は閾値の帯の内側に戻る（実際 lag=${String(lastLag)}）`,
   );
 });
 
